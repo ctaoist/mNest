@@ -16,6 +16,7 @@ pub struct Settings {
     pub queue: QueueSettings,
     pub admin: AdminSettings,
     pub tools: ToolSettings,
+    pub cover_cache: CoverCacheSettings,
     pub auth: AuthSettings,
     pub scraper: ScraperSettings,
 }
@@ -74,6 +75,17 @@ impl Settings {
         if !(1..=300).contains(&self.scraper.timeout_seconds) {
             bail!("scraper.timeout_seconds must be between 1 and 300");
         }
+        if self.cover_cache.enabled {
+            if self.cover_cache.path.as_os_str().is_empty() {
+                bail!("cover_cache.path cannot be empty when cover caching is enabled");
+            }
+            if !self.cover_cache.path.is_absolute() {
+                bail!("cover_cache.path must be an absolute path");
+            }
+            if self.cover_cache.path == Path::new("/") {
+                bail!("cover_cache.path cannot be the filesystem root");
+            }
+        }
         match self.database.driver.as_str() {
             "sqlite" => {
                 if !cfg!(feature = "sqlite") {
@@ -110,6 +122,24 @@ impl Settings {
             }
             "redis" => {}
             other => bail!("unsupported queue.driver: {other}"),
+        }
+        Ok(())
+    }
+
+    pub fn prepare_runtime(&self) -> anyhow::Result<()> {
+        if self.cover_cache.enabled {
+            fs::create_dir_all(&self.cover_cache.path).with_context(|| {
+                format!(
+                    "failed to create cover cache directory {}",
+                    self.cover_cache.path.display()
+                )
+            })?;
+            if !self.cover_cache.path.is_dir() {
+                bail!(
+                    "cover_cache.path is not a directory: {}",
+                    self.cover_cache.path.display()
+                );
+            }
         }
         Ok(())
     }
@@ -234,6 +264,21 @@ impl Default for ToolSettings {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct CoverCacheSettings {
+    pub enabled: bool,
+    pub path: PathBuf,
+}
+impl Default for CoverCacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "/data/cache/covers".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AuthSettings {
     pub jwt_secret: String,
     pub access_token_minutes: i64,
@@ -289,6 +334,7 @@ auth: { jwt_secret: "12345678901234567890123456789012" }
         let settings: Settings = serde_yaml::from_str(yaml).unwrap();
         settings.validate().unwrap();
         assert_eq!(settings.server.port, 4535);
+        assert!(!settings.cover_cache.enabled);
     }
 
     #[test]
@@ -317,5 +363,19 @@ auth: { jwt_secret: "12345678901234567890123456789012" }
             settings.queue.redis_url.as_deref(),
             Some("redis://redis:6379/0")
         );
+    }
+
+    #[test]
+    fn validates_and_prepares_the_cover_cache_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.cover_cache.enabled = true;
+        settings.cover_cache.path = directory.path().join("covers");
+        settings.validate().unwrap();
+        settings.prepare_runtime().unwrap();
+        assert!(settings.cover_cache.path.is_dir());
+
+        settings.cover_cache.path = PathBuf::from("relative/covers");
+        assert!(settings.validate().is_err());
     }
 }

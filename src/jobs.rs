@@ -418,6 +418,11 @@ async fn remote_import_one(
                 .map_err(|error| anyhow::anyhow!(error.without_url()))
         })
         .await?;
+        let response_content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let total = response.content_length().unwrap_or_default();
         anyhow::ensure!(
             total == 0 || total <= MAX_IMPORT_BYTES,
@@ -454,6 +459,38 @@ async fn remote_import_one(
         file.flush().await?;
         file.sync_all().await?;
         drop(file);
+        anyhow::ensure!(downloaded > 0, "下载源返回了空文件");
+        let expected_extension = desired_destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let inspect_path = partial.clone();
+        let inspect_content_type = response_content_type.clone();
+        let actual_extension = tokio::task::spawn_blocking(move || {
+            remote_download::downloaded_audio_extension(
+                &inspect_path,
+                &expected_extension,
+                inspect_content_type.as_deref(),
+            )
+        })
+        .await??;
+        let desired_destination = if desired_destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(&actual_extension))
+        {
+            desired_destination.clone()
+        } else {
+            let corrected = desired_destination.with_extension(&actual_extension);
+            tracing::warn!(
+                requested_path = %desired_destination.display(),
+                actual_extension,
+                corrected_path = %corrected.display(),
+                "download source returned a different audio format; corrected file extension"
+            );
+            corrected
+        };
         let destination = commit_download(&partial, &desired_destination).await?;
         committed_destination = Some(destination.clone());
         set_progress(state, job_id, 0.85, "下载完成，正在扫描曲库").await?;

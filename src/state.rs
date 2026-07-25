@@ -42,7 +42,10 @@ impl AppState {
         db: DatabaseConnection,
         providers: Arc<ProviderRegistry>,
     ) -> Self {
-        let tags = Arc::new(TagService::new(settings.tools.clone()));
+        let tags = Arc::new(TagService::with_cover_cache(
+            settings.tools.clone(),
+            settings.cover_cache.clone(),
+        ));
         let events = EventHub::new();
         let shutdown = CancellationToken::new();
         Self {

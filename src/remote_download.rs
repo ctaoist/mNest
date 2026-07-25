@@ -1,10 +1,12 @@
-use std::time::Duration;
 use std::{
     collections::BTreeMap,
+    path::Path,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
+use lofty::{file::FileType, probe::Probe};
 use md5::{Digest, Md5};
 use reqwest::{Client, RequestBuilder, Response, Url, header};
 use serde::{Deserialize, Serialize};
@@ -645,6 +647,74 @@ fn extension_for(song: &RemoteSong, quality: &str) -> String {
     }
 }
 
+pub(crate) fn downloaded_audio_extension(
+    path: &Path,
+    expected_extension: &str,
+    content_type: Option<&str>,
+) -> anyhow::Result<String> {
+    let expected_extension = expected_extension.trim().to_ascii_lowercase();
+    let file_type = Probe::open(path)?.guess_file_type()?.file_type();
+    let detected = match file_type {
+        Some(FileType::Aac) => Some("aac"),
+        Some(FileType::Aiff) if matches!(expected_extension.as_str(), "aif" | "aiff") => {
+            Some(expected_extension.as_str())
+        }
+        Some(FileType::Aiff) => Some("aiff"),
+        Some(FileType::Ape) => Some("ape"),
+        Some(FileType::Flac) => Some("flac"),
+        Some(FileType::Mpeg) if matches!(expected_extension.as_str(), "mp1" | "mp2" | "mp3") => {
+            Some(expected_extension.as_str())
+        }
+        Some(FileType::Mpeg) => Some("mp3"),
+        Some(FileType::Mp4) if matches!(expected_extension.as_str(), "m4a" | "mp4") => {
+            Some(expected_extension.as_str())
+        }
+        Some(FileType::Mp4) => Some("m4a"),
+        Some(FileType::Mpc) => Some("mpc"),
+        Some(FileType::Opus) => Some("opus"),
+        Some(FileType::Vorbis) => Some("ogg"),
+        Some(FileType::Speex) => Some("spx"),
+        Some(FileType::Wav) => Some("wav"),
+        Some(FileType::WavPack) => Some("wv"),
+        Some(FileType::Custom(_)) | None => None,
+        _ => None,
+    };
+    if let Some(extension) = detected {
+        return Ok(extension.to_owned());
+    }
+
+    let content_type = content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if content_type.starts_with("text/")
+        || content_type.contains("json")
+        || content_type.contains("html")
+        || content_type.contains("xml")
+    {
+        anyhow::bail!("下载源返回了 {content_type}，不是音频文件");
+    }
+
+    if matches!(
+        expected_extension.as_str(),
+        "wma" | "wmv" | "tta" | "dsf" | "dff"
+    ) {
+        return Ok(expected_extension);
+    }
+
+    anyhow::bail!(
+        "无法识别下载文件的实际音频格式（响应类型：{}）",
+        if content_type.is_empty() {
+            "unknown"
+        } else {
+            &content_type
+        }
+    )
+}
+
 pub fn safe_component(value: &str) -> String {
     let mut value = value
         .trim()
@@ -774,6 +844,39 @@ mod tests {
             import_filename(&song, "original", "title-artist").unwrap(),
             "A_B_ - Singer.flac"
         );
+    }
+
+    #[test]
+    fn detects_the_downloaded_audio_format_from_file_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("download.part");
+
+        std::fs::write(&path, b"fLaC\0\0\0\0").unwrap();
+        assert_eq!(
+            downloaded_audio_extension(&path, "flac", Some("application/octet-stream")).unwrap(),
+            "flac"
+        );
+
+        std::fs::write(&path, [0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0]).unwrap();
+        assert_eq!(
+            downloaded_audio_extension(&path, "flac", Some("audio/mpeg")).unwrap(),
+            "mp3"
+        );
+        assert_eq!(
+            downloaded_audio_extension(&path, "mp2", Some("audio/mpeg")).unwrap(),
+            "mp2"
+        );
+    }
+
+    #[test]
+    fn rejects_successful_http_responses_that_are_not_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("download.part");
+        std::fs::write(&path, br#"{"error":"not logged in"}"#).unwrap();
+        let error = downloaded_audio_extension(&path, "flac", Some("application/json"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不是音频文件"));
     }
 
     #[test]

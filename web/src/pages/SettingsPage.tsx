@@ -513,7 +513,7 @@ export function SettingsPage() {
                 <ToolRow name="FFmpeg / FFprobe" description="音频流与转码" ready={config().tools.ffmpeg} />
                 <ToolRow name="Chromaprint / fpcalc" description="AcoustID 音频指纹" ready={config().tools.fpcalc} />
                 <ToolRow name="TagLib" description="特殊格式标签回退" ready={true} optional={!config().tools.taglib_configured} />
-                <div class="config-note"><CircleAlert size={18} /><p>工具路径、Provider 与队列配置由服务器 <code>config.yaml</code> 管理，网页仅展示运行状态。</p></div>
+                <div class="config-note"><CircleAlert size={18} /><p>工具路径、Provider、队列与封面缓存由服务器 <code>config.yaml</code> 管理。封面缓存{config().cover_cache.enabled ? <>已启用：<code>{config().cover_cache.path}</code></> : '未启用'}。</p></div>
               </section>
             </div>
 

@@ -171,6 +171,10 @@ export interface ConfigStatus {
   library_roots: LibraryRoot[]
   providers: string[]
   download_filename_format: DownloadFilenameFormat
+  cover_cache: {
+    enabled: boolean
+    path: string
+  }
   lastfm: LastFmStatus
   tools: {
     ffmpeg: boolean

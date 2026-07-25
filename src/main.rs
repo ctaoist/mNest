@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let settings = Arc::new(Settings::load(&cli.config)?);
     settings.validate()?;
+    settings.prepare_runtime()?;
 
     let pool = db::connect(&settings.database).await?;
     db::migrate(&pool).await?;

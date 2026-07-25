@@ -54,6 +54,7 @@ describe('SettingsPage permissions', () => {
         library_roots: [{ id: 'root-1', name: 'Music', path: '/music', enabled: 1 }],
         providers: [],
         download_filename_format: 'artist-title',
+        cover_cache: { enabled: true, path: '/data/cache/covers' },
         lastfm,
         tools: { ffmpeg: true, fpcalc: true, taglib_configured: false },
       })

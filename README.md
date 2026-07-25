@@ -69,6 +69,16 @@ database:
 
 同时确认 `tools` 中的 `ffmpeg`、`ffprobe` 和 `fpcalc` 路径与服务器一致。
 
+需要避免每次请求都从音频文件重新提取封面时，可以启用磁盘缓存：
+
+```yaml
+cover_cache:
+  enabled: true
+  path: /data/cache/covers
+```
+
+缓存目录必须使用绝对路径。Docker 部署中的 `/data` 已持久化；音频文件大小或修改时间变化后，对应封面缓存会自动失效。设置为 `enabled: false` 时不会读写封面缓存。
+
 如果通过域名或反向代理访问，请将 `server.public_url` 改为用户实际访问的外部地址，例如 `https://music.example.com`。
 
 ### 3. 设置初始密码
@@ -113,6 +123,60 @@ Docker 部署时，曲库目录必须填写容器内路径。例如主机目录�
 管理员账号只在首次启动时创建。修改环境变量中的管理员密码不会自动覆盖数据库中的现有密码。如需从配置同步密码，可临时将 `admin.overwrite_existing` 设为 `true`，成功启动一次后再恢复为 `false`。
 
 ## Docker 部署
+
+### 从 Docker Hub 拉取
+
+Docker Hub 镜像同时包含 amd64 和 arm64 架构，Docker 会根据服务器架构自动选择：
+
+```bash
+docker pull ctaoist/mnest:latest
+```
+
+准备 `.env` 和 `config.yaml` 后可以直接运行：
+
+```bash
+docker run -d \
+  --name mNest \
+  --restart unless-stopped \
+  -p 4535:4535 \
+  --env-file .env \
+  -e MNEST_DATABASE_DRIVER=sqlite \
+  -e 'MNEST_DATABASE_URL=sqlite:///data/mNest.db?mode=rwc' \
+  -e MNEST_QUEUE_DRIVER=database \
+  -v "$PWD/config.yaml:/data/config.yaml:ro" \
+  -v "$PWD/data:/data" \
+  -v /服务器上的音乐目录:/music:rw \
+  ctaoist/mnest:latest
+```
+
+需要固定版本时，将 `latest` 换成具体版本号，例如：
+
+```bash
+docker pull ctaoist/mnest:1.2.3
+```
+
+使用 Compose 拉取镜像时，将 `compose.yaml` 中的：
+
+```yaml
+build: .
+```
+
+替换为：
+
+```yaml
+image: ctaoist/mnest:latest
+```
+
+之后执行：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+`latest` 指向最新稳定版本；指定完整版本号可以避免更新时自动跨版本。镜像中已经包含 Web 前端、FFmpeg、FFprobe 和 fpcalc。
+
+### 从源码构建镜像
 
 准备环境变量和配置：
 

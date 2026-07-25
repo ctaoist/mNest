@@ -1625,6 +1625,10 @@ async fn config_status(
         "library_roots": roots,
         "providers": state.providers.names(),
         "download_filename_format": download_filename_format,
+        "cover_cache": {
+            "enabled": state.settings.cover_cache.enabled,
+            "path": state.settings.cover_cache.path.to_string_lossy(),
+        },
         "lastfm": lastfm,
         "tools": {"ffmpeg":state.settings.tools.ffmpeg.exists(),"fpcalc":state.settings.tools.fpcalc.exists(),"taglib_configured":state.settings.tools.taglib.is_some()}
     }))))

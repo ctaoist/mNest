@@ -32,6 +32,10 @@ tools:
   fpcalc: /usr/bin/fpcalc
   taglib: /usr/lib/x86_64-linux-gnu/libtag_c.so.0
 
+cover_cache:
+  enabled: false
+  path: /data/cache/covers
+
 scraper:
   enabled: [netease, qmusic, migu, kuwo, kugou, acoustid]
   timeout_seconds: 12

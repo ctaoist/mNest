@@ -2,6 +2,7 @@ use std::{
     ffi::{CStr, CString, c_char, c_uint, c_void},
     fs, io,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use anyhow::{Context, bail};
@@ -14,16 +15,18 @@ use lofty::{
     probe::Probe,
     tag::{ItemKey, Tag},
 };
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder, NamedTempFile};
 
-use crate::config::ToolSettings;
+use crate::config::{CoverCacheSettings, ToolSettings};
 
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "flac", "mp3", "mp2", "ape", "wav", "aiff", "aif", "wv", "tta", "m4a", "mp4", "ogg",
     "mpc", "opus", "wma", "wmv", "dsf", "dff", "spx",
 ];
 pub const ARTWORK_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+const MAX_CACHED_ARTWORK_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AudioMetadata {
@@ -63,11 +66,19 @@ pub struct AudioArtwork {
 #[derive(Debug, Clone)]
 pub struct TagService {
     tools: ToolSettings,
+    cover_cache: CoverCacheSettings,
 }
 
 impl TagService {
     pub fn new(tools: ToolSettings) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            cover_cache: CoverCacheSettings::default(),
+        }
+    }
+
+    pub fn with_cover_cache(tools: ToolSettings, cover_cache: CoverCacheSettings) -> Self {
+        Self { tools, cover_cache }
     }
 
     pub fn read(&self, path: &Path) -> anyhow::Result<AudioMetadata> {
@@ -91,11 +102,33 @@ impl TagService {
     }
 
     pub fn read_artwork(&self, path: &Path) -> anyhow::Result<Option<AudioArtwork>> {
-        match self.read_artwork_lofty(path) {
+        if self.cover_cache.enabled {
+            match self.read_cached_artwork(path) {
+                Ok(Some(artwork)) => return Ok(Some(artwork)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "failed to read cached artwork");
+                }
+            }
+        }
+
+        let artwork = match self.read_artwork_lofty(path) {
             Ok(artwork) => Ok(artwork),
             Err(_) if is_taglib_extension(path) => Ok(None),
             Err(error) => Err(error),
+        }?;
+
+        if self.cover_cache.enabled {
+            let cache_result = match artwork.as_ref() {
+                Some(artwork) => self.write_cached_artwork(path, artwork),
+                None => self.remove_stale_artwork_cache(path),
+            };
+            if let Err(error) = cache_result {
+                tracing::warn!(path = %path.display(), %error, "failed to update artwork cache");
+            }
         }
+
+        Ok(artwork)
     }
 
     fn read_artwork_lofty(&self, path: &Path) -> anyhow::Result<Option<AudioArtwork>> {
@@ -116,6 +149,88 @@ impl TagService {
             mime_type,
             data: picture.data().to_vec(),
         }))
+    }
+
+    fn read_cached_artwork(&self, source: &Path) -> anyhow::Result<Option<AudioArtwork>> {
+        let (path, _) = self.artwork_cache_entry(source)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_CACHED_ARTWORK_BYTES {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
+        let data = fs::read(&path)?;
+        let Some(mime_type) = detect_artwork_mime(&data) else {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        };
+        Ok(Some(AudioArtwork {
+            mime_type: mime_type.to_owned(),
+            data,
+        }))
+    }
+
+    fn write_cached_artwork(&self, source: &Path, artwork: &AudioArtwork) -> anyhow::Result<()> {
+        let (path, prefix) = self.artwork_cache_entry(source)?;
+        fs::create_dir_all(&self.cover_cache.path)?;
+        if artwork.data.len() as u64 <= MAX_CACHED_ARTWORK_BYTES
+            && detect_artwork_mime(&artwork.data).is_some()
+        {
+            atomic_write(&path, &artwork.data, false)?;
+            self.prune_artwork_cache(&prefix, Some(&path));
+        } else {
+            self.prune_artwork_cache(&prefix, None);
+        }
+        Ok(())
+    }
+
+    fn remove_stale_artwork_cache(&self, source: &Path) -> anyhow::Result<()> {
+        let (_, prefix) = self.artwork_cache_entry(source)?;
+        self.prune_artwork_cache(&prefix, None);
+        Ok(())
+    }
+
+    fn artwork_cache_entry(&self, source: &Path) -> anyhow::Result<(PathBuf, String)> {
+        let metadata = fs::metadata(source)?;
+        let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        let source_name = canonical.to_string_lossy();
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let path_hash = hex::encode(Md5::digest(source_name.as_bytes()));
+        let signature = hex::encode(Md5::digest(
+            format!("{source_name}:{}:{modified}", metadata.len()).as_bytes(),
+        ));
+        let prefix = format!("{path_hash}-");
+        Ok((
+            self.cover_cache
+                .path
+                .join(format!("{prefix}{signature}.artwork")),
+            prefix,
+        ))
+    }
+
+    fn prune_artwork_cache(&self, prefix: &str, keep: Option<&Path>) {
+        let Ok(entries) = fs::read_dir(&self.cover_cache.path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let matches_source = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".artwork"));
+            if matches_source && keep.is_none_or(|keep| keep != path) {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 
     fn read_lofty(&self, path: &Path) -> anyhow::Result<AudioMetadata> {
@@ -707,5 +822,34 @@ mod tests {
             validate_sidecar_target(&original, &directory.path().join("new.mp3"), &metadata)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn caches_artwork_and_invalidates_it_when_the_audio_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("song.mp3");
+        let cache = directory.path().join("covers");
+        std::fs::write(&source, b"first audio version").unwrap();
+        let service = TagService::with_cover_cache(
+            ToolSettings::default(),
+            CoverCacheSettings {
+                enabled: true,
+                path: cache.clone(),
+            },
+        );
+        let artwork = AudioArtwork {
+            mime_type: "image/jpeg".into(),
+            data: b"\xff\xd8\xffcached artwork".to_vec(),
+        };
+
+        service.write_cached_artwork(&source, &artwork).unwrap();
+        let cached = service.read_cached_artwork(&source).unwrap().unwrap();
+        assert_eq!(cached.mime_type, "image/jpeg");
+        assert_eq!(cached.data, artwork.data);
+
+        std::fs::write(&source, b"second and longer audio version").unwrap();
+        assert!(service.read_cached_artwork(&source).unwrap().is_none());
+        service.remove_stale_artwork_cache(&source).unwrap();
+        assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
     }
 }
