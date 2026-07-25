@@ -27,6 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
+      docker_image: ${{ steps.docker-image.outputs.name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -55,6 +56,19 @@ jobs:
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize Docker image name
+        id: docker-image
+        env:
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${DOCKERHUB_IMAGE,,}"
+          if [[ "$image" != "$DOCKERHUB_IMAGE" ]]; then
+            echo "::notice::Docker image name was normalized to lowercase: ${image}"
+          fi
+          echo "name=${image}" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     name: Build ${{ matrix.platform }}
@@ -131,9 +145,11 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
+    if: ${{ always() && needs.prepare.result == 'success' && needs.build-binaries.result == 'success' && (!inputs.publish_docker || needs.publish-docker.result == 'success') }}
     needs:
       - prepare
       - build-binaries
+      - publish-docker
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -156,17 +172,27 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
 
-  publish-docker:
-    name: Publish Docker image
+  build-docker:
+    name: Build Docker ${{ matrix.arch }}
     if: ${{ inputs.publish_docker }}
     needs: prepare
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
       - name: Validate Docker Hub configuration
         env:
-          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          DOCKERHUB_IMAGE: ${{ needs.prepare.outputs.docker_image }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         shell: bash
@@ -184,8 +210,83 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Detect Docker Hub build cache
+        id: registry-cache
+        env:
+          CACHE_REF: ${{ needs.prepare.outputs.docker_image }}:buildcache-${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$CACHE_REF" >/dev/null 2>&1; then
+            echo "source=type=registry,ref=${CACHE_REF}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Docker Hub cache ${CACHE_REF} does not exist yet; building without it"
+            echo "source=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push ${{ matrix.arch }} image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ needs.prepare.outputs.docker_image }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.version }}
+            ALPINE_MIRROR=${{ vars.ALPINE_MIRROR || 'https://dl-cdn.alpinelinux.org/alpine' }}
+          cache-from: |
+            ${{ steps.registry-cache.outputs.source }}
+            type=gha,scope=mnest-${{ matrix.arch }}
+          cache-to: |
+            type=registry,ref=${{ needs.prepare.outputs.docker_image }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+            type=gha,scope=mnest-${{ matrix.arch }},mode=max
+
+      - name: Export image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid image digest: ${DIGEST}"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-docker:
+    name: Publish multi-architecture Docker image
+    if: ${{ inputs.publish_docker }}
+    needs:
+      - prepare
+      - build-docker
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -200,7 +301,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ vars.DOCKERHUB_IMAGE }}
+          images: ${{ needs.prepare.outputs.docker_image }}
           tags: |
             type=semver,pattern={{version}},value=${{ needs.prepare.outputs.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.version }}
@@ -210,20 +311,38 @@ jobs:
             org.opencontainers.image.title=mNest
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
 
-      - name: Build and push amd64/arm64 image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ needs.prepare.outputs.version }}
-            ALPINE_MIRROR=${{ vars.ALPINE_MIRROR || 'https://dl-cdn.alpinelinux.org/alpine' }}
-          cache-from: |
-            type=registry,ref=${{ vars.DOCKERHUB_IMAGE }}:buildcache
-            type=gha,scope=mnest-multiarch
-          cache-to: |
-            type=registry,ref=${{ vars.DOCKERHUB_IMAGE }}:buildcache,mode=max
-            type=gha,scope=mnest-multiarch,mode=max
+      - name: Create and verify multi-architecture manifest
+        env:
+          DOCKERHUB_IMAGE: ${{ needs.prepare.outputs.docker_image }}
+          DOCKER_TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          digest_files=("$RUNNER_TEMP"/digests/*)
+          if [[ ${#digest_files[@]} -ne 2 ]]; then
+            echo "::error::Expected two platform digests, found ${#digest_files[@]}"
+            exit 1
+          fi
+
+          tag_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              tag_args+=(--tag "$tag")
+            fi
+          done <<< "$DOCKER_TAGS"
+
+          sources=()
+          for digest_file in "${digest_files[@]}"; do
+            digest="$(basename "$digest_file")"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid digest file: ${digest}"
+              exit 1
+            fi
+            sources+=("${DOCKERHUB_IMAGE}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${VERSION}"
