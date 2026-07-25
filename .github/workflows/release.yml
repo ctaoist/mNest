@@ -221,5 +221,9 @@ jobs:
           build-args: |
             APP_VERSION=${{ needs.prepare.outputs.version }}
             ALPINE_MIRROR=${{ vars.ALPINE_MIRROR || 'https://dl-cdn.alpinelinux.org/alpine' }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=${{ vars.DOCKERHUB_IMAGE }}:buildcache
+            type=gha,scope=mnest-multiarch
+          cache-to: |
+            type=registry,ref=${{ vars.DOCKERHUB_IMAGE }}:buildcache,mode=max
+            type=gha,scope=mnest-multiarch,mode=max
