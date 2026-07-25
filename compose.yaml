@@ -1,0 +1,18 @@
+services:
+  mNest:
+    build: .
+    container_name: mNest
+    ports:
+      - "4535:4535"
+    environment:
+      MNEST_ADMIN_PASSWORD: ${MNEST_ADMIN_PASSWORD:?set MNEST_ADMIN_PASSWORD}
+      MNEST_JWT_SECRET: ${MNEST_JWT_SECRET:?set MNEST_JWT_SECRET}
+      MNEST_DATABASE_DRIVER: ${MNEST_DATABASE_DRIVER:-sqlite}
+      MNEST_DATABASE_URL: ${MNEST_DATABASE_URL:-sqlite:///data/mNest.db?mode=rwc}
+      MNEST_QUEUE_DRIVER: ${MNEST_QUEUE_DRIVER:-database}
+      MNEST_REDIS_URL: ${MNEST_REDIS_URL:-}
+    volumes:
+      - ./config.yaml:/data/config.yaml:ro
+      - ./data:/data
+      - /path/to/music:/music:rw
+    restart: unless-stopped

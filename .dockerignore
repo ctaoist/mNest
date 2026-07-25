@@ -1,0 +1,17 @@
+target
+target-*
+web/node_modules
+web/dist
+web/coverage
+.git
+.github
+.agents
+.codex
+data
+config.yaml
+config.postgres.yaml
+.env
+.env.*
+screenshots
+*.md
+compose*.yaml

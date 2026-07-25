@@ -1,0 +1,849 @@
+use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::Context;
+use md5::{Digest, Md5};
+use reqwest::{Client, RequestBuilder, Response, Url, header};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::artist_credit;
+
+pub const DOWNLOAD_FILENAME_FORMAT_KEY: &str = "download_filename_format";
+pub const DEFAULT_DOWNLOAD_FILENAME_FORMAT: &str = "artist-title";
+pub const DOWNLOAD_FILENAME_FORMATS: &[&str] = &["artist-title", "title-artist"];
+
+#[derive(Debug, Clone)]
+pub struct RemoteConnection {
+    pub source: String,
+    pub gateway_url: String,
+    pub cookie: String,
+    pub subsonic_url: String,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSearchRequest {
+    pub source_id: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteImportRequest {
+    pub source_id: String,
+    pub song: RemoteSong,
+    pub quality: String,
+    pub root_id: String,
+    #[serde(default)]
+    pub directory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteQuality {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSong {
+    pub source: String,
+    pub id: String,
+    pub title: String,
+    pub artists: Vec<String>,
+    pub album: String,
+    pub suffix: String,
+    pub bit_rate: Option<i64>,
+    pub qualities: Vec<RemoteQuality>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteImportPayload {
+    pub download_url: String,
+    pub root_id: String,
+    pub directory: String,
+    pub filename: String,
+    pub source: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NeteaseLoginStart {
+    pub key: String,
+    pub qr_image: String,
+    pub cookie: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NeteaseLoginStatus {
+    pub code: i64,
+    pub message: String,
+    pub cookie: String,
+}
+
+pub async fn search(connection: &RemoteConnection, query: &str) -> anyhow::Result<Vec<RemoteSong>> {
+    let query = query.trim();
+    anyhow::ensure!(!query.is_empty(), "请输入搜索关键词");
+    anyhow::ensure!(query.len() <= 512, "搜索关键词过长");
+    let client = client()?;
+    match connection.source.as_str() {
+        "netease" => search_netease(&client, connection, query).await,
+        "qq" => search_qq(&client, connection, query).await,
+        "qq2" => search_qq2(&client, connection, query).await,
+        "subsonic" => search_subsonic(&client, connection, query).await,
+        _ => anyhow::bail!("不支持的下载来源"),
+    }
+}
+
+pub async fn prepare_import(
+    connection: &RemoteConnection,
+    request: &RemoteImportRequest,
+    filename_format: &str,
+) -> anyhow::Result<RemoteImportPayload> {
+    anyhow::ensure!(request.song.source == connection.source, "下载来源不匹配");
+    anyhow::ensure!(
+        !request.song.id.trim().is_empty() && request.song.id.len() <= 512,
+        "歌曲 ID 无效"
+    );
+    anyhow::ensure!(
+        !request.song.title.trim().is_empty() && request.song.title.len() <= 512,
+        "歌曲标题无效"
+    );
+    anyhow::ensure!(
+        request.song.artists.len() <= 64
+            && request.song.artists.iter().map(String::len).sum::<usize>() <= 2048,
+        "艺术家信息过长"
+    );
+    anyhow::ensure!(request.song.suffix.len() <= 32, "文件扩展名过长");
+    anyhow::ensure!(request.quality.len() <= 32, "码率参数过长");
+    anyhow::ensure!(request.directory.len() <= 1024, "下载目录过长");
+    anyhow::ensure!(
+        request.directory.split(['/', '\\']).count() <= 16,
+        "下载目录层级过深"
+    );
+    let client = client()?;
+    let download_url = match connection.source.as_str() {
+        "netease" => {
+            resolve_netease(&client, connection, &request.song.id, &request.quality).await?
+        }
+        "qq" => resolve_qq(&client, connection, &request.song.id, &request.quality).await?,
+        "qq2" => resolve_qq2(&client, connection, &request.song.id, &request.quality).await?,
+        "subsonic" => subsonic_download_url(connection, &request.song.id, &request.quality)?,
+        _ => anyhow::bail!("不支持的下载来源"),
+    };
+    validate_http_url(&download_url)?;
+    let filename = import_filename(&request.song, &request.quality, filename_format)?;
+    Ok(RemoteImportPayload {
+        download_url,
+        root_id: request.root_id.clone(),
+        directory: request.directory.trim().to_owned(),
+        filename,
+        source: request.song.source.clone(),
+        title: request.song.title.trim().to_owned(),
+    })
+}
+
+fn import_filename(
+    song: &RemoteSong,
+    quality: &str,
+    filename_format: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        DOWNLOAD_FILENAME_FORMATS.contains(&filename_format),
+        "下载文件名格式无效"
+    );
+    let extension = extension_for(song, quality);
+    let joined_artists = song.artists.join("; ");
+    let artists = if joined_artists.trim().is_empty() {
+        String::new()
+    } else {
+        artist_credit::parse_artist_names(&joined_artists).join(", ")
+    };
+    let title = song.title.trim();
+    let stem = if artists.is_empty() {
+        title.to_owned()
+    } else if filename_format == "title-artist" {
+        format!("{title} - {artists}")
+    } else {
+        format!("{artists} - {title}")
+    };
+    Ok(format!("{}.{}", safe_component(&stem), extension))
+}
+
+pub async fn preview_stream(
+    connection: &RemoteConnection,
+    song_id: &str,
+    range: Option<&str>,
+) -> anyhow::Result<reqwest::Response> {
+    anyhow::ensure!(!song_id.trim().is_empty(), "试听歌曲 ID 不能为空");
+    let client = client()?;
+    let download_url = match connection.source.as_str() {
+        "netease" => resolve_netease(&client, connection, song_id, "128").await?,
+        "qq" => resolve_qq(&client, connection, song_id, "128").await?,
+        "qq2" => resolve_qq2(&client, connection, song_id, "128").await?,
+        "subsonic" => subsonic_download_url(connection, song_id, "128")?,
+        _ => anyhow::bail!("不支持的下载来源"),
+    };
+    validate_http_url(&download_url)?;
+    let mut request = client.get(download_url);
+    if let Some(range) = range.filter(|value| !value.trim().is_empty()) {
+        request = request.header(header::RANGE, range);
+    }
+    send_checked(request).await
+}
+
+pub async fn netease_login_start(
+    connection: &RemoteConnection,
+) -> anyhow::Result<NeteaseLoginStart> {
+    anyhow::ensure!(connection.source == "netease", "这个来源不是网易云后端");
+    let client = client()?;
+    let timestamp = timestamp_millis();
+    let mut key_url = gateway_url(connection, "/login/qr/key")?;
+    key_url
+        .query_pairs_mut()
+        .append_pair("timestamp", &timestamp)
+        .append_pair("ua", "pc");
+    let (key_value, first_cookie) = send_gateway_with_cookie(&client, connection, key_url).await?;
+    let key = stringish(key_value.pointer("/data/unikey"));
+    anyhow::ensure!(!key.is_empty(), "网易云后端没有返回二维码 key");
+    let mut next = connection.clone();
+    next.cookie = first_cookie;
+    let mut qr_url = gateway_url(&next, "/login/qr/create")?;
+    qr_url
+        .query_pairs_mut()
+        .append_pair("key", &key)
+        .append_pair("qrimg", "true")
+        .append_pair("timestamp", &timestamp)
+        .append_pair("ua", "pc");
+    let (qr_value, cookie) = send_gateway_with_cookie(&client, &next, qr_url).await?;
+    let qr_image = stringish(qr_value.pointer("/data/qrimg"));
+    anyhow::ensure!(!qr_image.is_empty(), "网易云后端没有返回二维码图片");
+    Ok(NeteaseLoginStart {
+        key,
+        qr_image,
+        cookie,
+    })
+}
+
+pub async fn netease_login_check(
+    connection: &RemoteConnection,
+    key: &str,
+) -> anyhow::Result<NeteaseLoginStatus> {
+    anyhow::ensure!(connection.source == "netease", "这个来源不是网易云后端");
+    anyhow::ensure!(!key.trim().is_empty(), "二维码 key 不能为空");
+    let client = client()?;
+    let mut url = gateway_url(connection, "/login/qr/check")?;
+    url.query_pairs_mut()
+        .append_pair("key", key)
+        .append_pair("timestamp", &timestamp_millis())
+        .append_pair("ua", "pc");
+    let (value, header_cookie) = send_gateway_with_cookie(&client, connection, url).await?;
+    let body_cookie = stringish(
+        value
+            .get("cookie")
+            .or_else(|| value.pointer("/data/cookie")),
+    );
+    let cookie = merge_cookie(&header_cookie, &body_cookie);
+    Ok(NeteaseLoginStatus {
+        code: value
+            .get("code")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        message: stringish(value.get("message").or_else(|| value.get("msg"))),
+        cookie,
+    })
+}
+
+pub async fn netease_account_name(connection: &RemoteConnection) -> anyhow::Result<String> {
+    anyhow::ensure!(connection.source == "netease", "这个来源不是网易云后端");
+    anyhow::ensure!(
+        !connection.cookie.trim().is_empty(),
+        "网易云 Cookie 不能为空"
+    );
+    let client = client()?;
+    let mut url = gateway_url(connection, "/login/status")?;
+    url.query_pairs_mut()
+        .append_pair("timestamp", &timestamp_millis());
+    let value = send_gateway(&client, connection, url).await?;
+    let account_name = stringish(
+        value
+            .pointer("/data/profile/nickname")
+            .or_else(|| value.pointer("/profile/nickname")),
+    );
+    anyhow::ensure!(!account_name.is_empty(), "网易云没有返回登录用户名");
+    Ok(account_name)
+}
+
+fn client() -> anyhow::Result<Client> {
+    Ok(Client::builder()
+        .connect_timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(35))
+        .user_agent("mNest/remote-download")
+        .build()?)
+}
+
+async fn search_netease(
+    client: &Client,
+    connection: &RemoteConnection,
+    query: &str,
+) -> anyhow::Result<Vec<RemoteSong>> {
+    let mut url = gateway_url(connection, "/cloudsearch")?;
+    url.query_pairs_mut().append_pair("keywords", query);
+    let value = send_gateway(client, connection, url).await?;
+    Ok(value
+        .pointer("/result/songs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|song| RemoteSong {
+            source: "netease".into(),
+            id: stringish(song.get("id")),
+            title: stringish(song.get("name")),
+            artists: names(song.get("ar")),
+            album: stringish(song.pointer("/al/name")),
+            suffix: "mp3".into(),
+            bit_rate: None,
+            qualities: qualities(&[("max", "最大"), ("320", "320k"), ("128", "128k")]),
+        })
+        .filter(|song| !song.id.is_empty())
+        .collect())
+}
+
+async fn search_qq(
+    client: &Client,
+    connection: &RemoteConnection,
+    query: &str,
+) -> anyhow::Result<Vec<RemoteSong>> {
+    let mut url = gateway_url(connection, "/search")?;
+    url.query_pairs_mut().append_pair("key", query);
+    let value = send_gateway(client, connection, url).await?;
+    anyhow::ensure!(
+        value.get("result").and_then(Value::as_i64).unwrap_or(100) == 100,
+        "QQ 音乐搜索失败"
+    );
+    Ok(value
+        .pointer("/data/list")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|song| remote_qq_song("qq", song))
+        .filter(|song| !song.id.is_empty())
+        .collect())
+}
+
+async fn search_qq2(
+    client: &Client,
+    connection: &RemoteConnection,
+    query: &str,
+) -> anyhow::Result<Vec<RemoteSong>> {
+    let mut url = gateway_url(connection, "/getSearchByKey")?;
+    url.query_pairs_mut().append_pair("key", query);
+    let value = send_gateway(client, connection, url).await?;
+    Ok(value
+        .pointer("/response/data/song/list")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|song| remote_qq_song("qq2", song))
+        .filter(|song| !song.id.is_empty())
+        .collect())
+}
+
+fn remote_qq_song(source: &str, song: &Value) -> RemoteSong {
+    let mut available = Vec::new();
+    for (field, id, label) in [
+        ("sizeflac", "flac", "FLAC"),
+        ("sizeape", "ape", "APE"),
+        ("size320", "320", "320k"),
+        ("size128", "128", "128k"),
+    ] {
+        if truthy_size(song.get(field)) {
+            available.push(RemoteQuality {
+                id: id.into(),
+                label: label.into(),
+            });
+        }
+    }
+    if available.is_empty() {
+        available = qualities(&[("320", "320k"), ("128", "128k")]);
+    }
+    RemoteSong {
+        source: source.into(),
+        id: stringish(song.get("songmid").or_else(|| song.get("id"))),
+        title: stringish(song.get("songname").or_else(|| song.get("name"))),
+        artists: names(song.get("singer")),
+        album: stringish(
+            song.get("albumname")
+                .or_else(|| song.pointer("/album/name")),
+        ),
+        suffix: stringish(song.get("filetype")),
+        bit_rate: song.get("bitRate").and_then(Value::as_i64),
+        qualities: available,
+    }
+}
+
+async fn search_subsonic(
+    client: &Client,
+    connection: &RemoteConnection,
+    query: &str,
+) -> anyhow::Result<Vec<RemoteSong>> {
+    let mut url = subsonic_url(connection, "search3")?;
+    url.query_pairs_mut()
+        .append_pair("query", query)
+        .append_pair("songCount", "80")
+        .append_pair("albumCount", "0")
+        .append_pair("artistCount", "0");
+    let value = send_checked(client.get(url))
+        .await?
+        .json::<Value>()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.without_url()))?;
+    let envelope = value
+        .get("subsonic-response")
+        .context("Subsonic 返回格式无效")?;
+    ensure_subsonic_ok(envelope)?;
+    Ok(envelope
+        .pointer("/searchResult3/song")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|song| {
+            let structured = names(song.get("artists"));
+            let artists = if structured.is_empty() {
+                vec![stringish(song.get("artist"))]
+                    .into_iter()
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            } else {
+                structured
+            };
+            RemoteSong {
+                source: "subsonic".into(),
+                id: stringish(song.get("id")),
+                title: stringish(song.get("title")),
+                artists,
+                album: stringish(song.get("album")),
+                suffix: stringish(song.get("suffix")),
+                bit_rate: song.get("bitRate").and_then(Value::as_i64),
+                qualities: qualities(&[("original", "原格式"), ("320", "320k"), ("128", "128k")]),
+            }
+        })
+        .filter(|song| !song.id.is_empty())
+        .collect())
+}
+
+async fn resolve_netease(
+    client: &Client,
+    connection: &RemoteConnection,
+    id: &str,
+    quality: &str,
+) -> anyhow::Result<String> {
+    let mut url = gateway_url(connection, "/song/url")?;
+    let bitrate = netease_bitrate(quality);
+    url.query_pairs_mut()
+        .append_pair("id", id)
+        .append_pair("br", bitrate);
+    let value = send_gateway(client, connection, url).await?;
+    let url = stringish(value.pointer("/data/0/url"));
+    anyhow::ensure!(!url.is_empty(), "网易云没有返回可下载地址");
+    Ok(url)
+}
+
+fn netease_bitrate(quality: &str) -> &'static str {
+    match quality {
+        "max" => "999000",
+        "128" => "128000",
+        _ => "320000",
+    }
+}
+
+async fn resolve_qq(
+    client: &Client,
+    connection: &RemoteConnection,
+    id: &str,
+    quality: &str,
+) -> anyhow::Result<String> {
+    let mut url = gateway_url(connection, "/song/url")?;
+    url.query_pairs_mut()
+        .append_pair("id", id)
+        .append_pair("type", quality);
+    let value = send_gateway(client, connection, url).await?;
+    anyhow::ensure!(
+        value.get("result").and_then(Value::as_i64) == Some(100),
+        "QQ 音乐获取下载地址失败"
+    );
+    let url = stringish(value.get("data"));
+    anyhow::ensure!(!url.is_empty(), "QQ 音乐没有返回可下载地址");
+    Ok(url)
+}
+
+async fn resolve_qq2(
+    client: &Client,
+    connection: &RemoteConnection,
+    id: &str,
+    quality: &str,
+) -> anyhow::Result<String> {
+    let mut url = gateway_url(connection, "/getMusicPlay")?;
+    url.query_pairs_mut()
+        .append_pair("songmid", id)
+        .append_pair("quality", quality)
+        .append_pair("justPlayUrl", "play");
+    let value = send_gateway(client, connection, url).await?;
+    let item = value
+        .pointer(&format!("/data/playUrl/{id}"))
+        .context("QQ2 返回格式无效")?;
+    anyhow::ensure!(
+        item.get("error").and_then(Value::as_bool) != Some(true),
+        "QQ2 获取下载地址失败"
+    );
+    let url = stringish(item.get("url"));
+    anyhow::ensure!(!url.is_empty(), "QQ2 没有返回可下载地址");
+    Ok(url)
+}
+
+fn subsonic_download_url(
+    connection: &RemoteConnection,
+    id: &str,
+    quality: &str,
+) -> anyhow::Result<String> {
+    let action = if quality == "original" {
+        "download"
+    } else {
+        "stream"
+    };
+    let mut url = subsonic_url(connection, action)?;
+    url.query_pairs_mut().append_pair("id", id);
+    if quality != "original" {
+        url.query_pairs_mut()
+            .append_pair("format", "mp3")
+            .append_pair("maxBitRate", quality);
+    }
+    Ok(url.to_string())
+}
+
+async fn send_gateway(
+    client: &Client,
+    connection: &RemoteConnection,
+    url: Url,
+) -> anyhow::Result<Value> {
+    let mut request = client.get(url);
+    if !connection.cookie.trim().is_empty() {
+        request = request.header(header::COOKIE, connection.cookie.trim());
+    }
+    send_checked(request)
+        .await?
+        .json::<Value>()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.without_url()))
+}
+
+async fn send_gateway_with_cookie(
+    client: &Client,
+    connection: &RemoteConnection,
+    url: Url,
+) -> anyhow::Result<(Value, String)> {
+    let mut request = client.get(url);
+    if !connection.cookie.trim().is_empty() {
+        request = request.header(header::COOKIE, connection.cookie.trim());
+    }
+    let response = send_checked(request).await?;
+    let cookie = cookie_from_headers(&connection.cookie, response.headers());
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.without_url()))?;
+    Ok((value, cookie))
+}
+
+async fn send_checked(request: RequestBuilder) -> anyhow::Result<Response> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.without_url()))?;
+    response
+        .error_for_status()
+        .map_err(|error| anyhow::anyhow!(error.without_url()))
+}
+
+fn gateway_url(connection: &RemoteConnection, endpoint: &str) -> anyhow::Result<Url> {
+    joined_url(&connection.gateway_url, endpoint)
+}
+
+fn subsonic_url(connection: &RemoteConnection, action: &str) -> anyhow::Result<Url> {
+    anyhow::ensure!(
+        !connection.username.trim().is_empty() && !connection.password.is_empty(),
+        "Subsonic 用户名和密码不能为空"
+    );
+    let endpoint = format!("/rest/{action}.view");
+    let mut url = joined_url(connection.subsonic_url.trim_end_matches("/rest"), &endpoint)?;
+    let salt = Uuid::new_v4().simple().to_string();
+    let token = hex::encode(Md5::digest(
+        format!("{}{}", connection.password, salt).as_bytes(),
+    ));
+    url.query_pairs_mut()
+        .append_pair("u", connection.username.trim())
+        .append_pair("t", &token)
+        .append_pair("s", &salt)
+        .append_pair("v", "1.16.1")
+        .append_pair("c", "mNest-import")
+        .append_pair("f", "json");
+    Ok(url)
+}
+
+fn joined_url(base: &str, endpoint: &str) -> anyhow::Result<Url> {
+    let mut url = Url::parse(base.trim()).context("服务器地址无效")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "只支持 HTTP 或 HTTPS 服务器"
+    );
+    let prefix = url.path().trim_end_matches('/');
+    url.set_path(&format!("{prefix}{endpoint}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn validate_http_url(value: &str) -> anyhow::Result<()> {
+    let url = Url::parse(value).context("下载地址无效")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "下载地址必须使用 HTTP 或 HTTPS"
+    );
+    Ok(())
+}
+
+fn ensure_subsonic_ok(envelope: &Value) -> anyhow::Result<()> {
+    if envelope.get("status").and_then(Value::as_str) == Some("ok") {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", stringish(envelope.pointer("/error/message")).trim())
+    }
+}
+
+fn extension_for(song: &RemoteSong, quality: &str) -> String {
+    if matches!(quality, "320" | "128") {
+        return "mp3".into();
+    }
+    let candidate = if matches!(quality, "original" | "max") {
+        &song.suffix
+    } else {
+        quality
+    };
+    let sanitized = candidate
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    if sanitized.is_empty() || sanitized.len() > 8 {
+        "audio".into()
+    } else {
+        sanitized
+    }
+}
+
+pub fn safe_component(value: &str) -> String {
+    let mut value = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0'
+            ) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while value.len() > 160 {
+        value.pop();
+    }
+    if value.is_empty() || matches!(value.as_str(), "." | "..") {
+        "download".into()
+    } else {
+        value
+    }
+}
+
+fn qualities(values: &[(&str, &str)]) -> Vec<RemoteQuality> {
+    values
+        .iter()
+        .map(|(id, label)| RemoteQuality {
+            id: (*id).into(),
+            label: (*label).into(),
+        })
+        .collect()
+}
+
+fn names(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let name = stringish(item.get("name").or_else(|| item.get("title")));
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+fn truthy_size(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Number(number)) => number.as_i64().unwrap_or_default() > 0,
+        Some(Value::String(value)) => value.parse::<i64>().unwrap_or_default() > 0,
+        _ => false,
+    }
+}
+
+fn stringish(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn timestamp_millis() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+
+fn cookie_from_headers(existing: &str, headers: &reqwest::header::HeaderMap) -> String {
+    let mut cookie = existing.to_owned();
+    for value in headers.get_all(header::SET_COOKIE) {
+        if let Ok(value) = value.to_str() {
+            cookie = merge_cookie(&cookie, value.split(';').next().unwrap_or_default());
+        }
+    }
+    cookie
+}
+
+fn merge_cookie(left: &str, right: &str) -> String {
+    let mut values = BTreeMap::new();
+    for cookie in [left, right] {
+        for pair in cookie
+            .split(';')
+            .map(str::trim)
+            .filter(|pair| pair.contains('='))
+        {
+            if let Some((name, value)) = pair.split_once('=') {
+                values.insert(name.trim().to_owned(), value.trim().to_owned());
+            }
+        }
+    }
+    values
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creates_safe_import_names() {
+        let song = RemoteSong {
+            source: "qq".into(),
+            id: "1".into(),
+            title: "A/B?".into(),
+            artists: vec!["Singer".into()],
+            album: String::new(),
+            suffix: "flac".into(),
+            bit_rate: None,
+            qualities: vec![],
+        };
+        assert_eq!(extension_for(&song, "original"), "flac");
+        assert_eq!(extension_for(&song, "max"), "flac");
+        assert_eq!(safe_component("Singer - A/B?"), "Singer - A_B_");
+        assert_eq!(
+            import_filename(&song, "original", "artist-title").unwrap(),
+            "Singer - A_B_.flac"
+        );
+        assert_eq!(
+            import_filename(&song, "original", "title-artist").unwrap(),
+            "A_B_ - Singer.flac"
+        );
+    }
+
+    #[test]
+    fn formats_multiple_artists_with_comma_space() {
+        let song = RemoteSong {
+            source: "subsonic".into(),
+            id: "1".into(),
+            title: "Song".into(),
+            artists: vec!["Artist A, Artist B".into(), "Artist C".into()],
+            album: String::new(),
+            suffix: "mp3".into(),
+            bit_rate: None,
+            qualities: vec![],
+        };
+        assert_eq!(
+            import_filename(&song, "original", "artist-title").unwrap(),
+            "Artist A, Artist B, Artist C - Song.mp3"
+        );
+        assert_eq!(
+            import_filename(&song, "original", "title-artist").unwrap(),
+            "Song - Artist A, Artist B, Artist C.mp3"
+        );
+    }
+
+    #[test]
+    fn omits_the_artist_separator_when_no_artist_is_available() {
+        let song = RemoteSong {
+            source: "qq".into(),
+            id: "1".into(),
+            title: "Song".into(),
+            artists: vec![],
+            album: String::new(),
+            suffix: "mp3".into(),
+            bit_rate: None,
+            qualities: vec![],
+        };
+        assert_eq!(
+            import_filename(&song, "original", "artist-title").unwrap(),
+            "Song.mp3"
+        );
+    }
+
+    #[test]
+    fn builds_reference_gateway_urls() {
+        let connection = RemoteConnection {
+            source: "qq".into(),
+            gateway_url: "https://music.example/api/".into(),
+            cookie: String::new(),
+            subsonic_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+        };
+        assert_eq!(
+            gateway_url(&connection, "/search").unwrap().as_str(),
+            "https://music.example/api/search"
+        );
+    }
+
+    #[test]
+    fn merges_server_side_cookies() {
+        assert_eq!(
+            merge_cookie("MUSIC_U=old; os=pc", "MUSIC_U=new; csrf=1"),
+            "MUSIC_U=new; csrf=1; os=pc"
+        );
+    }
+
+    #[test]
+    fn maps_netease_max_quality_to_999k() {
+        assert_eq!(netease_bitrate("max"), "999000");
+        assert_eq!(netease_bitrate("320"), "320000");
+        assert_eq!(netease_bitrate("128"), "128000");
+    }
+}

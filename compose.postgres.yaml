@@ -1,0 +1,46 @@
+services:
+  mNest:
+    build: .
+    container_name: mNest
+    ports:
+      - "4535:4535"
+    environment:
+      MNEST_ADMIN_PASSWORD: ${MNEST_ADMIN_PASSWORD:?set MNEST_ADMIN_PASSWORD}
+      MNEST_JWT_SECRET: ${MNEST_JWT_SECRET:?set MNEST_JWT_SECRET}
+      MNEST_DATABASE_DRIVER: postgres
+      MNEST_DATABASE_URL: postgres://mNest:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mNest
+      MNEST_QUEUE_DRIVER: redis
+      MNEST_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./config.postgres.yaml:/data/config.yaml:ro
+      - ./data:/data
+      - /path/to/music:/music:rw
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: mNest
+      POSTGRES_USER: mNest
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mNest"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    volumes:
+      - redis-data:/data
+
+volumes:
+  postgres-data:
+  redis-data:

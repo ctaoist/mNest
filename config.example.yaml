@@ -1,0 +1,39 @@
+server:
+  host: 0.0.0.0
+  port: 4535
+
+database:
+  # driver: sqlite
+  driver: postgres
+  # url: url: sqlite:///data/mNest.db?mode=rwc
+  url: postgres://mNest:change-me@postgres:5432/mNest
+  max_connections: 20
+
+queue:
+  driver: redis
+  redis_url: redis://redis:6379/0
+  workers: 8
+  max_attempts: 3
+
+admin:
+  username: admin
+  password: ${MNEST_ADMIN_PASSWORD}
+  email: admin@example.com
+  overwrite_existing: false
+
+auth:
+  jwt_secret: ${MNEST_JWT_SECRET}
+  access_token_minutes: 60
+  refresh_token_days: 30
+
+tools:
+  ffmpeg: /usr/bin/ffmpeg
+  ffprobe: /usr/bin/ffprobe
+  fpcalc: /usr/bin/fpcalc
+  taglib: /usr/lib/x86_64-linux-gnu/libtag_c.so.0
+
+scraper:
+  enabled: [netease, qmusic, migu, kuwo, kugou, acoustid]
+  timeout_seconds: 12
+  acoustid_api_key: cSpUJKpD
+  provider_options: {}

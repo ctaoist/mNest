@@ -1,0 +1,75 @@
+[package]
+name = "mNest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Self-hosted music tag scraper and OpenSubsonic server"
+
+[features]
+default = ["sqlite", "postgres"]
+sqlite = ["sea-orm/sqlx-sqlite"]
+postgres = ["sea-orm/sqlx-postgres"]
+
+[lib]
+name = "mnest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mNest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+argon2 = "0.5"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["multipart"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+jsonwebtoken = "9.3"
+libloading = "0.8"
+lofty = "0.24"
+md-5 = "0.10"
+mime_guess = "2.0"
+rand = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
+redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
+regex = "1.11"
+ring = "0.17"
+rust-embed = { version = "8.12", features = ["debug-embed"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_urlencoded = "0.7"
+serde_yaml = "0.9"
+strsim = "0.11"
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.46", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "process", "io-util", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tower-http = { version = "0.6", default-features = false, features = ["trace", "compression-gzip"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2.1"
+uuid = { version = "1.17", default-features = false, features = ["v4"] }
+walkdir = "2.5"
+
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "gzip", "stream"] }
+sea-orm = { version = "1.1.20", default-features = false, features = ["macros", "runtime-tokio-native-tls"] }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream"] }
+sea-orm = { version = "1.1.20", default-features = false, features = ["macros", "runtime-tokio-rustls"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
