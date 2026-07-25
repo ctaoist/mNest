@@ -21,7 +21,6 @@ pub async fn run(db: &DatabaseConnection) -> anyhow::Result<()> {
     } else {
         remove_non_baseline_versions(db).await?;
     }
-    ensure_baseline_columns(db).await?;
     if !has_column(db, "tracks", "needs_scrape").await? {
         anyhow::bail!(
             "database baseline is outdated: recreate the database to add tracks.needs_scrape"
@@ -332,17 +331,6 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         create_index(db, name, table, columns, false).await?;
     }
 
-    Ok(())
-}
-
-async fn ensure_baseline_columns(db: &DatabaseConnection) -> anyhow::Result<()> {
-    if !has_column(db, "users", "subsonic_password").await? {
-        let mut users = Table::alter();
-        users
-            .table(alias("users"))
-            .add_column(text_default("subsonic_password", ""));
-        execute(db, users).await?;
-    }
     Ok(())
 }
 
