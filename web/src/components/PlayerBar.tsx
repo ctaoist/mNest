@@ -98,7 +98,7 @@ export function PlayerBar() {
     const active = activeLyricsLine()
     if (active < 0) return
     requestAnimationFrame(() => {
-      lyricsList?.querySelector(`[data-lyrics-line="${active}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      lyricsList?.querySelector<HTMLElement>(`[data-lyrics-line="${active}"]`)?.scrollIntoView?.({ block: 'center', behavior: 'smooth' })
     })
   })
 

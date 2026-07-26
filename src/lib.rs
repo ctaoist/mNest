@@ -12,6 +12,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod entities;
+pub mod internet_radio;
 pub mod jobs;
 pub mod lastfm;
 pub mod migrations;

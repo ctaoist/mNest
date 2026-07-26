@@ -48,6 +48,7 @@ describe('SettingsPage permissions', () => {
     mocks.get.mockImplementation((path: string) => {
       if (path === '/api/lastfm/status/') return Promise.resolve(lastfm)
       if (path === '/api/download_sources/') return Promise.resolve([])
+      if (path === '/api/internet_radio_stations/') return Promise.resolve([])
       if (path === '/api/config/status/') return Promise.resolve({
         database: 'sqlite',
         queue: 'database',
@@ -112,5 +113,25 @@ describe('SettingsPage permissions', () => {
     }))
     expect(mocks.post).not.toHaveBeenCalledWith('/api/scan/', expect.anything())
     expect(mocks.notify).toHaveBeenCalledWith('曲库目录已更新，不会自动扫描', 'success')
+  })
+
+  it('saves the OpenSubsonic proxy option for an internet radio', async () => {
+    mocks.role = 'admin'
+    render(() => <SettingsPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '添加电台' })).toBeTruthy())
+
+    await fireEvent.click(screen.getByRole('button', { name: '添加电台' }))
+    await fireEvent.input(screen.getByLabelText('电台名称'), { target: { value: '代理电台' } })
+    await fireEvent.input(screen.getByLabelText('音频流地址'), { target: { value: 'https://radio.example/live' } })
+    await fireEvent.click(screen.getByLabelText('OpenSubsonic 服务端代理'))
+    await fireEvent.click(screen.getByRole('button', { name: '保存电台' }))
+
+    await waitFor(() => expect(mocks.subsonic).toHaveBeenCalledWith('createInternetRadioStation', {
+      id: undefined,
+      name: '代理电台',
+      streamUrl: 'https://radio.example/live',
+      homepageUrl: '',
+      proxy: true,
+    }))
   })
 })

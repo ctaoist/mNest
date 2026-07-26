@@ -45,6 +45,7 @@ use crate::{
         rating as rating_entity, scrobble as scrobble_entity, share as share_entity,
         track as track_entity, track_artist as track_artist_entity, user as user_entity,
     },
+    internet_radio,
     jobs::{self, ScanPayload},
     lastfm,
     models::{Album, Artist, MusicFolder, Track, User},
@@ -207,6 +208,7 @@ async fn dispatch(
 ) -> Response {
     let method = method.trim_end_matches(".view");
     let method = if method == "hls.m3u8" { "hls" } else { method };
+    let request_base_url = request_base_url(&state, request.headers());
     let web_user = web_user_from_headers(
         &state.db,
         request.headers(),
@@ -215,10 +217,13 @@ async fn dispatch(
     .await
     .ok()
     .flatten();
-    let params = match collect_params(request).await {
+    let mut params = match collect_params(request).await {
         Ok(value) => value,
         Err(error) => return subsonic_error(&HashMap::new(), 10, &error.to_string()),
     };
+    if let Some(base_url) = request_base_url {
+        params.insert("_mnest_base_url".into(), base_url);
+    }
     if method == "getOpenSubsonicExtensions" {
         return subsonic_response(&params, open_subsonic_extensions());
     }
@@ -286,6 +291,40 @@ async fn collect_params(request: Request) -> anyhow::Result<HashMap<String, Stri
         params.insert("_range".into(), range);
     }
     Ok(params)
+}
+
+fn request_base_url(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if let Some(public_url) = state
+        .settings
+        .server
+        .public_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(normalized_http_base_url)
+    {
+        return Some(public_url);
+    }
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))?;
+    normalized_http_base_url(&format!("{scheme}://{host}"))
+}
+
+fn normalized_http_base_url(value: &str) -> Option<String> {
+    Url::parse(value)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .map(|url| url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn decode_params(encoded: &[u8]) -> anyhow::Result<HashMap<String, String>> {
@@ -430,7 +469,7 @@ async fn json_endpoint(
         "createShare" => create_share(state, user, p).await,
         "updateShare" => update_share(state, user, p).await,
         "deleteShare" => delete_share(state, user, required(p, "id")?).await,
-        "getInternetRadioStations" => radio_stations(state).await,
+        "getInternetRadioStations" => radio_stations(state, p).await,
         "createInternetRadioStation" => create_radio(state, user, p).await,
         "updateInternetRadioStation" => update_radio(state, user, p).await,
         "deleteInternetRadioStation" => delete_radio(state, user, required(p, "id")?).await,
@@ -1878,13 +1917,27 @@ async fn delete_share(state: &AppState, user: &User, id: &str) -> Result<Value, 
     Ok(json!({}))
 }
 
-async fn radio_stations(state: &AppState) -> Result<Value, ApiFailure> {
+async fn radio_stations(
+    state: &AppState,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
     let rows = radio_entity::Entity::find()
         .order_by_asc(radio_entity::Column::Name)
         .all(&state.db)
         .await?;
+    let proxied = internet_radio::proxy_enabled_ids(&state.db).await?;
+    let proxy_base_url = p.get("_mnest_base_url");
     Ok(
-        json!({"internetRadioStations":{"internetRadioStation":rows.iter().map(|v|json!({"id":v.id,"name":v.name,"streamUrl":v.stream_url,"homePageUrl":v.home_page_url})).collect::<Vec<_>>()}}),
+        json!({"internetRadioStations":{"internetRadioStation":rows.iter().map(|v| {
+            let stream_url = if proxied.contains(&v.id) {
+                proxy_base_url
+                    .map(|base_url| internet_radio::proxy_stream_url(base_url, &v.id, &state.settings.auth.jwt_secret))
+                    .unwrap_or_else(|| v.stream_url.clone())
+            } else {
+                v.stream_url.clone()
+            };
+            json!({"id":v.id,"name":v.name,"streamUrl":stream_url,"homePageUrl":v.home_page_url})
+        }).collect::<Vec<_>>()}}),
     )
 }
 async fn create_radio(
@@ -1894,14 +1947,18 @@ async fn create_radio(
 ) -> Result<Value, ApiFailure> {
     require_admin(user)?;
     let (name, stream_url, home_page_url) = validated_radio_fields(p)?;
+    let id = Uuid::new_v4().to_string();
+    let transaction = state.db.begin().await?;
     radio_entity::ActiveModel {
-        id: Set(Uuid::new_v4().to_string()),
+        id: Set(id.clone()),
         name: Set(name),
         stream_url: Set(stream_url),
         home_page_url: Set(home_page_url),
     }
-    .insert(&state.db)
+    .insert(&transaction)
     .await?;
+    internet_radio::set_proxy_enabled(&transaction, &id, bool_param(p, "proxy")).await?;
+    transaction.commit().await?;
     Ok(json!({}))
 }
 async fn update_radio(
@@ -1911,25 +1968,34 @@ async fn update_radio(
 ) -> Result<Value, ApiFailure> {
     require_admin(user)?;
     let (name, stream_url, home_page_url) = validated_radio_fields(p)?;
+    let transaction = state.db.begin().await?;
     let radio = radio_entity::Entity::find_by_id(required(p, "id")?)
-        .one(&state.db)
+        .one(&transaction)
         .await?
         .ok_or_else(not_found)?;
+    let radio_id = radio.id.clone();
     let mut active = radio.into_active_model();
     active.name = Set(name);
     active.stream_url = Set(stream_url);
     active.home_page_url = Set(home_page_url);
-    active.update(&state.db).await?;
+    active.update(&transaction).await?;
+    if p.contains_key("proxy") {
+        internet_radio::set_proxy_enabled(&transaction, &radio_id, bool_param(p, "proxy")).await?;
+    }
+    transaction.commit().await?;
     Ok(json!({}))
 }
 async fn delete_radio(state: &AppState, user: &User, id: &str) -> Result<Value, ApiFailure> {
     require_admin(user)?;
+    let transaction = state.db.begin().await?;
     let result = radio_entity::Entity::delete_by_id(id)
-        .exec(&state.db)
+        .exec(&transaction)
         .await?;
     if result.rows_affected == 0 {
         return Err(not_found());
     }
+    internet_radio::set_proxy_enabled(&transaction, id, false).await?;
+    transaction.commit().await?;
     Ok(json!({}))
 }
 
@@ -3027,7 +3093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internet_radio_crud_round_trips_standard_fields() {
+    async fn internet_radio_crud_round_trips_fields_and_proxy_preference() {
         let state = test_state().await;
         let admin = user_by_name(&state.db, &state.settings.admin.username)
             .await
@@ -3037,6 +3103,7 @@ mod tests {
             ("name".into(), "Radio One".into()),
             ("streamUrl".into(), "https://radio.example/live".into()),
             ("homepageUrl".into(), "https://radio.example/".into()),
+            ("proxy".into(), "true".into()),
         ]);
         create_radio(&state, &admin, &create).await.unwrap();
         let created = radio_entity::Entity::find()
@@ -3044,11 +3111,32 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let stations = radio_stations(&state).await.unwrap();
-        assert_eq!(
-            stations["internetRadioStations"]["internetRadioStation"][0]["homePageUrl"],
-            "https://radio.example/"
-        );
+        let direct = HashMap::from([
+            ("name".into(), "Radio Direct".into()),
+            ("streamUrl".into(), "https://direct.example/live".into()),
+        ]);
+        create_radio(&state, &admin, &direct).await.unwrap();
+        let list_params =
+            HashMap::from([("_mnest_base_url".into(), "https://music.example".into())]);
+        let stations = radio_stations(&state, &list_params).await.unwrap();
+        let stations = stations["internetRadioStations"]["internetRadioStation"]
+            .as_array()
+            .unwrap();
+        let proxied_station = stations
+            .iter()
+            .find(|station| station["name"] == "Radio One")
+            .unwrap();
+        assert_eq!(proxied_station["homePageUrl"], "https://radio.example/");
+        let proxy_url = proxied_station["streamUrl"].as_str().unwrap();
+        assert!(proxy_url.starts_with("https://music.example/api/internet_radio_stream/?id="));
+        assert!(proxy_url.contains("&token="));
+        let direct_stream_url = stations
+            .iter()
+            .find(|station| station["name"] == "Radio Direct")
+            .unwrap()["streamUrl"]
+            .as_str()
+            .unwrap();
+        assert_eq!(direct_stream_url, "https://direct.example/live");
 
         let update = HashMap::from([
             ("id".into(), created.id.clone()),
@@ -3065,6 +3153,11 @@ mod tests {
         assert_eq!(updated.name, "Radio Two");
         assert_eq!(updated.stream_url, "http://radio.example/aac");
         assert!(updated.home_page_url.is_empty());
+        assert!(
+            internet_radio::proxy_enabled(&state.db, &created.id)
+                .await
+                .unwrap()
+        );
 
         delete_radio(&state, &admin, &created.id).await.unwrap();
         assert!(
@@ -3074,7 +3167,65 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            !internet_radio::proxy_enabled(&state.db, &created.id)
+                .await
+                .unwrap()
+        );
         assert!(delete_radio(&state, &admin, &created.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn open_subsonic_radio_listing_uses_the_request_host_for_proxy_urls() {
+        let state = test_state().await;
+        let admin = user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let (access, _) = crate::auth::issue_tokens(
+            &admin,
+            &state.settings.auth.jwt_secret,
+            state.settings.auth.access_token_minutes,
+            state.settings.auth.refresh_token_days,
+        )
+        .unwrap();
+        radio_entity::ActiveModel {
+            id: Set("proxied-radio".into()),
+            name: Set("Proxied radio".into()),
+            stream_url: Set("https://radio.example/live".into()),
+            home_page_url: Set(String::new()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        internet_radio::set_proxy_enabled(&state.db, "proxied-radio", true)
+            .await
+            .unwrap();
+
+        let response = router()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/getInternetRadioStations?f=json&v=1.16.1&c=test")
+                    .header(header::HOST, "music.example:4535")
+                    .header("x-forwarded-proto", "https")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let stream_url = body["subsonic-response"]["internetRadioStations"]["internetRadioStation"]
+            [0]["streamUrl"]
+            .as_str()
+            .unwrap();
+
+        assert!(stream_url.starts_with(
+            "https://music.example:4535/api/internet_radio_stream/?id=proxied-radio&token="
+        ));
+        assert!(!stream_url.contains("radio.example"));
     }
 
     #[test]

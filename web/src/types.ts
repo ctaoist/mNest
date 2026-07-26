@@ -64,6 +64,7 @@ export interface RadioStation {
   name: string
   streamUrl: string
   homePageUrl?: string
+  proxy?: boolean
 }
 
 export interface PlayQueue {

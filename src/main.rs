@@ -7,7 +7,13 @@ use axum::{body::Body, http::Request};
 use clap::Parser;
 use mnest::{AppState, api, config::Settings, db, jobs::JobRunner, providers::ProviderRegistry};
 use tokio_util::sync::CancellationToken;
-use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+use tower_http::{
+    compression::{
+        CompressionLayer,
+        predicate::{DefaultPredicate, Predicate},
+    },
+    trace::TraceLayer,
+};
 use tracing::{info, info_span, warn};
 
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -42,15 +48,17 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = state.shutdown.clone();
     let runner = JobRunner::start(state.clone(), shutdown.clone()).await?;
 
-    let app = api::router(state).layer(CompressionLayer::new()).layer(
-        TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
-            info_span!(
-                "http_request",
-                method = %request.method(),
-                path = %request.uri().path()
-            )
-        }),
-    );
+    let app = api::router(state)
+        .layer(CompressionLayer::new().compress_when(compression_predicate()))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+                info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path()
+                )
+            }),
+        );
 
     let address: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
         .parse()
@@ -63,6 +71,35 @@ async fn main() -> anyhow::Result<()> {
     shutdown.cancel();
     runner.shutdown().await;
     Ok(())
+}
+
+fn compression_predicate() -> impl Predicate {
+    DefaultPredicate::new().and(
+        |_: axum::http::StatusCode,
+         _: axum::http::Version,
+         headers: &axum::http::HeaderMap,
+         _: &axum::http::Extensions| {
+            match headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+            {
+                Some(content_type) => {
+                    content_type.starts_with("text/")
+                        || matches!(
+                            content_type,
+                            "application/json"
+                                | "application/javascript"
+                                | "application/xml"
+                                | "application/xhtml+xml"
+                                | "image/svg+xml"
+                        )
+                }
+                None => false,
+            }
+        },
+    )
 }
 
 async fn shutdown_signal(shutdown: CancellationToken) {
@@ -104,5 +141,68 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, header},
+        response::IntoResponse,
+        routing::get,
+    };
+    use tower::ServiceExt;
+    use tower_http::compression::CompressionLayer;
+
+    use super::compression_predicate;
+
+    async fn audio() -> impl IntoResponse {
+        ([(header::CONTENT_TYPE, "audio/mpeg")], vec![b'A'; 128])
+    }
+
+    async fn text() -> impl IntoResponse {
+        ([(header::CONTENT_TYPE, "text/plain")], "A".repeat(128))
+    }
+
+    #[tokio::test]
+    async fn compression_skips_audio_but_keeps_text_compression() {
+        let app = Router::new()
+            .route("/audio", get(audio))
+            .route("/text", get(text))
+            .layer(CompressionLayer::new().compress_when(compression_predicate()));
+
+        let audio = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/audio")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(audio.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(
+            to_bytes(audio.into_body(), usize::MAX).await.unwrap(),
+            vec![b'A'; 128]
+        );
+
+        let text = app
+            .oneshot(
+                Request::builder()
+                    .uri("/text")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            text.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
     }
 }

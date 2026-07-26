@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    io,
     path::{Component, Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -24,7 +25,10 @@ use sea_orm::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::AsyncWriteExt,
+    process::{Child, Command},
+};
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
 
 use crate::{
@@ -32,8 +36,10 @@ use crate::{
     auth::{
         AdminUser, AuthUser, authenticate_password_with_subsonic, cookie_value, decode_token,
         decrypt_server_secret, encrypt_server_secret, issue_tokens, user_by_id,
+        web_user_from_headers,
     },
     entities::{app_setting, download_source, internet_radio_station, job, music_folder, track},
+    internet_radio,
     jobs::{self, AutoTagPayload, ScanPayload},
     lastfm,
     models::{ApiResponse, MusicFolder},
@@ -86,6 +92,10 @@ pub fn router() -> Router<AppState> {
             post(delete_download_source),
         )
         .route("/api/remote_download/search/", post(remote_download_search))
+        .route(
+            "/api/internet_radio_stations/",
+            get(internet_radio_stations),
+        )
         .route("/api/internet_radio_stream/", get(internet_radio_stream))
         .route(
             "/api/remote_download/preview/",
@@ -846,6 +856,7 @@ struct RemotePreviewQuery {
 #[derive(Deserialize)]
 struct InternetRadioStreamQuery {
     id: String,
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1059,9 +1070,33 @@ async fn remote_download_preview(
     Ok(response)
 }
 
+async fn internet_radio_stations(
+    State(state): State<AppState>,
+    _user: AdminUser,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    let stations = internet_radio_station::Entity::find()
+        .order_by_asc(internet_radio_station::Column::Name)
+        .all(&state.db)
+        .await?;
+    let proxied = internet_radio::proxy_enabled_ids(&state.db).await?;
+    let stations = stations
+        .into_iter()
+        .map(|station| {
+            let proxy = proxied.contains(&station.id);
+            json!({
+                "id": station.id,
+                "name": station.name,
+                "streamUrl": station.stream_url,
+                "homePageUrl": station.home_page_url,
+                "proxy": proxy,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(ApiResponse::success(json!(stations))))
+}
+
 async fn internet_radio_stream(
     State(state): State<AppState>,
-    _user: AuthUser,
     headers: HeaderMap,
     Query(request): Query<InternetRadioStreamQuery>,
 ) -> Result<Response, ApiError> {
@@ -1072,6 +1107,17 @@ async fn internet_radio_stream(
         .one(&state.db)
         .await?
         .ok_or_else(|| ApiError::bad_request("网络电台不存在"))?;
+    let proxy_token_valid = request.token.as_deref().is_some_and(|token| {
+        internet_radio::verify_proxy_token(&station.id, token, &state.settings.auth.jwt_secret)
+    }) && internet_radio::proxy_enabled(&state.db, &station.id).await?;
+    if !proxy_token_valid
+        && web_user_from_headers(&state.db, &headers, &state.settings.auth.jwt_secret)
+            .await
+            .map_err(|_| ApiError::unauthorized("网络电台代理认证失败"))?
+            .is_none()
+    {
+        return Err(ApiError::unauthorized("缺少网络电台代理凭据"));
+    }
     let url = reqwest::Url::parse(station.stream_url.trim())
         .map_err(|_| ApiError::bad_request("网络电台流地址无效"))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -1084,7 +1130,7 @@ async fn internet_radio_stream(
         .user_agent("mNest/internet-radio")
         .build()
         .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
-    let mut upstream_request = client.get(url).header("Icy-MetaData", "0");
+    let mut upstream_request = client.get(url.clone()).header("Icy-MetaData", "0");
     if let Some(range) = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
@@ -1106,9 +1152,9 @@ async fn internet_radio_stream(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     if is_hls_radio_stream(upstream.url(), content_type) {
-        let url = upstream.url().clone();
+        let resolved_url = upstream.url().clone();
         drop(upstream);
-        return transcode_hls_radio(&state, &url).await;
+        return transcode_hls_radio(&state, client, url, resolved_url).await;
     }
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .map_err(|_| ApiError::bad_gateway("网络电台返回了无效状态码"))?;
@@ -1159,20 +1205,48 @@ fn is_hls_radio_stream(url: &reqwest::Url, content_type: Option<&str>) -> bool {
     )
 }
 
-async fn transcode_hls_radio(state: &AppState, url: &reqwest::Url) -> Result<Response, ApiError> {
-    let mut command = Command::new(&state.settings.tools.ffmpeg);
+const HLS_RADIO_MAX_RESTARTS: u8 = 3;
+const HLS_RADIO_STABLE_RUNTIME: Duration = Duration::from_secs(10);
+const HLS_RADIO_STABLE_BYTES: u64 = 128 * 1024;
+
+struct HlsRadioProcess {
+    stdout: ReaderStream<tokio::process::ChildStdout>,
+    child: Child,
+    started_at: Instant,
+    output_bytes: u64,
+}
+
+struct HlsRadioStreamState {
+    ffmpeg: PathBuf,
+    client: reqwest::Client,
+    source_url: reqwest::Url,
+    shutdown: CancellationToken,
+    process: Option<HlsRadioProcess>,
+    restart_attempts: u8,
+}
+
+fn spawn_hls_radio_process(ffmpeg: &Path, source_url: &str) -> io::Result<HlsRadioProcess> {
+    let mut command = Command::new(ffmpeg);
     command.kill_on_drop(true);
     command
         .args([
             "-nostdin",
             "-v",
             "error",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_at_eof",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            "-rw_timeout",
+            "30000000",
             "-user_agent",
             "mNest/internet-radio",
             "-i",
-        ])
-        .arg(url.as_str())
-        .args([
+            source_url,
             "-map",
             "0:a:0",
             "-vn",
@@ -1182,40 +1256,186 @@ async fn transcode_hls_radio(state: &AppState, url: &reqwest::Url) -> Result<Res
             "128k",
             "-f",
             "mp3",
+            "-id3v2_version",
+            "0",
+            "-write_xing",
+            "0",
             "pipe:1",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(|error| ApiError::bad_gateway(format!("网络电台 HLS 转码启动失败：{error}")))?;
+    let mut child = command.spawn()?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| ApiError::bad_gateway("网络电台 HLS 转码输出不可用"))?;
-    let stream = futures::stream::try_unfold(
-        (ReaderStream::new(stdout), child),
-        |(mut stdout, mut child)| async move {
-            match stdout.next().await {
-                Some(Ok(chunk)) => Ok(Some((chunk, (stdout, child)))),
-                Some(Err(error)) => {
-                    let _ = child.kill().await;
-                    Err(error)
+        .ok_or_else(|| io::Error::other("ffmpeg stdout unavailable"))?;
+    Ok(HlsRadioProcess {
+        stdout: ReaderStream::new(stdout),
+        child,
+        started_at: Instant::now(),
+        output_bytes: 0,
+    })
+}
+
+fn hls_radio_restart_delay(
+    state: &mut HlsRadioStreamState,
+    runtime: Duration,
+    output_bytes: u64,
+    error: &io::Error,
+) -> io::Result<Duration> {
+    if runtime >= HLS_RADIO_STABLE_RUNTIME && output_bytes >= HLS_RADIO_STABLE_BYTES {
+        state.restart_attempts = 0;
+    }
+    state.restart_attempts = state.restart_attempts.saturating_add(1);
+    if state.restart_attempts > HLS_RADIO_MAX_RESTARTS {
+        return Err(io::Error::other(format!(
+            "network radio transcoder stopped after {HLS_RADIO_MAX_RESTARTS} restart attempts: {error}"
+        )));
+    }
+    let delay = Duration::from_millis(250 * (1_u64 << (state.restart_attempts - 1)));
+    tracing::warn!(
+        restart_attempt = state.restart_attempts,
+        delay_ms = delay.as_millis(),
+        %error,
+        "network radio transcoder stopped; restarting"
+    );
+    Ok(delay)
+}
+
+async fn wait_for_hls_radio_restart(shutdown: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+async fn resolve_hls_radio_url(
+    client: &reqwest::Client,
+    source_url: &reqwest::Url,
+) -> io::Result<reqwest::Url> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(20),
+        client
+            .get(source_url.clone())
+            .header("Icy-MetaData", "0")
+            .send(),
+    )
+    .await
+    .map_err(|_| io::Error::other("timed out resolving internet radio HLS URL"))?
+    .map_err(|error| io::Error::other(error.without_url().to_string()))?;
+    if !response.status().is_success() {
+        return Err(io::Error::other(format!(
+            "internet radio returned HTTP {} while refreshing HLS URL",
+            response.status().as_u16()
+        )));
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if !is_hls_radio_stream(response.url(), content_type) {
+        return Err(io::Error::other(
+            "internet radio no longer resolves to an HLS stream",
+        ));
+    }
+    Ok(response.url().clone())
+}
+
+async fn transcode_hls_radio(
+    state: &AppState,
+    client: reqwest::Client,
+    source_url: reqwest::Url,
+    resolved_url: reqwest::Url,
+) -> Result<Response, ApiError> {
+    let process = spawn_hls_radio_process(&state.settings.tools.ffmpeg, resolved_url.as_str())
+        .map_err(|error| ApiError::bad_gateway(format!("网络电台 HLS 转码启动失败：{error}")))?;
+    let stream_state = HlsRadioStreamState {
+        ffmpeg: state.settings.tools.ffmpeg.clone(),
+        client,
+        source_url,
+        shutdown: state.shutdown.clone(),
+        process: Some(process),
+        restart_attempts: 0,
+    };
+    let stream = futures::stream::try_unfold(stream_state, |mut state| async move {
+        loop {
+            if state.shutdown.is_cancelled() {
+                if let Some(mut process) = state.process.take() {
+                    let _ = process.child.kill().await;
                 }
-                None => {
-                    let status = child.wait().await?;
-                    if status.success() {
-                        Ok(None)
-                    } else {
-                        Err(std::io::Error::other(format!(
-                            "ffmpeg exited with status {status}"
-                        )))
+                return Ok::<_, io::Error>(None);
+            }
+            if state.process.is_none() {
+                let process = match resolve_hls_radio_url(&state.client, &state.source_url).await {
+                    Ok(resolved_url) => {
+                        spawn_hls_radio_process(&state.ffmpeg, resolved_url.as_str())
+                    }
+                    Err(error) => Err(error),
+                };
+                match process {
+                    Ok(process) => state.process = Some(process),
+                    Err(error) => {
+                        let delay = hls_radio_restart_delay(&mut state, Duration::ZERO, 0, &error)?;
+                        if !wait_for_hls_radio_restart(&state.shutdown, delay).await {
+                            return Ok(None);
+                        }
+                        continue;
                     }
                 }
             }
-        },
-    );
-    let stream = stream.take_until(state.shutdown.clone().cancelled_owned());
+
+            let shutdown = state.shutdown.clone();
+            let (cancelled, next) = {
+                let process = state.process.as_mut().expect("process was initialized");
+                tokio::select! {
+                    _ = shutdown.cancelled() => (true, None),
+                    next = process.stdout.next() => (false, Some(next)),
+                }
+            };
+            if cancelled {
+                if let Some(mut process) = state.process.take() {
+                    let _ = process.child.kill().await;
+                }
+                return Ok(None);
+            }
+
+            match next.expect("stdout completed the select") {
+                Some(Ok(chunk)) => {
+                    if let Some(process) = state.process.as_mut() {
+                        process.output_bytes =
+                            process.output_bytes.saturating_add(chunk.len() as u64);
+                    }
+                    return Ok(Some((chunk, state)));
+                }
+                Some(Err(error)) => {
+                    let mut process = state.process.take().expect("process was initialized");
+                    let runtime = process.started_at.elapsed();
+                    let output_bytes = process.output_bytes;
+                    let _ = process.child.kill().await;
+                    let _ = process.child.wait().await;
+                    let delay = hls_radio_restart_delay(&mut state, runtime, output_bytes, &error)?;
+                    if !wait_for_hls_radio_restart(&state.shutdown, delay).await {
+                        return Ok(None);
+                    }
+                }
+                None => {
+                    let mut process = state.process.take().expect("process was initialized");
+                    let runtime = process.started_at.elapsed();
+                    let output_bytes = process.output_bytes;
+                    let status = process.child.wait().await?;
+                    let error = io::Error::other(if status.success() {
+                        "ffmpeg ended an internet radio stream unexpectedly".to_owned()
+                    } else {
+                        format!("ffmpeg exited with status {status}")
+                    });
+                    let delay = hls_radio_restart_delay(&mut state, runtime, output_bytes, &error)?;
+                    if !wait_for_hls_radio_restart(&state.shutdown, delay).await {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    });
     let mut response = Response::new(Body::from_stream(stream));
     response
         .headers_mut()
@@ -2545,24 +2765,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxies_an_authenticated_internet_radio_stream() {
+    async fn proxies_authenticated_and_signed_internet_radio_streams() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 2048];
-            let size = socket.read(&mut request).await.unwrap();
-            assert!(
-                String::from_utf8_lossy(&request[..size])
-                    .to_ascii_lowercase()
-                    .contains("icy-metadata: 0")
-            );
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 5\r\n\r\nRADIO",
-                )
-                .await
-                .unwrap();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let size = socket.read(&mut request).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size])
+                        .to_ascii_lowercase()
+                        .contains("icy-metadata: 0")
+                );
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 5\r\n\r\nRADIO",
+                    )
+                    .await
+                    .unwrap();
+            }
         });
         let state = test_state().await;
         let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
@@ -2585,9 +2807,13 @@ mod tests {
         .insert(&state.db)
         .await
         .unwrap();
+        internet_radio::set_proxy_enabled(&state.db, "radio-1", true)
+            .await
+            .unwrap();
 
-        let response = router()
-            .with_state(state)
+        let app = router().with_state(state.clone());
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/internet_radio_stream/?id=radio-1")
@@ -2606,54 +2832,145 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             b"RADIO".as_slice()
         );
+
+        let signed_url = reqwest::Url::parse(&internet_radio::proxy_stream_url(
+            "http://localhost",
+            "radio-1",
+            &state.settings.auth.jwt_secret,
+        ))
+        .unwrap();
+        let signed_uri = match signed_url.query() {
+            Some(query) => format!("{}?{query}", signed_url.path()),
+            None => signed_url.path().to_owned(),
+        };
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(signed_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            b"RADIO".as_slice()
+        );
         upstream.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_signed_radio_proxy_urls_after_proxy_is_disabled() {
+        let state = test_state().await;
+        internet_radio_station::ActiveModel {
+            id: Set("radio-disabled".into()),
+            name: Set("Disabled proxy".into()),
+            stream_url: Set("https://radio.example/live".into()),
+            home_page_url: Set(String::new()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let signed_url = reqwest::Url::parse(&internet_radio::proxy_stream_url(
+            "http://localhost",
+            "radio-disabled",
+            &state.settings.auth.jwt_secret,
+        ))
+        .unwrap();
+        let signed_uri = format!(
+            "{}?{}",
+            signed_url.path(),
+            signed_url.query().unwrap_or_default()
+        );
+
+        let response = router()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(signed_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn transcodes_a_redirected_hls_radio_with_a_generic_content_type() {
+    async fn refreshes_a_redirected_hls_url_before_restarting() {
         use std::os::unix::fs::PermissionsExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 2048];
-            let size = socket.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..size]).contains("GET /live "));
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 302 Found\r\nLocation: http://{address}/stream/index.m3u8?token=test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            for token in ["initial", "refreshed"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let size = socket.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..size]).contains("GET /live "));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{address}/stream/index.m3u8?token={token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
+                    .await
+                    .unwrap();
 
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let size = socket.read(&mut request).await.unwrap();
-            assert!(
-                String::from_utf8_lossy(&request[..size])
-                    .contains("GET /stream/index.m3u8?token=test ")
-            );
-            let playlist = b"#EXTM3U\n#EXT-X-VERSION:3\n";
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        playlist.len()
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let size = socket.read(&mut request).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size])
+                        .contains(&format!("GET /stream/index.m3u8?token={token} "))
+                );
+                let playlist = b"#EXTM3U\n#EXT-X-VERSION:3\n";
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            playlist.len()
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            socket.write_all(playlist).await.unwrap();
+                    .await
+                    .unwrap();
+                socket.write_all(playlist).await.unwrap();
+            }
         });
 
         let temp = tempfile::tempdir().unwrap();
         let fake_ffmpeg = temp.path().join("ffmpeg");
-        std::fs::write(&fake_ffmpeg, "#!/bin/sh\nprintf 'HLS-RADIO'\n").unwrap();
+        let invocations = temp.path().join("invocations");
+        let arguments = temp.path().join("arguments");
+        std::fs::write(
+            &fake_ffmpeg,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+count=0
+if [ -f '{}' ]; then
+  read count < '{}'
+fi
+count=$((count + 1))
+printf '%s' "$count" > '{}'
+if [ "$count" -eq 1 ]; then
+  printf 'HLS-FIRST'
+  exit 1
+fi
+printf 'HLS-SECOND'
+exec sleep 30
+"#,
+                arguments.display(),
+                invocations.display(),
+                invocations.display(),
+                invocations.display(),
+            ),
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(&fake_ffmpeg).unwrap().permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(&fake_ffmpeg, permissions).unwrap();
@@ -2697,10 +3014,30 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "audio/mpeg"
         );
-        assert_eq!(
-            response.into_body().collect().await.unwrap().to_bytes(),
-            b"HLS-RADIO".as_slice()
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("first transcoder output timed out")
+            .expect("first transcoder output missing")
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(3), body.next())
+            .await
+            .expect("restarted transcoder output timed out")
+            .expect("restarted transcoder output missing")
+            .unwrap();
+        assert_eq!(first, b"HLS-FIRST".as_slice());
+        assert_eq!(second, b"HLS-SECOND".as_slice());
+        drop(body);
+
+        assert_eq!(std::fs::read_to_string(&invocations).unwrap(), "2");
+        let arguments = std::fs::read_to_string(arguments).unwrap();
+        assert!(
+            arguments
+                .lines()
+                .any(|value| value
+                    == format!("http://{address}/stream/index.m3u8?token=refreshed"))
         );
+        assert!(!arguments.contains("token=initial"));
         upstream.await.unwrap();
     }
 
