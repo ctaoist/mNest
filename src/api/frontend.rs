@@ -33,12 +33,23 @@ pub async fn serve(method: Method, uri: Uri) -> Response {
         return response;
     }
 
+    if is_backend_path(asset_path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     if !asset_path.contains('.') {
         return embedded_response(INDEX_HTML, &method)
             .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+fn is_backend_path(path: &str) -> bool {
+    matches!(
+        path.split('/').next(),
+        Some("api" | "rest" | "user" | "health")
+    )
 }
 
 fn embedded_response(path: &str, method: &Method) -> Option<Response> {
@@ -128,5 +139,18 @@ mod tests {
         let response = serve(Method::GET, Uri::from_static("/assets/missing-bundle.js")).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn does_not_return_html_for_missing_backend_routes() {
+        for uri in [
+            "/api/internet_radio_stream/",
+            "/rest/missing",
+            "/user/missing",
+            "/health/missing",
+        ] {
+            let response = serve(Method::GET, uri.parse().unwrap()).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 }

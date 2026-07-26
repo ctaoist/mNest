@@ -646,7 +646,7 @@ function RadioGrid(props: { stations: RadioStation[] }) {
           const active = () => player.current()?.id === `radio:${station.id}`
           const streamUrl = () => safeHttpUrl(station.streamUrl)
           const homePageUrl = () => safeHttpUrl(station.homePageUrl)
-          const proxyUrl = () => `/api/internet_radio_stream/?${new URLSearchParams({ id: station.id }).toString()}`
+          const proxyUrl = () => `/api/internet_radio_stream.mp3?${new URLSearchParams({ id: station.id }).toString()}`
           return (
             <article class={`radio-card ${active() ? 'is-active' : ''}`}>
               <span class="radio-mark"><RadioTower /></span>

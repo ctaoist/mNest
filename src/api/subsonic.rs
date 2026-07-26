@@ -2030,6 +2030,12 @@ fn validate_radio_url(value: &str, parameter: &str) -> Result<String, ApiFailure
             format!("Internet radio {parameter} must use HTTP or HTTPS"),
         ));
     }
+    if parameter == "streamUrl" && internet_radio::is_proxy_stream_url(&url) {
+        return Err(ApiFailure::new(
+            10,
+            "Internet radio streamUrl must be the original stream URL",
+        ));
+    }
     Ok(value.to_owned())
 }
 
@@ -3087,6 +3093,14 @@ mod tests {
                 ("streamUrl".into(), "https://radio.example/live".into()),
                 ("homepageUrl".into(), "file:///tmp/radio".into()),
             ]),
+            HashMap::from([
+                ("name".into(), "Radio".into()),
+                (
+                    "streamUrl".into(),
+                    "https://music.example/api/internet_radio_stream.mp3?id=radio-1&token=test"
+                        .into(),
+                ),
+            ]),
         ] {
             assert!(validated_radio_fields(&invalid).is_err());
         }
@@ -3128,7 +3142,7 @@ mod tests {
             .unwrap();
         assert_eq!(proxied_station["homePageUrl"], "https://radio.example/");
         let proxy_url = proxied_station["streamUrl"].as_str().unwrap();
-        assert!(proxy_url.starts_with("https://music.example/api/internet_radio_stream/?id="));
+        assert!(proxy_url.starts_with("https://music.example/api/internet_radio_stream.mp3?id="));
         assert!(proxy_url.contains("&token="));
         let direct_stream_url = stations
             .iter()
@@ -3223,7 +3237,7 @@ mod tests {
             .unwrap();
 
         assert!(stream_url.starts_with(
-            "https://music.example:4535/api/internet_radio_stream/?id=proxied-radio&token="
+            "https://music.example:4535/api/internet_radio_stream.mp3?id=proxied-radio&token="
         ));
         assert!(!stream_url.contains("radio.example"));
     }
