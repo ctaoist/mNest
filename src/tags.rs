@@ -131,6 +131,13 @@ impl TagService {
         Ok(artwork)
     }
 
+    pub fn clear_artwork_cache(&self, source: &Path) -> anyhow::Result<()> {
+        if !self.cover_cache.enabled {
+            return Ok(());
+        }
+        self.remove_stale_artwork_cache(source)
+    }
+
     fn read_artwork_lofty(&self, path: &Path) -> anyhow::Result<Option<AudioArtwork>> {
         let tagged = Probe::open(path)?
             .options(ParseOptions::new().read_properties(false))

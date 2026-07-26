@@ -76,6 +76,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/library_roots/update/", post(update_library_root))
         .route("/api/library_roots/delete/", post(delete_library_root))
+        .route("/api/tracks/delete/", post(delete_track))
         .route(
             "/api/download_sources/",
             get(download_sources).post(save_download_source),
@@ -1912,6 +1913,76 @@ async fn delete_library_root(
     Ok(Json(ApiResponse::success(json!([]))))
 }
 
+#[derive(Deserialize)]
+struct DeleteTrackRequest {
+    id: String,
+}
+
+async fn delete_track(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Json(request): Json<DeleteTrackRequest>,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    if user.role != "admin" {
+        return Err(ApiError::forbidden("需要管理员权限"));
+    }
+    let indexed_track = track::Entity::find_by_id(&request.id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("歌曲不存在"))?;
+    let folder = music_folder::Entity::find_by_id(&indexed_track.folder_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("歌曲所属曲库不存在"))?;
+    let stored_path = PathBuf::from(&indexed_track.path);
+    if !stored_path.is_absolute() {
+        return Err(ApiError::bad_request("歌曲文件路径无效"));
+    }
+    let track_ids: Vec<String> = track::Entity::find()
+        .select_only()
+        .column(track::Column::Id)
+        .filter(track::Column::Path.eq(&indexed_track.path))
+        .into_tuple()
+        .all(&state.db)
+        .await?;
+
+    let file_deleted = match tokio::fs::symlink_metadata(&stored_path).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ApiError::bad_request("不允许永久删除符号链接歌曲"));
+            }
+            if !metadata.is_file() {
+                return Err(ApiError::bad_request("歌曲路径不是普通文件"));
+            }
+            let root = tokio::fs::canonicalize(&folder.path)
+                .await
+                .map_err(|_| ApiError::bad_request("曲库目录不存在或无法访问"))?;
+            let path = tokio::fs::canonicalize(&stored_path)
+                .await
+                .map_err(|_| ApiError::bad_request("歌曲文件不存在或无法访问"))?;
+            if !path.starts_with(&root) {
+                return Err(ApiError::forbidden("歌曲文件不在所属曲库目录中"));
+            }
+            if let Err(error) = state.tags.clear_artwork_cache(&path) {
+                tracing::warn!(path = %path.display(), %error, "failed to clear deleted track artwork cache");
+            }
+            tokio::fs::remove_file(&path).await?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+
+    let removed_records = scanner::remove_track_records(&state.db, &track_ids).await?;
+    scanner::rebuild_aggregates(&state.db).await?;
+    Ok(Json(ApiResponse::success(json!({
+        "id": request.id,
+        "ids": track_ids,
+        "file_deleted": file_deleted,
+        "removed_records": removed_records,
+    }))))
+}
+
 async fn fetch_library_roots(state: &AppState) -> Result<Vec<MusicFolder>, ApiError> {
     Ok(music_folder::Entity::find()
         .filter(music_folder::Column::Enabled.eq(1))
@@ -2171,6 +2242,63 @@ mod tests {
             .unwrap();
         let providers = Arc::new(crate::providers::ProviderRegistry::new(settings.clone()));
         AppState::new(settings, db, providers)
+    }
+
+    async fn insert_test_track(
+        state: &AppState,
+        folder_id: &str,
+        root: &Path,
+        track_id: &str,
+        path: &Path,
+    ) {
+        music_folder::ActiveModel {
+            id: Set(folder_id.to_owned()),
+            name: Set("Library".into()),
+            path: Set(root.to_string_lossy().into_owned()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        crate::models::Track {
+            id: track_id.to_owned(),
+            folder_id: folder_id.to_owned(),
+            path: path.to_string_lossy().into_owned(),
+            relative_path: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            title: "Delete Me".into(),
+            artist_id: "artist-1".into(),
+            artist_name: "Artist".into(),
+            artists_json: "[]".into(),
+            album_id: None,
+            album_name: String::new(),
+            album_artist: String::new(),
+            genre: String::new(),
+            year: 0,
+            track_number: 0,
+            disc_number: 0,
+            duration: 1.0,
+            bit_rate: 0,
+            size: 0,
+            suffix: "wav".into(),
+            mimetype: "audio/wav".into(),
+            lyrics: String::new(),
+            comment: String::new(),
+            cover_path: None,
+            mtime: 0,
+            fingerprint: String::new(),
+            play_count: 0,
+            needs_scrape: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+        .into_active_model()
+        .insert(&state.db)
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -2654,6 +2782,109 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn permanently_deletes_an_indexed_track_file_and_record() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let song = library.path().join("delete-me.wav");
+        std::fs::write(&song, minimal_wav()).unwrap();
+        insert_test_track(&state, "library-1", library.path(), "track-1", &song).await;
+
+        let response = delete_track(
+            State(state.clone()),
+            AuthUser(admin),
+            Json(DeleteTrackRequest {
+                id: "track-1".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.data["file_deleted"], true);
+        assert!(!song.exists());
+        assert!(
+            track::Entity::find_by_id("track-1")
+                .one(&state.db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_delete_rejects_files_outside_the_tracks_library() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let song = outside.path().join("outside.wav");
+        std::fs::write(&song, minimal_wav()).unwrap();
+        insert_test_track(&state, "library-1", library.path(), "track-1", &song).await;
+
+        let error = delete_track(
+            State(state.clone()),
+            AuthUser(admin),
+            Json(DeleteTrackRequest {
+                id: "track-1".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(song.exists());
+        assert!(
+            track::Entity::find_by_id("track-1")
+                .one(&state.db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_delete_requires_an_administrator() {
+        let state = test_state().await;
+        let user = crate::entities::user::ActiveModel {
+            id: Set("listener-id".into()),
+            username: Set("listener".into()),
+            password_hash: Set(String::new()),
+            email: Set(String::new()),
+            role: Set("user".into()),
+            subsonic_token: Set(String::new()),
+            subsonic_password: Set(String::new()),
+            created_at: Set(chrono::Utc::now().to_rfc3339()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let song = library.path().join("protected.wav");
+        std::fs::write(&song, minimal_wav()).unwrap();
+        insert_test_track(&state, "library-1", library.path(), "track-1", &song).await;
+
+        let error = delete_track(
+            State(state.clone()),
+            AuthUser(user),
+            Json(DeleteTrackRequest {
+                id: "track-1".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(song.exists());
     }
 
     #[tokio::test]

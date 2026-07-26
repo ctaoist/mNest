@@ -77,17 +77,20 @@ describe('TrackTable', () => {
   it('adds and removes the exact row through playlist actions', async () => {
     const onAddToPlaylist = vi.fn()
     const onRemove = vi.fn()
+    const onDelete = vi.fn()
     render(() => (
       <PlayerProvider>
-        <TrackTable tracks={tracks} onAddToPlaylist={onAddToPlaylist} onRemove={onRemove} />
+        <TrackTable tracks={tracks} onAddToPlaylist={onAddToPlaylist} onRemove={onRemove} onDelete={onDelete} />
       </PlayerProvider>
     ))
 
     await fireEvent.click(screen.getByRole('button', { name: '将 晨雾 添加到歌单' }))
     await fireEvent.click(screen.getByRole('button', { name: '从歌单移除 晨雾' }))
+    await fireEvent.click(screen.getByRole('button', { name: '永久删除 晨雾' }))
 
     expect(onAddToPlaylist).toHaveBeenCalledWith(tracks[1])
     expect(onRemove).toHaveBeenCalledWith(tracks[1], 1)
+    expect(onDelete).toHaveBeenCalledWith(tracks[1])
   })
 
   it('renders sortable headers and reports the selected column', async () => {

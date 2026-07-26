@@ -24,7 +24,7 @@ import { TrackTable } from '../components/TrackTable'
 import { useAuth } from '../context/auth'
 import { usePlayer } from '../context/player'
 import { useToast } from '../context/toast'
-import { subsonic } from '../lib/api'
+import { post, subsonic } from '../lib/api'
 import {
   PAGE_SIZE_OPTIONS,
   buildPaginationItems,
@@ -81,6 +81,8 @@ export function PlayerPage() {
   const [searching, setSearching] = createSignal(false)
   const [results, setResults] = createSignal<SearchResult | null>(null)
   const [loading, setLoading] = createSignal(true)
+  const [deletingTrack, setDeletingTrack] = createSignal('')
+  const canDeleteTracks = () => auth.user()?.role === 'admin'
 
   const sortedSongs = createMemo(() => {
     const key = songSortKey()
@@ -312,6 +314,58 @@ export function PlayerPage() {
     }
   }
 
+  const permanentlyDeleteTrack = async (track: Track) => {
+    if (!canDeleteTracks() || deletingTrack()) return
+    if (!window.confirm(`永久删除“${track.title}”？\n\n服务器上的歌曲文件会被立即删除，且无法恢复。`)) return
+    setDeletingTrack(track.id)
+    try {
+      const response = await post<{ id: string; ids?: string[] }>('/api/tracks/delete/', { id: track.id })
+      const deletedIds = new Set(response.ids?.length ? response.ids : [response.id])
+      const keepTracks = (items: Track[] = []) => items.filter((item) => !deletedIds.has(item.id))
+      const nextSongs = keepTracks(songs())
+      setSongs(nextSongs)
+      setFavorites((items) => keepTracks(items))
+      setResults((value) => value ? { ...value, song: keepTracks(value.song || []) } : value)
+      setSelectedAlbum((value) => {
+        if (!value) return value
+        const song = keepTracks(value.song || [])
+        return song.length ? { ...value, song, songCount: song.length, duration: song.reduce((sum, item) => sum + item.duration, 0) } : null
+      })
+      setSelectedArtist((value) => {
+        if (!value) return value
+        const tracks = keepTracks(value.tracks)
+        return tracks.length ? { ...value, tracks } : null
+      })
+      setSelectedPlaylist((value) => {
+        if (!value) return value
+        const entry = keepTracks(value.entry || [])
+        return { ...value, entry, songCount: entry.length, duration: entry.reduce((sum, item) => sum + item.duration, 0) }
+      })
+      for (let index = player.queue().length - 1; index >= 0; index -= 1) {
+        if (deletedIds.has(player.queue()[index].id)) player.removeAt(index)
+      }
+      setSongPage((page) => Math.min(page, Math.max(1, Math.ceil(nextSongs.length / songPageSize()))))
+      toast.notify('歌曲文件已永久删除', 'success')
+
+      try {
+        const [nextAlbums, artistResponse] = await Promise.all([
+          loadAllAlbums(),
+          subsonic<{ artists: { index?: Array<{ artist?: Artist[] }> } }>('getArtists'),
+          loadFavorites(),
+          loadPlaylists(),
+        ])
+        setAlbums(nextAlbums)
+        setArtists((artistResponse.artists?.index || []).flatMap((group) => group.artist || []))
+      } catch (error) {
+        toast.notify(error instanceof Error ? `歌曲已删除，但曲库统计刷新失败：${error.message}` : '歌曲已删除，但曲库统计刷新失败', 'info')
+      }
+    } catch (error) {
+      toast.notify(error instanceof Error ? error.message : '歌曲永久删除失败', 'error')
+    } finally {
+      setDeletingTrack('')
+    }
+  }
+
   return (
     <div class="page player-page">
       <header class="player-toolbar" aria-label="播放器工具栏">
@@ -335,7 +389,7 @@ export function PlayerPage() {
             <section class="search-results page-reveal">
               <div class="section-heading"><div><span class="eyebrow">SEARCH RESULTS</span><h2>“{query()}”</h2></div><button class="text-button" onClick={() => { setResults(null); setQuery('') }}>清除搜索</button></div>
               <Show when={searchResults().album?.length}><AlbumGrid albums={searchResults().album} onOpen={openAlbum} /></Show>
-              <Show when={searchResults().song?.length}><div class="panel"><h3>歌曲</h3><TrackTable tracks={searchResults().song} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} /></div></Show>
+              <Show when={searchResults().song?.length}><div class="panel"><h3>歌曲</h3><TrackTable tracks={searchResults().song} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} onDelete={canDeleteTracks() ? permanentlyDeleteTrack : undefined} deleteDisabled={!!deletingTrack()} /></div></Show>
               <Show when={!searchResults().album?.length && !searchResults().song?.length}><div class="empty-state">没有找到匹配内容</div></Show>
             </section>
           )}
@@ -345,14 +399,14 @@ export function PlayerPage() {
           <div class="page-reveal">
             <section class="panel">
               <div class="section-heading compact"><div><span class="eyebrow">SONG CATALOGUE</span><h2>全部歌曲</h2></div><div class="section-actions"><span class="count-label">{songs().length} 首</span><button class="primary-button small" disabled={!songs().length} onClick={() => player.playTracks(sortedSongs())}><Play size={15} fill="currentColor" />播放全部</button></div></div>
-              <TrackTable tracks={pagedSongs()} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} showHeader sortKey={songSortKey()} sortDirection={songSortDirection()} onSort={sortSongsBy} />
+              <TrackTable tracks={pagedSongs()} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} onDelete={canDeleteTracks() ? permanentlyDeleteTrack : undefined} deleteDisabled={!!deletingTrack()} showHeader sortKey={songSortKey()} sortDirection={songSortDirection()} onSort={sortSongsBy} />
               <Pagination page={songPage()} total={songs().length} pageSize={songPageSize()} onChange={setSongPage} onPageSizeChange={(size) => { setSongPageSize(size); setSongPage(1) }} />
             </section>
 
             <Show when={favorites().length}>
               <section class="panel player-favorites">
                 <div class="section-heading compact"><div><span class="eyebrow">YOUR COLLECTION</span><h2>收藏歌曲</h2></div><button class="round-action" onClick={() => player.playTracks(favorites())}><Play fill="currentColor" /></button></div>
-                <TrackTable tracks={favorites()} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} />
+                <TrackTable tracks={favorites()} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} onDelete={canDeleteTracks() ? permanentlyDeleteTrack : undefined} deleteDisabled={!!deletingTrack()} />
               </section>
             </Show>
           </div>
@@ -415,7 +469,7 @@ export function PlayerPage() {
                   <button class="primary-button" disabled={!album().song?.length} onClick={() => player.playTracks(album().song || [])}><Play size={17} fill="currentColor" />播放专辑</button>
                 </div>
               </div>
-              <TrackTable tracks={album().song || []} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} compact />
+              <TrackTable tracks={album().song || []} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} onDelete={canDeleteTracks() ? permanentlyDeleteTrack : undefined} deleteDisabled={!!deletingTrack()} compact />
             </section>
           </div>
         )}
@@ -433,7 +487,7 @@ export function PlayerPage() {
                   <button class="primary-button" disabled={!detail().tracks.length} onClick={() => player.playTracks(detail().tracks)}><Play size={17} fill="currentColor" />播放艺术家</button>
                 </div>
               </div>
-              <TrackTable tracks={detail().tracks} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} compact />
+              <TrackTable tracks={detail().tracks} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} onDelete={canDeleteTracks() ? permanentlyDeleteTrack : undefined} deleteDisabled={!!deletingTrack()} compact />
             </section>
           </div>
         )}
@@ -460,7 +514,7 @@ export function PlayerPage() {
                   <button class="primary-button" disabled={!playlist().entry?.length} onClick={() => player.playTracks(playlist().entry || [])}><Play size={17} fill="currentColor" />播放歌单</button>
                 </div>
               </div>
-              <TrackTable tracks={playlist().entry || []} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} onRemove={playlist().owner === auth.user()?.username ? removeTrackFromPlaylist : undefined} actionsDisabled={!!playlistBusy()} compact />
+              <TrackTable tracks={playlist().entry || []} onFavorite={toggleFavorite} onArtist={openTrackArtist} onAlbum={openTrackAlbum} onAddToPlaylist={setPlaylistTrack} onRemove={playlist().owner === auth.user()?.username ? removeTrackFromPlaylist : undefined} onDelete={canDeleteTracks() ? permanentlyDeleteTrack : undefined} actionsDisabled={!!playlistBusy()} deleteDisabled={!!deletingTrack()} compact />
             </section>
           </div>
         )}

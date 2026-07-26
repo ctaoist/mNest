@@ -78,4 +78,34 @@ describe('PlayerProvider', () => {
     expect(MockAudio.latest.paused).toBe(true)
     expect(screen.getByText('empty')).toBeTruthy()
   })
+
+  it('opens the current song lyrics from the player bar', async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input).includes('/rest/getLyricsBySongId?')) {
+        return new Response(JSON.stringify({
+          'subsonic-response': {
+            status: 'ok',
+            lyricsList: {
+              structuredLyrics: [{
+                displayArtist: '测试艺术家',
+                displayTitle: '夜航',
+                synced: true,
+                line: [{ start: 0, value: '第一句歌词' }, { start: 12_000, value: '第二句歌词' }],
+              }],
+            },
+          },
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({
+        'subsonic-response': { status: 'ok', playQueueByIndex: { entry: [] } },
+      }), { status: 200 })
+    })
+
+    render(() => <PlayerProvider><PlayerHarness /><PlayerBar /></PlayerProvider>)
+    await fireEvent.click(screen.getByRole('button', { name: 'play' }))
+    await fireEvent.click(await screen.findByRole('button', { name: '显示歌词' }))
+
+    expect(await screen.findByText('第一句歌词')).toBeTruthy()
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('getLyricsBySongId') && String(input).includes('id=track-1'))).toBe(true)
+  })
 })

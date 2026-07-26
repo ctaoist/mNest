@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    artist_credit::ArtistCredit,
+    artist_credit::{ArtistCredit, parse_artist_names},
     auth::{authenticate_subsonic, encrypt_subsonic_password, user_by_name, web_user_from_headers},
     db,
     entities::{
@@ -56,6 +56,7 @@ struct IntValue {
 }
 
 const API_VERSION: &str = "1.16.1";
+const XML_NAMESPACE: &str = "http://subsonic.org/restapi";
 const MAX_COLLECTION_ITEMS: usize = 10_000;
 const MAX_SCROBBLE_BATCH: usize = 1_000;
 
@@ -402,9 +403,7 @@ async fn json_endpoint(
         "getArtistInfo" | "getArtistInfo2" => {
             Ok(json!({if method.ends_with('2') {"artistInfo2"} else {"artistInfo"}: {}}))
         }
-        "getAlbumInfo" | "getAlbumInfo2" => {
-            Ok(json!({if method.ends_with('2') {"albumInfo2"} else {"albumInfo"}: {}}))
-        }
+        "getAlbumInfo" | "getAlbumInfo2" => Ok(json!({"albumInfo": {}})),
         "getSimilarSongs" | "getSimilarSongs2" => {
             similar_songs(state, method, required(p, "id")?, int(p, "count", 50)).await
         }
@@ -600,16 +599,16 @@ async fn enabled_music_folders(state: &AppState) -> Result<Vec<MusicFolder>, Api
         .await?)
 }
 
-fn folder_api_id(id: &str) -> i64 {
-    if let Ok(id) = id.parse::<i64>()
+fn folder_api_id(id: &str) -> i32 {
+    if let Ok(id) = id.parse::<i32>()
         && id >= 0
     {
         return id;
     }
     let digest = Md5::digest(id.as_bytes());
-    digest[..6]
-        .iter()
-        .fold(0i64, |value, byte| (value << 8) | i64::from(*byte))
+    let value =
+        i32::from_be_bytes(digest[..4].try_into().expect("MD5 prefix has four bytes")) & i32::MAX;
+    value.max(1)
 }
 
 async fn find_music_folder(
@@ -1122,7 +1121,11 @@ async fn starred(
                         .one(&state.db)
                         .await?
                 {
-                    let mut value = artist_json(&artist);
+                    let mut value = if method.ends_with('2') {
+                        artist_json(&artist)
+                    } else {
+                        legacy_artist_json(&artist)
+                    };
                     value["starred"] = json!(star.created_at);
                     artists.push(value);
                 }
@@ -1201,16 +1204,16 @@ async fn search(
     method: &str,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
-    let query = present(p, "query")?;
+    let query = normalize_search_query(present(p, "query")?);
     let folder_id = requested_music_folder(state, p).await?;
-    let artist_count = int(p, "artistCount", 20).clamp(0, 500);
+    let artist_count = int(p, "artistCount", 20).clamp(0, MAX_COLLECTION_ITEMS as i64);
     let artist_offset = int(p, "artistOffset", 0).max(0);
-    let album_count = int(p, "albumCount", 20).clamp(0, 500);
+    let album_count = int(p, "albumCount", 20).clamp(0, MAX_COLLECTION_ITEMS as i64);
     let album_offset = int(p, "albumOffset", 0).max(0);
-    let song_count = int(p, "songCount", 20).clamp(0, 500);
+    let song_count = int(p, "songCount", 20).clamp(0, MAX_COLLECTION_ITEMS as i64);
     let song_offset = int(p, "songOffset", 0).max(0);
     let mut artist_request = artist_entity::Entity::find()
-        .filter(artist_entity::Column::Name.contains(query))
+        .filter(artist_entity::Column::Name.contains(&query))
         .order_by_asc(artist_entity::Column::Name)
         .order_by_asc(artist_entity::Column::Id)
         .limit(artist_count as u64)
@@ -1218,8 +1221,8 @@ async fn search(
     let mut album_request = album_entity::Entity::find()
         .filter(
             Condition::any()
-                .add(album_entity::Column::Name.contains(query))
-                .add(album_entity::Column::ArtistName.contains(query)),
+                .add(album_entity::Column::Name.contains(&query))
+                .add(album_entity::Column::ArtistName.contains(&query)),
         )
         .order_by_asc(album_entity::Column::Name)
         .order_by_asc(album_entity::Column::Id)
@@ -1228,9 +1231,9 @@ async fn search(
     let mut track_request = track_entity::Entity::find()
         .filter(
             Condition::any()
-                .add(track_entity::Column::Title.contains(query))
-                .add(track_entity::Column::ArtistName.contains(query))
-                .add(track_entity::Column::AlbumName.contains(query)),
+                .add(track_entity::Column::Title.contains(&query))
+                .add(track_entity::Column::ArtistName.contains(&query))
+                .add(track_entity::Column::AlbumName.contains(&query)),
         )
         .order_by_asc(track_entity::Column::Title)
         .order_by_asc(track_entity::Column::Id)
@@ -1272,8 +1275,13 @@ async fn search(
     } else {
         albums.iter().map(album_child_json).collect::<Vec<_>>()
     };
+    let artists = if method == "search3" {
+        artists.iter().map(artist_json).collect::<Vec<_>>()
+    } else {
+        artists.iter().map(legacy_artist_json).collect::<Vec<_>>()
+    };
     Ok(
-        json!({key:{"artist":artists.iter().map(artist_json).collect::<Vec<_>>(),"album":albums,"song":tracks.iter().map(|v|track_json(v,None)).collect::<Vec<_>>()}}),
+        json!({key:{"artist":artists,"album":albums,"song":tracks.iter().map(|v|track_json(v,None)).collect::<Vec<_>>()}}),
     )
 }
 
@@ -1555,18 +1563,18 @@ async fn get_lyrics_by_song(state: &AppState, id: &str) -> Result<Value, ApiFail
     )
 }
 
-fn parse_lrc_line(line: &str) -> Option<(f64, String)> {
+fn parse_lrc_line(line: &str) -> Option<(i64, String)> {
     let end = line.find(']')?;
     let timestamp = line.strip_prefix('[')?[..end - 1].split_once(':')?;
-    let minutes = timestamp.0.parse::<f64>().ok()?;
+    let minutes = timestamp.0.parse::<u64>().ok()?;
     let seconds = timestamp.1.parse::<f64>().ok()?;
-    if !(0.0..60.0).contains(&seconds) || minutes.is_sign_negative() {
+    if !(0.0..60.0).contains(&seconds) {
         return None;
     }
-    Some((
-        (minutes * 60.0 + seconds) * 1000.0,
-        line[end + 1..].to_owned(),
-    ))
+    let start = minutes
+        .checked_mul(60_000)?
+        .checked_add((seconds * 1000.0).round() as u64)?;
+    Some((i64::try_from(start).ok()?, line[end + 1..].to_owned()))
 }
 async fn favorite(
     state: &AppState,
@@ -1966,7 +1974,8 @@ async fn get_user(state: &AppState, requester: &User, username: &str) -> Result<
     let user = user_by_name(&state.db, username)
         .await?
         .ok_or_else(not_found)?;
-    Ok(json!({"user":user_json(&user)}))
+    let folder_ids = user_folder_ids(state).await?;
+    Ok(json!({"user":user_json(&user, &folder_ids)}))
 }
 async fn get_users(state: &AppState, requester: &User) -> Result<Value, ApiFailure> {
     require_admin(requester)?;
@@ -1974,7 +1983,10 @@ async fn get_users(state: &AppState, requester: &User) -> Result<Value, ApiFailu
         .order_by_asc(user_entity::Column::Username)
         .all(&state.db)
         .await?;
-    Ok(json!({"users":{"user":users.iter().map(user_json).collect::<Vec<_>>()}}))
+    let folder_ids = user_folder_ids(state).await?;
+    Ok(
+        json!({"users":{"user":users.iter().map(|user|user_json(user, &folder_ids)).collect::<Vec<_>>()}}),
+    )
 }
 async fn create_user(
     state: &AppState,
@@ -2459,10 +2471,19 @@ fn track_select(tail: &str) -> String {
     )
 }
 fn artist_json(a: &Artist) -> Value {
-    json!({"id":a.id,"name":a.name,"albumCount":a.album_count,"songCount":a.song_count,"coverArt":format!("ar-{}",a.id),"sortName":a.sort_name})
+    json!({"id":a.id,"name":a.name,"albumCount":a.album_count,"coverArt":format!("ar-{}",a.id),"sortName":a.sort_name})
+}
+fn legacy_artist_json(a: &Artist) -> Value {
+    json!({"id":a.id,"name":a.name})
 }
 fn album_json(a: &Album) -> Value {
-    json!({"id":a.id,"name":a.name,"artist":a.artist_name,"artistId":a.artist_id,"artists":[{"id":a.artist_id,"name":a.artist_name}],"displayArtist":a.artist_name,"coverArt":format!("al-{}",a.id),"songCount":a.song_count,"duration":a.duration as i64,"year":a.year,"genre":a.genre,"created":a.created_at,"isDir":true})
+    let mut value = json!({"id":a.id,"name":a.name,"artist":a.artist_name,"artistId":a.artist_id,"displayArtist":a.artist_name,"coverArt":format!("al-{}",a.id),"songCount":a.song_count,"duration":a.duration as i64,"year":a.year,"genre":a.genre,"created":a.created_at});
+    let artist_names = parse_artist_names(&a.artist_name);
+    // The album table stores only one artist ID, so do not attach that ID to a combined name.
+    if artist_names.len() == 1 {
+        value["artists"] = json!([{"id":a.artist_id,"name":artist_names[0]}]);
+    }
+    value
 }
 fn album_child_json(album: &Album) -> Value {
     json!({"id":album.id,"parent":album.artist_id,"isDir":true,"title":album.name,"album":album.name,"artist":album.artist_name,"artistId":album.artist_id,"albumId":album.id,"coverArt":format!("al-{}",album.id),"duration":album.duration as i64,"year":album.year,"genre":album.genre,"created":album.created_at,"type":"music"})
@@ -2480,7 +2501,7 @@ fn track_json(t: &Track, starred: Option<String>) -> Value {
         .collect::<Vec<_>>()
         .join("; ");
     let artist_id = artists.first().map(|artist| artist.id.clone());
-    let mut v = json!({"id":t.id,"isDir":false,"title":t.title,"album":t.album_name,"artist":artist,"displayArtist":artist,"artists":artists,"track":t.track_number,"discNumber":t.disc_number,"year":t.year,"genre":t.genre,"coverArt":cover_art,"size":t.size,"contentType":t.mimetype,"suffix":t.suffix,"duration":t.duration as i64,"bitRate":t.bit_rate,"path":t.relative_path,"type":"music","mediaType":"song","playCount":t.play_count,"created":t.created_at,"comment":t.comment});
+    let mut v = json!({"id":t.id,"isDir":false,"isVideo":false,"title":t.title,"album":t.album_name,"artist":artist,"displayArtist":artist,"artists":artists,"track":t.track_number,"discNumber":t.disc_number,"year":t.year,"genre":t.genre,"coverArt":cover_art,"size":t.size,"contentType":t.mimetype,"suffix":t.suffix,"duration":t.duration as i64,"bitRate":t.bit_rate,"path":t.relative_path,"type":"music","mediaType":"song","playCount":t.play_count,"bookmarkPosition":0,"created":t.created_at,"comment":t.comment});
     if let Some(album_id) = &t.album_id {
         v["parent"] = json!(album_id);
         v["albumId"] = json!(album_id);
@@ -2531,8 +2552,15 @@ async fn share_json(
         json!({"id":share.id,"url":format!("{base}/share/{}",share.id),"description":share.description,"username":user.username,"created":share.created_at,"expires":share.expires_at,"lastVisited":share.last_visited_at,"visitCount":share.play_count,"entry":entries}),
     )
 }
-fn user_json(v: &User) -> Value {
-    json!({"username":v.username,"email":v.email,"scrobblingEnabled":true,"adminRole":v.role=="admin","settingsRole":v.role=="admin","downloadRole":true,"uploadRole":v.role=="admin","playlistRole":true,"coverArtRole":true,"commentRole":true,"podcastRole":false,"streamRole":true,"jukeboxRole":false,"shareRole":true,"videoConversionRole":false})
+async fn user_folder_ids(state: &AppState) -> Result<Vec<i32>, ApiFailure> {
+    Ok(enabled_music_folders(state)
+        .await?
+        .iter()
+        .map(|folder| folder_api_id(&folder.id))
+        .collect())
+}
+fn user_json(v: &User, folder_ids: &[i32]) -> Value {
+    json!({"username":v.username,"email":v.email,"scrobblingEnabled":true,"adminRole":v.role=="admin","settingsRole":v.role=="admin","downloadRole":true,"uploadRole":v.role=="admin","playlistRole":true,"coverArtRole":true,"commentRole":true,"podcastRole":false,"streamRole":true,"jukeboxRole":false,"shareRole":true,"videoConversionRole":false,"folder":folder_ids})
 }
 
 fn required<'a>(p: &'a HashMap<String, String>, key: &str) -> Result<&'a str, ApiFailure> {
@@ -2545,6 +2573,19 @@ fn present<'a>(p: &'a HashMap<String, String>, key: &str) -> Result<&'a str, Api
     p.get(key)
         .map(String::as_str)
         .ok_or_else(|| ApiFailure::new(10, format!("Missing required parameter: {key}")))
+}
+fn normalize_search_query(value: &str) -> String {
+    let value = value
+        .trim()
+        .strip_suffix('*')
+        .unwrap_or(value.trim())
+        .trim();
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+        .trim()
+        .to_owned()
 }
 fn required_anyhow<'a>(p: &'a HashMap<String, String>, key: &str) -> anyhow::Result<&'a str> {
     p.get(key)
@@ -2681,14 +2722,22 @@ fn render(params: &HashMap<String, String>, value: Value, status: StatusCode) ->
         )
             .into_response()
     } else {
-        let xml = value_to_xml("subsonic-response", &value["subsonic-response"]);
+        let xml = xml_document(&value);
         (
             status,
             [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
-            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{xml}"),
+            xml,
         )
             .into_response()
     }
+}
+fn xml_document(value: &Value) -> String {
+    let mut response = value["subsonic-response"].clone();
+    if let Value::Object(attributes) = &mut response {
+        attributes.insert("xmlns".into(), json!(XML_NAMESPACE));
+    }
+    let xml = value_to_xml("subsonic-response", &response);
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{xml}")
 }
 struct JsonValue(Value);
 impl IntoResponse for JsonValue {
@@ -2701,25 +2750,127 @@ fn value_to_xml(name: &str, value: &Value) -> String {
         Value::Object(map) => {
             let mut attrs = String::new();
             let mut children = String::new();
+            let mut text_content = String::new();
+            let mut child_values = Vec::new();
             for (key, v) in map {
                 match v {
                     Value::Null => {}
                     Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                        attrs.push_str(&format!(" {}=\"{}\"", key, xml_escape(&scalar(v))))
+                        if xml_text_field(name, key) {
+                            text_content.push_str(&xml_escape(&scalar(v)));
+                        } else if xml_scalar_child(name, key) {
+                            child_values.push((xml_child_rank(name, key), key, v));
+                        } else {
+                            attrs.push_str(&format!(" {}=\"{}\"", key, xml_escape(&scalar(v))))
+                        }
                     }
+                    Value::Array(_) | Value::Object(_) => {
+                        child_values.push((xml_child_rank(name, key), key, v));
+                    }
+                }
+            }
+            child_values.sort_by(|(left_rank, left_key, _), (right_rank, right_key, _)| {
+                left_rank
+                    .cmp(right_rank)
+                    .then_with(|| left_key.cmp(right_key))
+            });
+            for (_, key, value) in child_values {
+                match value {
                     Value::Array(items) => {
                         for item in items {
                             children.push_str(&value_to_xml(key, item));
                         }
                     }
-                    Value::Object(_) => children.push_str(&value_to_xml(key, v)),
+                    _ => children.push_str(&value_to_xml(key, value)),
                 }
             }
-            format!("<{name}{attrs}>{children}</{name}>")
+            format!("<{name}{attrs}>{text_content}{children}</{name}>")
         }
         Value::Array(items) => items.iter().map(|v| value_to_xml(name, v)).collect(),
         _ => format!("<{name}>{}</{name}>", xml_escape(&scalar(value))),
     }
+}
+
+fn xml_text_field(element: &str, field: &str) -> bool {
+    field == "value" && matches!(element, "genre" | "lyrics" | "line" | "cue")
+}
+
+fn xml_scalar_child(element: &str, field: &str) -> bool {
+    matches!(
+        (element, field),
+        (
+            "albumInfo" | "albumInfo2",
+            "notes"
+                | "musicBrainzId"
+                | "lastFmUrl"
+                | "smallImageUrl"
+                | "mediumImageUrl"
+                | "largeImageUrl"
+        ) | (
+            "artistInfo" | "artistInfo2",
+            "biography"
+                | "musicBrainzId"
+                | "lastFmUrl"
+                | "smallImageUrl"
+                | "mediumImageUrl"
+                | "largeImageUrl"
+        )
+    )
+}
+
+fn xml_child_rank(element: &str, field: &str) -> usize {
+    let order: &[&str] = match element {
+        "indexes" => &["shortcut", "index", "child"],
+        "searchResult2" | "searchResult3" | "starred" | "starred2" => &["artist", "album", "song"],
+        "artist" => &["roles", "album"],
+        "album" => &[
+            "recordLabels",
+            "genres",
+            "artists",
+            "releaseTypes",
+            "moods",
+            "originalReleaseDate",
+            "releaseDate",
+            "discTitles",
+            "song",
+        ],
+        "song" | "child" | "entry" | "match" => &[
+            "replayGain",
+            "genres",
+            "artists",
+            "albumArtists",
+            "contributors",
+            "moods",
+            "works",
+            "movements",
+            "groupings",
+        ],
+        "playlist" => &["allowedUser", "entry"],
+        "albumInfo" | "albumInfo2" => &[
+            "notes",
+            "musicBrainzId",
+            "lastFmUrl",
+            "smallImageUrl",
+            "mediumImageUrl",
+            "largeImageUrl",
+        ],
+        "artistInfo" | "artistInfo2" => &[
+            "biography",
+            "musicBrainzId",
+            "lastFmUrl",
+            "smallImageUrl",
+            "mediumImageUrl",
+            "largeImageUrl",
+            "similarArtist",
+        ],
+        "structuredLyrics" => &["line", "cueLine"],
+        "cueLine" => &["cue"],
+        _ => &[],
+    };
+    order
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap_or(order.len())
 }
 fn scalar(v: &Value) -> String {
     match v {
@@ -2930,12 +3081,51 @@ mod tests {
     fn renders_subsonic_attributes_and_children() {
         let value = wrapper(
             "ok",
-            json!({"album":{"id":"1","song":[{"id":"2","title":"A&B"}]}}),
+            json!({"album":{"id":"1","artists":[{"id":"artist-1","name":"Artist"}],"song":[{"id":"2","isDir":false,"title":"A&B"}]}}),
             None,
         );
-        let xml = value_to_xml("subsonic-response", &value["subsonic-response"]);
+        let xml = xml_document(&value);
+        assert!(xml.contains("xmlns=\"http://subsonic.org/restapi\""));
         assert!(xml.contains("version=\"1.16.1\""));
-        assert!(xml.contains("<song id=\"2\" title=\"A&amp;B\"></song>"));
+        assert!(xml.contains("<artists id=\"artist-1\" name=\"Artist\"></artists>"));
+        assert!(xml.contains("<song id=\"2\" isDir=\"false\" title=\"A&amp;B\"></song>"));
+    }
+
+    #[test]
+    fn renders_xml_text_nodes_and_schema_child_order() {
+        let genres = value_to_xml(
+            "genres",
+            &json!({"genre":[{"value":"Rock & Roll","songCount":2,"albumCount":1}]}),
+        );
+        assert_eq!(
+            genres,
+            "<genres><genre albumCount=\"1\" songCount=\"2\">Rock &amp; Roll</genre></genres>"
+        );
+
+        let search = value_to_xml(
+            "searchResult3",
+            &json!({
+                "album":[{"id":"album-1","name":"Album","songCount":1,"duration":1,"created":"2026-01-01T00:00:00Z"}],
+                "artist":[{"id":"artist-1","name":"Artist","albumCount":1}],
+                "song":[{"id":"song-1","isDir":false,"title":"Song"}]
+            }),
+        );
+        let artist = search.find("<artist ").unwrap();
+        let album = search.find("<album ").unwrap();
+        let song = search.find("<song ").unwrap();
+        assert!(artist < album && album < song);
+
+        let info = value_to_xml(
+            "albumInfo",
+            &json!({"lastFmUrl":"https://example.test/album","notes":"Notes"}),
+        );
+        assert_eq!(
+            info,
+            "<albumInfo><notes>Notes</notes><lastFmUrl>https://example.test/album</lastFmUrl></albumInfo>"
+        );
+
+        let line = value_to_xml("line", &json!({"start":2000,"value":"A & B"}));
+        assert_eq!(line, "<line start=\"2000\">A &amp; B</line>");
     }
 
     #[test]
@@ -2955,6 +3145,57 @@ mod tests {
         assert!(value.get("parent").is_none());
         assert!(value.get("albumId").is_none());
         assert_eq!(value["mediaType"], "song");
+        assert_eq!(value["isVideo"], false);
+        assert_eq!(value["bookmarkPosition"], 0);
+
+        let xml = value_to_xml("song", &value);
+        assert!(xml.contains(" displayArtist=\"Artist A; Artist B\""));
+        assert!(xml.contains(" mediaType=\"song\""));
+        assert!(xml.contains("<artists id=\"artist-1\" name=\"Artist A\"></artists>"));
+        assert!(xml.contains("<artists id=\"artist-2\" name=\"Artist B\"></artists>"));
+    }
+
+    #[test]
+    fn omits_fields_not_defined_on_album_and_artist_id3() {
+        let artist = Artist {
+            id: "artist-1".into(),
+            name: "Artist".into(),
+            sort_name: "artist".into(),
+            cover_path: None,
+            album_count: 2,
+            song_count: 3,
+        };
+        let artist = artist_json(&artist);
+        assert!(artist.get("songCount").is_none());
+        assert_eq!(artist["sortName"], "artist");
+        let legacy_artist = legacy_artist_json(&Artist {
+            id: "artist-1".into(),
+            name: "Artist".into(),
+            sort_name: "artist".into(),
+            cover_path: None,
+            album_count: 2,
+            song_count: 3,
+        });
+        assert!(legacy_artist.get("albumCount").is_none());
+
+        let mut album = Album {
+            id: "album-1".into(),
+            name: "Album".into(),
+            artist_id: "artist-1".into(),
+            artist_name: "Artist A; Artist B".into(),
+            year: 2026,
+            genre: "Pop".into(),
+            cover_path: None,
+            song_count: 3,
+            duration: 180.0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let value = album_json(&album);
+        assert!(value.get("isDir").is_none());
+        assert!(value.get("artists").is_none());
+
+        album.artist_name = "Artist A".into();
+        assert_eq!(album_json(&album)["artists"][0]["name"], "Artist A");
     }
 
     #[test]
@@ -2965,6 +3206,58 @@ mod tests {
         let empty_query = decode_params(b"query=").unwrap();
         assert_eq!(present(&empty_query, "query").unwrap(), "");
         assert!(required(&empty_query, "query").is_err());
+
+        let symfonium_query = decode_params(b"query=%22%22").unwrap();
+        assert_eq!(symfonium_query["query"], "\"\"");
+        assert_eq!(normalize_search_query(&symfonium_query["query"]), "");
+        assert_eq!(normalize_search_query("\"Muse\"*"), "Muse");
+    }
+
+    #[tokio::test]
+    async fn symfonium_empty_search_sentinel_returns_library_items() {
+        let state = test_state().await;
+        music_folder_entity::ActiveModel {
+            id: Set("folder-1".into()),
+            name: Set("Music".into()),
+            path: Set("/music".into()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        artist_entity::ActiveModel {
+            id: Set("artist-1".into()),
+            name: Set("Artist A".into()),
+            sort_name: Set("artist a".into()),
+            cover_path: Set(None),
+            album_count: Set(0),
+            song_count: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        test_track()
+            .into_active_model()
+            .insert(&state.db)
+            .await
+            .unwrap();
+
+        let params = HashMap::from([
+            ("query".into(), "\"\"".into()),
+            ("artistCount".into(), "0".into()),
+            ("albumCount".into(), "0".into()),
+            ("songCount".into(), "1000".into()),
+        ]);
+        let result = search(&state, "search3", &params).await.unwrap();
+        assert_eq!(result["searchResult3"]["song"].as_array().unwrap().len(), 1);
+
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let user = get_user(&state, &user, &user.username).await.unwrap();
+        assert_eq!(user["user"]["folder"][0], folder_api_id("folder-1"));
     }
 
     #[test]
@@ -2990,7 +3283,7 @@ mod tests {
     #[test]
     fn parses_synced_lrc_timestamps_in_milliseconds() {
         let (start, value) = parse_lrc_line("[01:02.50]Line").unwrap();
-        assert_eq!(start, 62_500.0);
+        assert_eq!(start, 62_500);
         assert_eq!(value, "Line");
         assert!(parse_lrc_line("[ar:Artist]").is_none());
     }
@@ -2999,7 +3292,8 @@ mod tests {
     fn exposes_stable_integer_music_folder_ids() {
         let id = folder_api_id("88133187-fa8c-461d-b00c-631703004590");
         assert_eq!(id, folder_api_id("88133187-fa8c-461d-b00c-631703004590"));
-        assert!((0..(1i64 << 48)).contains(&id));
+        assert!((1..=i32::MAX).contains(&id));
+        assert_eq!(folder_api_id("42"), 42);
     }
 
     #[tokio::test]
@@ -3040,7 +3334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_the_standard_album_info2_response_key() {
+    async fn uses_the_standard_album_info_response_key_for_both_endpoints() {
         let state = test_state().await;
         let user = user_entity::Entity::find()
             .one(&state.db)
@@ -3050,8 +3344,8 @@ mod tests {
         let value = json_endpoint(&state, &user, "getAlbumInfo2", &HashMap::new())
             .await
             .unwrap();
-        assert!(value.get("albumInfo2").is_some());
-        assert!(value.get("albumInfo").is_none());
+        assert!(value.get("albumInfo").is_some());
+        assert!(value.get("albumInfo2").is_none());
     }
 
     #[tokio::test]

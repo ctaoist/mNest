@@ -1,5 +1,5 @@
 import { For, Show } from 'solid-js'
-import { ArrowDown, ArrowUp, ChevronsUpDown, Heart, ListMusic, ListPlus, Pause, Play, Trash2 } from 'lucide-solid'
+import { ArrowDown, ArrowUp, ChevronsUpDown, Heart, ListMusic, ListPlus, ListX, Pause, Play, Trash2 } from 'lucide-solid'
 import { formatDuration } from '../lib/utils'
 import type { TrackSortDirection, TrackSortKey } from '../lib/trackSorting'
 import type { Track, TrackArtist } from '../types'
@@ -12,7 +12,9 @@ interface TrackTableProps {
   onAlbum?: (track: Track) => void
   onAddToPlaylist?: (track: Track) => void
   onRemove?: (track: Track, index: number) => void
+  onDelete?: (track: Track) => void
   actionsDisabled?: boolean
+  deleteDisabled?: boolean
   compact?: boolean
   showHeader?: boolean
   sortKey?: TrackSortKey
@@ -23,7 +25,7 @@ interface TrackTableProps {
 export function TrackTable(props: TrackTableProps) {
   const player = usePlayer()
   return (
-    <div class="track-table" classList={{ 'has-remove-action': !!props.onRemove }}>
+    <div class="track-table" classList={{ 'has-remove-action': !!props.onRemove, 'has-delete-action': !!props.onDelete }}>
       <Show when={props.showHeader}>
         <div class="track-table-header">
           <span aria-hidden="true" />
@@ -75,7 +77,10 @@ export function TrackTable(props: TrackTableProps) {
                   <button disabled={props.actionsDisabled} class="icon-button track-playlist-action" onClick={() => props.onAddToPlaylist?.(track)} aria-label={`将 ${track.title} 添加到歌单`}><ListMusic size={17} /></button>
                 </Show>
                 <Show when={props.onRemove}>
-                  <button disabled={props.actionsDisabled} class="icon-button danger track-remove-action" onClick={() => props.onRemove?.(track, index())} aria-label={`从歌单移除 ${track.title}`}><Trash2 size={16} /></button>
+                  <button disabled={props.actionsDisabled} class="icon-button track-remove-action" onClick={() => props.onRemove?.(track, index())} aria-label={`从歌单移除 ${track.title}`} title="从歌单移除"><ListX size={16} /></button>
+                </Show>
+                <Show when={props.onDelete}>
+                  <button disabled={props.deleteDisabled} class="icon-button danger track-delete-action" onClick={() => props.onDelete?.(track)} aria-label={`永久删除 ${track.title}`} title="永久删除服务器文件"><Trash2 size={16} /></button>
                 </Show>
               </div>
             </div>

@@ -1,7 +1,8 @@
-import { For, Show } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, Show } from 'solid-js'
 import {
   ChevronDown,
   ListMusic,
+  MicVocal,
   Pause,
   Play,
   Repeat,
@@ -14,17 +15,99 @@ import {
   X,
 } from 'lucide-solid'
 import { usePlayer } from '../context/player'
+import { subsonic } from '../lib/api'
 import { formatDuration, trackArtistLabel } from '../lib/utils'
 import { CoverArt } from './CoverArt'
 
+interface LyricsLine {
+  start?: number
+  value: string
+}
+
+interface StructuredLyrics {
+  displayArtist?: string
+  displayTitle?: string
+  synced: boolean
+  line: LyricsLine[]
+}
+
 export function PlayerBar() {
   const player = usePlayer()
+  const [lyricsOpen, setLyricsOpen] = createSignal(false)
+  const [lyricsLoading, setLyricsLoading] = createSignal(false)
+  const [lyricsError, setLyricsError] = createSignal('')
+  const [lyrics, setLyrics] = createSignal<StructuredLyrics | null>(null)
+  let lyricsRequest = 0
+  let lyricsList: HTMLDivElement | undefined
+
+  const activeLyricsLine = createMemo(() => {
+    const value = lyrics()
+    if (!value?.synced) return -1
+    const position = player.currentTime() * 1000
+    let active = -1
+    value.line.forEach((line, index) => {
+      if (line.start !== undefined && line.start <= position) active = index
+    })
+    return active
+  })
+
+  const loadLyrics = async (trackId: string) => {
+    const requestId = ++lyricsRequest
+    setLyricsLoading(true)
+    setLyricsError('')
+    setLyrics(null)
+    try {
+      const response = await subsonic<{ lyricsList?: { structuredLyrics?: StructuredLyrics[] } }>('getLyricsBySongId', { id: trackId })
+      if (requestId !== lyricsRequest) return
+      setLyrics(response.lyricsList?.structuredLyrics?.[0] || null)
+    } catch (error) {
+      if (requestId !== lyricsRequest) return
+      setLyricsError(error instanceof Error ? error.message : '歌词加载失败')
+    } finally {
+      if (requestId === lyricsRequest) setLyricsLoading(false)
+    }
+  }
+
+  const toggleLyrics = () => {
+    if (lyricsOpen()) {
+      setLyricsOpen(false)
+      return
+    }
+    player.setQueueOpen(false)
+    setLyricsOpen(true)
+  }
+
+  const openQueue = () => {
+    setLyricsOpen(false)
+    player.setQueueOpen(true)
+  }
+
+  createEffect(() => {
+    const track = player.current()
+    if (!track) {
+      lyricsRequest += 1
+      setLyricsOpen(false)
+      setLyrics(null)
+      return
+    }
+    if (lyricsOpen() && !track.id.startsWith('radio:')) void loadLyrics(track.id)
+  })
+
+  createEffect(() => {
+    if (!lyricsOpen() || !lyricsList) return
+    const active = activeLyricsLine()
+    if (active < 0) return
+    requestAnimationFrame(() => {
+      lyricsList?.querySelector(`[data-lyrics-line="${active}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    })
+  })
+
   return (
     <>
       <Show when={player.current()}>
         {(track) => (
           <div class="player-bar">
-            <button class="player-track" onClick={() => player.setQueueOpen(true)}>
+            <button class="player-track" onClick={openQueue}>
               <CoverArt id={track().coverArt} alt={track().album} kind="track" />
               <span><strong>{track().title}</strong><small class={player.error() ? 'player-track-error' : ''}>{player.error() || trackArtistLabel(track())}</small></span>
             </button>
@@ -39,6 +122,7 @@ export function PlayerBar() {
                 <button class={`icon-button ${player.repeat() !== 'off' ? 'is-active' : ''}`} onClick={player.cycleRepeat} aria-label="循环模式">
                   {player.repeat() === 'one' ? <Repeat1 size={16} /> : <Repeat size={16} />}
                 </button>
+                <button class={`icon-button player-lyrics-trigger ${lyricsOpen() ? 'is-active' : ''}`} disabled={track().id.startsWith('radio:')} onClick={toggleLyrics} aria-label={lyricsOpen() ? '关闭歌词' : '显示歌词'} title={track().id.startsWith('radio:') ? '电台不支持歌词' : '歌词'}><MicVocal size={17} /></button>
               </div>
               <div class="progress-line">
                 <span>{track().id.startsWith('radio:') ? 'LIVE' : formatDuration(player.currentTime())}</span>
@@ -49,12 +133,43 @@ export function PlayerBar() {
             <div class="player-tools">
               <Volume1 size={17} />
               <input class="volume" type="range" min="0" max="1" step="0.02" value={player.volume()} onInput={(event) => player.setVolume(Number(event.currentTarget.value))} aria-label="音量" />
-              <button class="queue-button" onClick={() => player.setQueueOpen(true)}><ListMusic size={18} /><span>{player.queue().length}</span></button>
+              <button class="queue-button" onClick={openQueue}><ListMusic size={18} /><span>{player.queue().length}</span></button>
             </div>
             <button class="icon-button player-close" onClick={player.clear} aria-label="关闭播放栏" title="关闭播放栏"><X size={18} /></button>
           </div>
         )}
       </Show>
+
+      <div class={`queue-sheet lyrics-sheet ${lyricsOpen() ? 'is-open' : ''}`} aria-hidden={!lyricsOpen()}>
+        <div class="sheet-backdrop" onClick={() => setLyricsOpen(false)} />
+        <aside>
+          <header class="lyrics-header">
+            <div><span class="eyebrow">NOW SINGING</span><div class="lyrics-heading">歌词</div></div>
+            <button class="icon-button" onClick={() => setLyricsOpen(false)} aria-label="关闭歌词"><X /></button>
+          </header>
+          <Show when={player.current()}>
+            {(track) => <div class="lyrics-track"><strong>{track().title}</strong><span>{trackArtistLabel(track())}</span></div>}
+          </Show>
+          <div class="lyrics-lines" ref={lyricsList} classList={{ 'is-synced': !!lyrics()?.synced }}>
+            <Show when={!lyricsLoading()} fallback={<div class="lyrics-state"><span class="lyrics-pulse" /><span>正在读取歌词</span></div>}>
+              <Show when={!lyricsError()} fallback={<div class="lyrics-state is-error">{lyricsError()}</div>}>
+                <For each={lyrics()?.line || []} fallback={<div class="lyrics-state">这首歌暂时没有歌词</div>}>
+                  {(line, index) => (
+                    <Show when={lyrics()?.synced && line.start !== undefined} fallback={<p class="lyrics-line">{line.value || '\u00a0'}</p>}>
+                      <button
+                        class="lyrics-line"
+                        classList={{ 'is-active': activeLyricsLine() === index() }}
+                        data-lyrics-line={index()}
+                        onClick={() => player.seek((line.start || 0) / 1000)}
+                      >{line.value || '\u00a0'}</button>
+                    </Show>
+                  )}
+                </For>
+              </Show>
+            </Show>
+          </div>
+        </aside>
+      </div>
 
       <div class={`queue-sheet ${player.queueOpen() ? 'is-open' : ''}`} aria-hidden={!player.queueOpen()}>
         <div class="sheet-backdrop" onClick={() => player.setQueueOpen(false)} />
