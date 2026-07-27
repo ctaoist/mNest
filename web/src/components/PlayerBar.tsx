@@ -1,12 +1,16 @@
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js'
 import {
+  AudioLines,
   ChevronDown,
+  ExternalLink,
   ListMusic,
+  LoaderCircle,
   MicVocal,
   Pause,
   Play,
   Repeat,
   Repeat1,
+  RefreshCw,
   Shuffle,
   SkipBack,
   SkipForward,
@@ -16,6 +20,7 @@ import {
 } from 'lucide-solid'
 import { usePlayer } from '../context/player'
 import { subsonic } from '../lib/api'
+import { identifyNeteaseAudio, type NeteaseAudioMatchResult } from '../lib/neteaseAudioMatch'
 import { formatDuration, trackArtistLabel } from '../lib/utils'
 import { CoverArt } from './CoverArt'
 
@@ -37,6 +42,11 @@ export function PlayerBar() {
   const [lyricsLoading, setLyricsLoading] = createSignal(false)
   const [lyricsError, setLyricsError] = createSignal('')
   const [lyrics, setLyrics] = createSignal<StructuredLyrics | null>(null)
+  const [matchOpen, setMatchOpen] = createSignal(false)
+  const [matchLoading, setMatchLoading] = createSignal(false)
+  const [matchStage, setMatchStage] = createSignal('')
+  const [matchError, setMatchError] = createSignal('')
+  const [matches, setMatches] = createSignal<NeteaseAudioMatchResult[]>([])
   let lyricsRequest = 0
   let lyricsList: HTMLDivElement | undefined
 
@@ -74,12 +84,35 @@ export function PlayerBar() {
       return
     }
     player.setQueueOpen(false)
+    setMatchOpen(false)
     setLyricsOpen(true)
   }
 
   const openQueue = () => {
     setLyricsOpen(false)
+    setMatchOpen(false)
     player.setQueueOpen(true)
+  }
+
+  const identifyRadio = async () => {
+    if (matchLoading()) return
+    player.setQueueOpen(false)
+    setLyricsOpen(false)
+    setMatchOpen(true)
+    setMatchLoading(true)
+    setMatchStage('正在采集3秒电台音频')
+    setMatchError('')
+    setMatches([])
+    try {
+      const samples = await player.captureRadioSamples(3)
+      setMatchStage('正在生成指纹并查询网易云')
+      setMatches(await identifyNeteaseAudio(samples))
+    } catch (error) {
+      setMatchError(error instanceof Error ? error.message : '听歌识曲失败')
+    } finally {
+      setMatchLoading(false)
+      setMatchStage('')
+    }
   }
 
   createEffect(() => {
@@ -88,7 +121,15 @@ export function PlayerBar() {
       lyricsRequest += 1
       setLyricsOpen(false)
       setLyrics(null)
+      setMatchOpen(false)
+      setMatches([])
+      setMatchError('')
       return
+    }
+    if (!track.id.startsWith('radio:')) {
+      setMatchOpen(false)
+      setMatches([])
+      setMatchError('')
     }
     if (lyricsOpen() && !track.id.startsWith('radio:')) void loadLyrics(track.id)
   })
@@ -122,7 +163,20 @@ export function PlayerBar() {
                 <button class={`icon-button ${player.repeat() !== 'off' ? 'is-active' : ''}`} onClick={player.cycleRepeat} aria-label="循环模式">
                   {player.repeat() === 'one' ? <Repeat1 size={16} /> : <Repeat size={16} />}
                 </button>
-                <button class={`icon-button player-lyrics-trigger ${lyricsOpen() ? 'is-active' : ''}`} disabled={track().id.startsWith('radio:')} onClick={toggleLyrics} aria-label={lyricsOpen() ? '关闭歌词' : '显示歌词'} title={track().id.startsWith('radio:') ? '电台不支持歌词' : '歌词'}><MicVocal size={17} /></button>
+                <Show when={!track().id.startsWith('radio:')}>
+                  <button class={`icon-button player-lyrics-trigger ${lyricsOpen() ? 'is-active' : ''}`} onClick={toggleLyrics} aria-label={lyricsOpen() ? '关闭歌词' : '显示歌词'} title="歌词"><MicVocal size={17} /></button>
+                </Show>
+                <Show when={track().id.startsWith('radio:')}>
+                  <button
+                    class={`icon-button player-radio-match ${matchOpen() ? 'is-active' : ''} ${matchLoading() ? 'is-listening' : ''}`}
+                    disabled={!player.playing() || matchLoading()}
+                    onClick={() => void identifyRadio()}
+                    aria-label="听歌识曲"
+                    title={player.playing() ? '听歌识曲' : '请先播放电台'}
+                  >
+                    <Show when={!matchLoading()} fallback={<LoaderCircle class="spin" size={17} />}><AudioLines size={17} /></Show>
+                  </button>
+                </Show>
               </div>
               <div class="progress-line">
                 <span>{track().id.startsWith('radio:') ? 'LIVE' : formatDuration(player.currentTime())}</span>
@@ -168,6 +222,39 @@ export function PlayerBar() {
               </Show>
             </Show>
           </div>
+        </aside>
+      </div>
+
+      <div class={`queue-sheet radio-match-sheet ${matchOpen() ? 'is-open' : ''}`} aria-hidden={!matchOpen()}>
+        <div class="sheet-backdrop" onClick={() => setMatchOpen(false)} />
+        <aside>
+          <header class="radio-match-header">
+            <div><span class="eyebrow">LISTENING ID</span><div class="radio-match-heading">听歌识曲</div></div>
+            <button class="icon-button" onClick={() => setMatchOpen(false)} aria-label="关闭听歌识曲"><X /></button>
+          </header>
+          <Show when={player.current()}>{(track) => <div class="radio-match-station"><span class="radio-match-live" /> <strong>{track().title}</strong><small>网易云音乐识别</small></div>}</Show>
+          <Show when={!matchLoading()} fallback={
+            <div class="radio-match-scanning">
+              <div class="radio-match-wave" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /></div>
+              <strong>{matchStage()}</strong>
+              <span>保持电台继续播放，识别过程不会中断音频。</span>
+            </div>
+          }>
+            <Show when={!matchError()} fallback={<div class="radio-match-state is-error"><AudioLines /><strong>识别未完成</strong><span>{matchError()}</span><button class="secondary-button" onClick={() => void identifyRadio()}><RefreshCw size={15} />重新识别</button></div>}>
+              <div class="radio-match-results">
+                <For each={matches()} fallback={<div class="radio-match-state"><AudioLines /><strong>暂未识别到歌曲</strong><span>可以等待歌曲进入副歌或人声段落后重试。</span><button class="secondary-button" onClick={() => void identifyRadio()}><RefreshCw size={15} />重新识别</button></div>}>
+                  {(result, index) => (
+                    <a class="radio-match-result" href={`https://music.163.com/#/song?id=${encodeURIComponent(result.id)}`} target="_blank" rel="noreferrer">
+                      <span class="radio-match-index">{String(index() + 1).padStart(2, '0')}</span>
+                      <span><strong>{result.title}</strong><small>{result.artists.join('; ') || '未知艺术家'} · {result.album || '未知专辑'}</small></span>
+                      <Show when={result.start_time_ms > 0}><em>{(result.start_time_ms / 1000).toFixed(1)}s</em></Show>
+                      <ExternalLink size={16} />
+                    </a>
+                  )}
+                </For>
+              </div>
+            </Show>
+          </Show>
         </aside>
       </div>
 

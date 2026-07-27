@@ -20,10 +20,11 @@ class MockAudio extends EventTarget {
 }
 
 const track: Track = { id: 'track-1', title: '夜航', artists: [{ id: 'artist-1', name: '测试艺术家' }], album: '远方', duration: 180 }
+const radio: Track = { id: 'radio:station-1', title: '测试电台', artists: [{ id: 'radio-artist:station-1', name: '网络电台' }], album: '实时广播', duration: 0, streamUrl: '/api/internet_radio_stream.mp3?id=station-1' }
 
 function PlayerHarness() {
   const player = usePlayer()
-  return <><span>{player.current()?.title || 'empty'}</span><button onClick={() => player.playTracks([track])}>play</button></>
+  return <><span>{player.current()?.title || 'empty'}</span><button onClick={() => player.playTracks([track])}>play</button><button onClick={() => player.playStream(radio)}>radio</button></>
 }
 
 describe('PlayerProvider', () => {
@@ -107,5 +108,15 @@ describe('PlayerProvider', () => {
 
     expect(await screen.findByText('第一句歌词')).toBeTruthy()
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('getLyricsBySongId') && String(input).includes('id=track-1'))).toBe(true)
+  })
+
+  it('shows listening identification only while a radio stream is playing', async () => {
+    render(() => <PlayerProvider><PlayerHarness /><PlayerBar /></PlayerProvider>)
+    await fireEvent.click(screen.getByRole('button', { name: 'play' }))
+    expect(screen.queryByRole('button', { name: '听歌识曲' })).toBeNull()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'radio' }))
+    expect(await screen.findByRole('button', { name: '听歌识曲' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '显示歌词' })).toBeNull()
   })
 })

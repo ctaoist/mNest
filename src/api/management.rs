@@ -105,6 +105,14 @@ pub fn router() -> Router<AppState> {
             "/api/remote_download/preview/",
             get(remote_download_preview),
         )
+        .route(
+            "/api/remote_download/netease/audio-match/",
+            post(netease_audio_match).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/remote_download/netease/audio-match/runtime.js",
+            get(netease_audio_match_runtime),
+        )
         .route("/api/remote_download/import/", post(remote_download_import))
         .route(
             "/api/remote_download/upload/",
@@ -1075,6 +1083,42 @@ async fn remote_download_preview(
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+async fn netease_audio_match(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+    Json(request): Json<remote_download::NeteaseAudioMatchRequest>,
+) -> Result<Json<ApiResponse<Vec<remote_download::NeteaseAudioMatchResult>>>, ApiError> {
+    let source = load_netease_download_source(&state).await?;
+    let matches = remote_download::netease_audio_match(&remote_connection(&source), &request)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(Json(ApiResponse::success(matches)))
+}
+
+async fn netease_audio_match_runtime(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+) -> Result<Response, ApiError> {
+    let source = load_netease_download_source(&state).await?;
+    let runtime = remote_download::netease_audio_match_runtime(&remote_connection(&source))
+        .await
+        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+    let mut response = Response::new(Body::from(runtime));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/javascript; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
     );
     Ok(response)
 }
@@ -2051,6 +2095,19 @@ async fn load_download_source(
     source.password = reveal_download_secret(state, &source.id, "password", &source.password)?;
     source.cookie = reveal_download_secret(state, &source.id, "cookie", &source.cookie)?;
     Ok(source)
+}
+
+async fn load_netease_download_source(
+    state: &AppState,
+) -> Result<download_source::Model, ApiError> {
+    let source = download_source::Entity::find()
+        .filter(download_source::Column::Kind.eq("netease"))
+        .filter(download_source::Column::Enabled.eq(1))
+        .order_by_asc(download_source::Column::Name)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("未配置已启用的网易云下载源"))?;
+    load_download_source(state, &source.id).await
 }
 
 fn download_secret_aad(id: &str, field: &str) -> String {

@@ -9,6 +9,7 @@ use anyhow::Context;
 use lofty::{file::FileType, probe::Probe};
 use md5::{Digest, Md5};
 use reqwest::{Client, RequestBuilder, Response, Url, header};
+use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -86,6 +87,33 @@ pub struct NeteaseLoginStatus {
     pub message: String,
     pub cookie: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeteaseAudioMatchRequest {
+    pub duration: u8,
+    pub audio_fp: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct NeteaseAudioMatchResult {
+    pub id: String,
+    pub title: String,
+    pub artists: Vec<String>,
+    pub album: String,
+    pub start_time_ms: i64,
+}
+
+const NETEASE_AUDIO_MATCH_RUNTIME_MAX_BYTES: usize = 512 * 1024;
+const NETEASE_AUDIO_MATCH_RUNTIME_FILES: [(&str, &str); 2] = [
+    (
+        "afp.wasm.js",
+        "4926a6d69527a1afbc7f7d120b9c21947e677d80c484c8b65572fa7d4ce3b99f",
+    ),
+    (
+        "afp.js",
+        "3776f3122d8a516d716ec00f55c24b919f03a2fb4bb009191007327170d33763",
+    ),
+];
 
 pub async fn search(connection: &RemoteConnection, query: &str) -> anyhow::Result<Vec<RemoteSong>> {
     let query = query.trim();
@@ -278,6 +306,126 @@ pub async fn netease_account_name(connection: &RemoteConnection) -> anyhow::Resu
     );
     anyhow::ensure!(!account_name.is_empty(), "网易云没有返回登录用户名");
     Ok(account_name)
+}
+
+pub async fn netease_audio_match(
+    connection: &RemoteConnection,
+    request: &NeteaseAudioMatchRequest,
+) -> anyhow::Result<Vec<NeteaseAudioMatchResult>> {
+    anyhow::ensure!(connection.source == "netease", "这个来源不是网易云后端");
+    anyhow::ensure!(request.duration == 3, "听歌识曲只接受3秒音频指纹");
+    anyhow::ensure!(
+        !request.audio_fp.is_empty() && request.audio_fp.len() <= 64 * 1024,
+        "音频指纹无效"
+    );
+    anyhow::ensure!(
+        request
+            .audio_fp
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'+' | b'/' | b'=')),
+        "音频指纹格式无效"
+    );
+    let client = client()?;
+    let mut url = gateway_url(connection, "/audio/match")?;
+    url.query_pairs_mut()
+        .append_pair("duration", &request.duration.to_string())
+        .append_pair("audioFP", &request.audio_fp);
+    let mut upstream = client.post(url);
+    if !connection.cookie.trim().is_empty() {
+        upstream = upstream.header(header::COOKIE, connection.cookie.trim());
+    }
+    let value = send_checked(upstream)
+        .await?
+        .json::<Value>()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.without_url()))?;
+    anyhow::ensure!(
+        value.get("code").and_then(Value::as_i64).unwrap_or(200) == 200,
+        "网易云听歌识曲接口返回失败"
+    );
+    Ok(normalize_netease_audio_matches(&value))
+}
+
+pub async fn netease_audio_match_runtime(connection: &RemoteConnection) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(connection.source == "netease", "这个来源不是网易云后端");
+    let client = client()?;
+    let mut runtime = Vec::new();
+    for (file, expected_sha256) in NETEASE_AUDIO_MATCH_RUNTIME_FILES {
+        let url = gateway_url(connection, &format!("/audio_match_demo/{file}"))?;
+        let response = send_checked(client.get(url)).await?;
+        if let Some(length) = response.content_length() {
+            anyhow::ensure!(
+                length <= NETEASE_AUDIO_MATCH_RUNTIME_MAX_BYTES as u64,
+                "网易云听歌识曲运行时文件过大"
+            );
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.without_url()))?;
+        anyhow::ensure!(
+            bytes.len() <= NETEASE_AUDIO_MATCH_RUNTIME_MAX_BYTES,
+            "网易云听歌识曲运行时文件过大"
+        );
+        let bytes = normalize_netease_audio_match_runtime_file(file, bytes.to_vec())?;
+        let actual_sha256 = hex::encode(digest(&SHA256, &bytes));
+        anyhow::ensure!(
+            actual_sha256 == expected_sha256,
+            "网易云听歌识曲运行时 {file} 校验失败，请更新网易云下载源后端"
+        );
+        runtime.extend_from_slice(&bytes);
+        runtime.push(b'\n');
+    }
+    Ok(runtime)
+}
+
+fn normalize_netease_audio_match_runtime_file(
+    file: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    if file != "afp.js" {
+        return Ok(bytes);
+    }
+
+    let source = String::from_utf8(bytes).context("网易云听歌识曲运行时 afp.js 不是有效文本")?;
+    Ok(source
+        .replace("\r\n", "\n")
+        .replace("const logger = require('../../util/logger.js')\n", "")
+        .replace("logger.info(", "console.info(")
+        .into_bytes())
+}
+
+fn normalize_netease_audio_matches(value: &Value) -> Vec<NeteaseAudioMatchResult> {
+    value
+        .pointer("/data/result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let song = item.get("song")?;
+            let id = stringish(song.get("id"));
+            let title = stringish(song.get("name"));
+            if id.is_empty() || title.is_empty() {
+                return None;
+            }
+            let artists = names(song.get("artists").or_else(|| song.get("ar")));
+            let album = stringish(
+                song.pointer("/album/name")
+                    .or_else(|| song.pointer("/al/name")),
+            );
+            Some(NeteaseAudioMatchResult {
+                id,
+                title,
+                artists,
+                album,
+                start_time_ms: item
+                    .get("startTime")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            })
+        })
+        .take(20)
+        .collect()
 }
 
 fn client() -> anyhow::Result<Client> {
@@ -948,5 +1096,98 @@ mod tests {
         assert_eq!(netease_bitrate("max"), "999000");
         assert_eq!(netease_bitrate("320"), "320000");
         assert_eq!(netease_bitrate("128"), "128000");
+    }
+
+    #[test]
+    fn normalizes_netease_audio_match_results() {
+        let value = serde_json::json!({
+            "code": 200,
+            "data": {
+                "result": [{
+                    "startTime": 1250,
+                    "song": {
+                        "id": 42,
+                        "name": "夜航",
+                        "artists": [{"name": "甲"}, {"name": "乙"}],
+                        "album": {"name": "远方"}
+                    }
+                }]
+            }
+        });
+
+        assert_eq!(
+            normalize_netease_audio_matches(&value),
+            vec![NeteaseAudioMatchResult {
+                id: "42".into(),
+                title: "夜航".into(),
+                artists: vec!["甲".into(), "乙".into()],
+                album: "远方".into(),
+                start_time_ms: 1250,
+            }]
+        );
+    }
+
+    #[test]
+    fn normalizes_the_node_audio_match_runtime_for_browsers() {
+        let source = b"'use strict'\r\nconst logger = require('../../util/logger.js')\r\nlogger.info('start')\r\n";
+
+        assert_eq!(
+            normalize_netease_audio_match_runtime_file("afp.js", source.to_vec()).unwrap(),
+            b"'use strict'\nconsole.info('start')\n"
+        );
+        assert_eq!(
+            normalize_netease_audio_match_runtime_file("afp.wasm.js", source.to_vec()).unwrap(),
+            source
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_netease_audio_match_to_the_configured_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let size = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.starts_with("POST /audio/match?"));
+            assert!(request.contains("duration=3"));
+            assert!(request.contains("audioFP=QUJDRA%3D%3D"));
+            let body = r#"{"code":200,"data":{"result":[{"startTime":0,"song":{"id":7,"name":"Matched","artists":[],"album":{"name":"Album"}}}]}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let connection = RemoteConnection {
+            source: "netease".into(),
+            gateway_url: format!("http://{address}"),
+            cookie: String::new(),
+            subsonic_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+        };
+
+        let matches = netease_audio_match(
+            &connection,
+            &NeteaseAudioMatchRequest {
+                duration: 3,
+                audio_fp: "QUJDRA==".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "7");
+        server.await.unwrap();
     }
 }

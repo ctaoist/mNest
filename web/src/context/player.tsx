@@ -26,6 +26,7 @@ interface PlayerContextValue {
   shuffled: () => boolean
   queueOpen: () => boolean
   error: () => string
+  captureRadioSamples: (durationSeconds?: number) => Promise<Float32Array>
   playTracks: (tracks: Track[], index?: number) => void
   playStream: (track: Track) => void
   playNow: (track: Track) => void
@@ -43,6 +44,46 @@ interface PlayerContextValue {
 }
 
 const PlayerContext = createContext<PlayerContextValue>()
+
+const RADIO_SAMPLE_RATE = 8_000
+const RADIO_RECORDER_WORKLET = `
+class MNestRadioRecorder extends AudioWorkletProcessor {
+  constructor() {
+    super()
+    this.buffer = new Float32Array(0)
+    this.offset = 0
+    this.recording = false
+    this.port.onmessage = (event) => {
+      if (event.data?.type === 'start') {
+        this.buffer = new Float32Array(event.data.samples)
+        this.offset = 0
+        this.recording = true
+      } else if (event.data?.type === 'cancel') {
+        this.recording = false
+        this.buffer = new Float32Array(0)
+        this.offset = 0
+      }
+    }
+  }
+  process(inputs) {
+    if (!this.recording) return true
+    const channel = inputs[0]?.[0]
+    if (!channel?.length) return true
+    const available = Math.min(channel.length, this.buffer.length - this.offset)
+    this.buffer.set(channel.subarray(0, available), this.offset)
+    this.offset += available
+    if (this.offset >= this.buffer.length) {
+      const samples = this.buffer
+      this.recording = false
+      this.buffer = new Float32Array(0)
+      this.offset = 0
+      this.port.postMessage({ type: 'finished', samples }, [samples.buffer])
+    }
+    return true
+  }
+}
+registerProcessor('mnest-radio-recorder', MNestRadioRecorder)
+`
 
 export function PlayerProvider(props: ParentProps) {
   const audio = new Audio()
@@ -65,6 +106,74 @@ export function PlayerProvider(props: ParentProps) {
   let lastPlaybackPosition = 0
   let nowPlayingSent = false
   let scrobbleSent = false
+  let radioCaptureContext: AudioContext | undefined
+  let radioCaptureSource: MediaElementAudioSourceNode | undefined
+  let radioCaptureRecorder: AudioWorkletNode | undefined
+  let radioCaptureReject: ((reason?: unknown) => void) | undefined
+  let radioCaptureTimer = 0
+
+  const cancelRadioCapture = (message = '听歌识曲已取消') => {
+    window.clearTimeout(radioCaptureTimer)
+    radioCaptureRecorder?.port.postMessage({ type: 'cancel' })
+    radioCaptureReject?.(new Error(message))
+    radioCaptureReject = undefined
+  }
+
+  const ensureRadioRecorder = async () => {
+    if (!radioCaptureContext || !radioCaptureSource) {
+      const context = new AudioContext()
+      const source = context.createMediaElementSource(audio)
+      source.connect(context.destination)
+      radioCaptureContext = context
+      radioCaptureSource = source
+    }
+    const context = radioCaptureContext
+    const source = radioCaptureSource
+    if (radioCaptureRecorder) {
+      await context.resume()
+      return { context, recorder: radioCaptureRecorder }
+    }
+    const workletUrl = URL.createObjectURL(new Blob([RADIO_RECORDER_WORKLET], { type: 'text/javascript' }))
+    try {
+      await context.audioWorklet.addModule(workletUrl)
+    } finally {
+      URL.revokeObjectURL(workletUrl)
+    }
+    const recorder = new AudioWorkletNode(context, 'mnest-radio-recorder')
+    const silentOutput = context.createGain()
+    silentOutput.gain.value = 0
+    source.connect(recorder)
+    recorder.connect(silentOutput)
+    silentOutput.connect(context.destination)
+    radioCaptureRecorder = recorder
+    await context.resume()
+    return { context, recorder }
+  }
+
+  const captureRadioSamples = async (durationSeconds = 3) => {
+    const track = current()
+    if (!track?.id.startsWith('radio:')) throw new Error('请先播放网络电台')
+    if (audio.paused) throw new Error('请先开始播放电台')
+    if (radioCaptureReject) throw new Error('正在识别当前电台')
+    const { context, recorder } = await ensureRadioRecorder()
+    const sampleCount = Math.ceil(durationSeconds * context.sampleRate)
+    const captured = await new Promise<Float32Array>((resolve, reject) => {
+      radioCaptureReject = reject
+      radioCaptureTimer = window.setTimeout(() => {
+        recorder.port.postMessage({ type: 'cancel' })
+        radioCaptureReject = undefined
+        reject(new Error('采集电台音频超时'))
+      }, durationSeconds * 1_000 + 5_000)
+      recorder.port.onmessage = (event: MessageEvent<{ type?: string; samples?: Float32Array }>) => {
+        if (event.data?.type !== 'finished' || !event.data.samples) return
+        window.clearTimeout(radioCaptureTimer)
+        radioCaptureReject = undefined
+        resolve(event.data.samples)
+      }
+      recorder.port.postMessage({ type: 'start', samples: sampleCount })
+    })
+    return resampleRadioSamples(captured, context.sampleRate, RADIO_SAMPLE_RATE)
+  }
 
   const resetPlaybackReport = (track?: Track, position = 0) => {
     playbackTrackId = track && !track.streamUrl ? track.id : ''
@@ -118,6 +227,7 @@ export function PlayerProvider(props: ParentProps) {
   const activate = (nextIndex: number, autoplay = true, position = 0, persist = true) => {
     const track = queue()[nextIndex]
     if (!track) return
+    cancelRadioCapture('播放内容已切换')
     setIndex(nextIndex)
     setError('')
     resetPlaybackReport(track, position)
@@ -203,6 +313,7 @@ export function PlayerProvider(props: ParentProps) {
   }
 
   const clear = () => {
+    cancelRadioCapture()
     audio.pause()
     audio.removeAttribute('src')
     setQueue([])
@@ -223,7 +334,10 @@ export function PlayerProvider(props: ParentProps) {
       setPlaying(true)
       reportNowPlaying()
     })
-    audio.addEventListener('pause', () => setPlaying(false))
+    audio.addEventListener('pause', () => {
+      setPlaying(false)
+      if (radioCaptureReject) cancelRadioCapture('电台播放已暂停')
+    })
     audio.addEventListener('timeupdate', () => {
       setCurrentTime(audio.currentTime)
       updatePlaybackReport()
@@ -271,19 +385,39 @@ export function PlayerProvider(props: ParentProps) {
 
   onCleanup(() => {
     window.clearTimeout(saveTimer)
+    cancelRadioCapture()
     audio.pause()
     audio.src = ''
+    radioCaptureSource?.disconnect()
+    radioCaptureRecorder?.disconnect()
+    void radioCaptureContext?.close()
   })
 
   return (
     <PlayerContext.Provider value={{
       current, queue, index, playing, currentTime, duration, volume, repeat, shuffled, queueOpen, error,
+      captureRadioSamples,
       playTracks, playStream, playNow, enqueue, toggle, next, previous, seek, setVolume, cycleRepeat,
       toggleShuffle: () => setShuffled((value) => !value), setQueueOpen, removeAt, clear,
     }}>
       {props.children}
     </PlayerContext.Provider>
   )
+}
+
+function resampleRadioSamples(samples: Float32Array, sourceRate: number, targetRate: number) {
+  if (sourceRate === targetRate) return samples
+  const outputLength = Math.max(1, Math.round(samples.length * targetRate / sourceRate))
+  const output = new Float32Array(outputLength)
+  const ratio = sourceRate / targetRate
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * ratio
+    const left = Math.floor(position)
+    const right = Math.min(left + 1, samples.length - 1)
+    const fraction = position - left
+    output[index] = samples[left] * (1 - fraction) + samples[right] * fraction
+  }
+  return output
 }
 
 export function usePlayer() {
