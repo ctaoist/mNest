@@ -4,7 +4,10 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::{config::Settings, providers::ProviderRegistry, tags::TagService};
+use crate::{
+    config::Settings, internet_radio::SharedStreamHub, providers::ProviderRegistry,
+    tags::TagService,
+};
 
 #[derive(Clone)]
 pub struct EventHub {
@@ -33,6 +36,7 @@ pub struct AppState {
     pub providers: Arc<ProviderRegistry>,
     pub tags: Arc<TagService>,
     pub events: EventHub,
+    pub radio_streams: SharedStreamHub,
     pub shutdown: CancellationToken,
 }
 
@@ -47,6 +51,7 @@ impl AppState {
             settings.cover_cache.clone(),
         ));
         let events = EventHub::new();
+        let radio_streams = SharedStreamHub::default();
         let shutdown = CancellationToken::new();
         Self {
             settings,
@@ -54,6 +59,7 @@ impl AppState {
             providers,
             tags,
             events,
+            radio_streams,
             shutdown,
         }
     }

@@ -1,17 +1,180 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
+use axum::body::Bytes;
 use base64::Engine;
 use ring::hmac;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
     QueryFilter, Set,
 };
+use tokio::sync::{Mutex, broadcast};
+use tokio_util::sync::CancellationToken;
 
 use crate::entities::app_setting;
 
 const PROXY_SETTING_PREFIX: &str = "internet_radio.proxy.";
 const PROXY_TOKEN_CONTEXT: &[u8] = b"mnest-internet-radio-proxy-v1\0";
 const PROXY_STREAM_PATH: &str = "/api/internet_radio_stream.mp3";
+const SHARED_STREAM_CHANNEL_CAPACITY: usize = 256;
+
+#[derive(Clone, Debug)]
+pub enum SharedStreamEvent {
+    Audio(Bytes),
+    Failed(Arc<str>),
+    Ended,
+}
+
+struct SharedStreamSession {
+    source_url: String,
+    sender: broadcast::Sender<SharedStreamEvent>,
+    cancellation: CancellationToken,
+    subscribers: AtomicUsize,
+}
+
+impl SharedStreamSession {
+    fn try_add_subscriber(&self) -> bool {
+        loop {
+            if self.cancellation.is_cancelled() {
+                return false;
+            }
+            let subscribers = self.subscribers.load(Ordering::SeqCst);
+            if subscribers == 0 {
+                return false;
+            }
+            if self
+                .subscribers
+                .compare_exchange(
+                    subscribers,
+                    subscribers.saturating_add(1),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct SharedStreamHub {
+    sessions: Arc<Mutex<HashMap<String, Arc<SharedStreamSession>>>>,
+}
+
+pub struct SharedStreamSubscription {
+    receiver: broadcast::Receiver<SharedStreamEvent>,
+    session: Arc<SharedStreamSession>,
+}
+
+impl SharedStreamSubscription {
+    pub async fn recv(&mut self) -> Result<SharedStreamEvent, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for SharedStreamSubscription {
+    fn drop(&mut self) {
+        if self.session.subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.session.cancellation.cancel();
+        }
+    }
+}
+
+pub struct SharedStreamProducer {
+    hub: SharedStreamHub,
+    station_id: String,
+    session: Arc<SharedStreamSession>,
+}
+
+impl SharedStreamProducer {
+    pub fn cancellation(&self) -> CancellationToken {
+        self.session.cancellation.clone()
+    }
+
+    pub fn send_audio(&self, chunk: Bytes) -> bool {
+        self.session
+            .sender
+            .send(SharedStreamEvent::Audio(chunk))
+            .is_ok()
+    }
+
+    pub async fn finish(self, error: Option<String>) {
+        let mut sessions = self.hub.sessions.lock().await;
+        if sessions
+            .get(&self.station_id)
+            .is_some_and(|session| Arc::ptr_eq(session, &self.session))
+        {
+            sessions.remove(&self.station_id);
+        }
+        drop(sessions);
+        let event = match error {
+            Some(error) => SharedStreamEvent::Failed(Arc::from(error)),
+            None => SharedStreamEvent::Ended,
+        };
+        let _ = self.session.sender.send(event);
+        self.session.cancellation.cancel();
+    }
+}
+
+impl SharedStreamHub {
+    pub async fn cancel(&self, station_id: &str) {
+        if let Some(session) = self.sessions.lock().await.remove(station_id) {
+            session.cancellation.cancel();
+        }
+    }
+
+    pub async fn subscribe(
+        &self,
+        station_id: &str,
+        source_url: &str,
+    ) -> (SharedStreamSubscription, Option<SharedStreamProducer>) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(station_id) {
+            if session.source_url == source_url && session.try_add_subscriber() {
+                return (
+                    SharedStreamSubscription {
+                        receiver: session.sender.subscribe(),
+                        session: session.clone(),
+                    },
+                    None,
+                );
+            }
+            session.cancellation.cancel();
+            sessions.remove(station_id);
+        }
+
+        let (sender, receiver) = broadcast::channel(SHARED_STREAM_CHANNEL_CAPACITY);
+        let session = Arc::new(SharedStreamSession {
+            source_url: source_url.to_owned(),
+            sender,
+            cancellation: CancellationToken::new(),
+            subscribers: AtomicUsize::new(1),
+        });
+        sessions.insert(station_id.to_owned(), session.clone());
+        let subscription = SharedStreamSubscription {
+            receiver,
+            session: session.clone(),
+        };
+        let producer = SharedStreamProducer {
+            hub: self.clone(),
+            station_id: station_id.to_owned(),
+            session,
+        };
+        (subscription, Some(producer))
+    }
+
+    #[cfg(test)]
+    pub async fn active_streams(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+}
 
 pub async fn proxy_enabled<C: ConnectionTrait>(db: &C, station_id: &str) -> Result<bool, DbErr> {
     Ok(
@@ -153,5 +316,35 @@ mod tests {
         assert!(is_proxy_stream_url(&proxy));
         assert!(is_proxy_stream_url(&removed_proxy));
         assert!(!is_proxy_stream_url(&original));
+    }
+
+    #[tokio::test]
+    async fn shared_streams_reuse_sources_and_replace_changed_urls() {
+        let hub = SharedStreamHub::default();
+        let (first_subscription, first_producer) = hub
+            .subscribe("radio-1", "https://radio.example/first.m3u8")
+            .await;
+        let first_producer = first_producer.unwrap();
+        let first_cancellation = first_producer.cancellation();
+        let (same_subscription, same_producer) = hub
+            .subscribe("radio-1", "https://radio.example/first.m3u8")
+            .await;
+        assert!(same_producer.is_none());
+        assert_eq!(hub.active_streams().await, 1);
+
+        let (replacement_subscription, replacement_producer) = hub
+            .subscribe("radio-1", "https://radio.example/second.m3u8")
+            .await;
+        let replacement_producer = replacement_producer.unwrap();
+        assert!(first_cancellation.is_cancelled());
+        first_producer.finish(None).await;
+        assert_eq!(hub.active_streams().await, 1);
+
+        drop(first_subscription);
+        drop(same_subscription);
+        drop(replacement_subscription);
+        assert!(replacement_producer.cancellation().is_cancelled());
+        replacement_producer.finish(None).await;
+        assert_eq!(hub.active_streams().await, 0);
     }
 }

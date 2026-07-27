@@ -392,7 +392,7 @@ export function SettingsPage() {
     if (!window.confirm(`确认删除网络电台“${station.name}”？`)) return
     setBusy(`radio-delete:${station.id}`)
     try {
-      await subsonic('deleteInternetRadioStation', { id: station.id })
+      await post('/api/internet_radio_stations/delete/', { id: station.id })
       toast.notify('网络电台已删除', 'success')
       await reloadRadios()
     } catch (error) {

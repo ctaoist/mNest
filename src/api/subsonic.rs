@@ -472,7 +472,10 @@ async fn json_endpoint(
         "getInternetRadioStations" => radio_stations(state, p).await,
         "createInternetRadioStation" => create_radio(state, user, p).await,
         "updateInternetRadioStation" => update_radio(state, user, p).await,
-        "deleteInternetRadioStation" => delete_radio(state, user, required(p, "id")?).await,
+        "deleteInternetRadioStation" => Err(ApiFailure::new(
+            50,
+            "Deleting internet radio stations through OpenSubsonic is disabled",
+        )),
         "getUser" => get_user(state, user, required(p, "username")?).await,
         "getUsers" => get_users(state, user).await,
         "createUser" => create_user(state, user, p).await,
@@ -1974,6 +1977,7 @@ async fn update_radio(
         .await?
         .ok_or_else(not_found)?;
     let radio_id = radio.id.clone();
+    let stream_url_changed = radio.stream_url != stream_url;
     let mut active = radio.into_active_model();
     active.name = Set(name);
     active.stream_url = Set(stream_url);
@@ -1983,19 +1987,9 @@ async fn update_radio(
         internet_radio::set_proxy_enabled(&transaction, &radio_id, bool_param(p, "proxy")).await?;
     }
     transaction.commit().await?;
-    Ok(json!({}))
-}
-async fn delete_radio(state: &AppState, user: &User, id: &str) -> Result<Value, ApiFailure> {
-    require_admin(user)?;
-    let transaction = state.db.begin().await?;
-    let result = radio_entity::Entity::delete_by_id(id)
-        .exec(&transaction)
-        .await?;
-    if result.rows_affected == 0 {
-        return Err(not_found());
+    if stream_url_changed {
+        state.radio_streams.cancel(&radio_id).await;
     }
-    internet_radio::set_proxy_enabled(&transaction, id, false).await?;
-    transaction.commit().await?;
     Ok(json!({}))
 }
 
@@ -3173,20 +3167,22 @@ mod tests {
                 .unwrap()
         );
 
-        delete_radio(&state, &admin, &created.id).await.unwrap();
+        let error = json_endpoint(
+            &state,
+            &admin,
+            "deleteInternetRadioStation",
+            &HashMap::from([("id".into(), created.id.clone())]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, 50);
         assert!(
             radio_entity::Entity::find_by_id(&created.id)
                 .one(&state.db)
                 .await
                 .unwrap()
-                .is_none()
+                .is_some()
         );
-        assert!(
-            !internet_radio::proxy_enabled(&state.db, &created.id)
-                .await
-                .unwrap()
-        );
-        assert!(delete_radio(&state, &admin, &created.id).await.is_err());
     }
 
     #[tokio::test]
