@@ -13,7 +13,7 @@ import { usePreferences } from './preferences'
 import { trackArtistLabel } from '../lib/utils'
 import type { PlayQueue, Track } from '../types'
 
-export type RepeatMode = 'off' | 'all' | 'one'
+export type PlaybackMode = 'sequence' | 'shuffle' | 'repeat-all' | 'repeat-one'
 
 interface PlayerContextValue {
   current: () => Track | null
@@ -23,8 +23,7 @@ interface PlayerContextValue {
   currentTime: () => number
   duration: () => number
   volume: () => number
-  repeat: () => RepeatMode
-  shuffled: () => boolean
+  playbackMode: () => PlaybackMode
   queueOpen: () => boolean
   error: () => string
   captureRadioSamples: (durationSeconds?: number) => Promise<Float32Array>
@@ -37,8 +36,7 @@ interface PlayerContextValue {
   previous: () => void
   seek: (value: number) => void
   setVolume: (value: number) => void
-  cycleRepeat: () => void
-  toggleShuffle: () => void
+  cyclePlaybackMode: () => void
   setQueueOpen: (open: boolean) => void
   removeAt: (index: number) => void
   clear: () => void
@@ -96,8 +94,7 @@ export function PlayerProvider(props: ParentProps) {
   const [currentTime, setCurrentTime] = createSignal(0)
   const [duration, setDuration] = createSignal(0)
   const [volume, setVolumeSignal] = createSignal(Number(localStorage.getItem('player-volume') || 0.8))
-  const [repeat, setRepeat] = createSignal<RepeatMode>('off')
-  const [shuffled, setShuffled] = createSignal(false)
+  const [playbackMode, setPlaybackMode] = createSignal<PlaybackMode>('sequence')
   const [queueOpen, setQueueOpen] = createSignal(false)
   const [error, setError] = createSignal('')
   const current = createMemo(() => queue()[index()] || null)
@@ -263,15 +260,15 @@ export function PlayerProvider(props: ParentProps) {
   const next = () => {
     const tracks = queue()
     if (!tracks.length) return
-    if (repeat() === 'one') return activate(index())
-    if (shuffled() && tracks.length > 1) {
+    if (playbackMode() === 'repeat-one') return activate(index())
+    if (playbackMode() === 'shuffle' && tracks.length > 1) {
       let random = index()
       while (random === index()) random = Math.floor(Math.random() * tracks.length)
       return activate(random)
     }
     const nextIndex = index() + 1
     if (nextIndex < tracks.length) activate(nextIndex)
-    else if (repeat() === 'all') activate(0)
+    else if (playbackMode() === 'repeat-all') activate(0)
     else setPlaying(false)
   }
 
@@ -369,7 +366,12 @@ export function PlayerProvider(props: ParentProps) {
     localStorage.setItem('player-volume', String(nextVolume))
   }
 
-  const cycleRepeat = () => setRepeat((mode) => (mode === 'off' ? 'all' : mode === 'all' ? 'one' : 'off'))
+  const cyclePlaybackMode = () => setPlaybackMode((mode) => ({
+    sequence: 'shuffle',
+    shuffle: 'repeat-all',
+    'repeat-all': 'repeat-one',
+    'repeat-one': 'sequence',
+  })[mode] as PlaybackMode)
   const removeAt = (removeIndex: number) => {
     const wasCurrent = removeIndex === index()
     setQueue((items) => items.filter((_, itemIndex) => itemIndex !== removeIndex))
@@ -514,10 +516,10 @@ export function PlayerProvider(props: ParentProps) {
 
   return (
     <PlayerContext.Provider value={{
-      current, queue, index, playing, currentTime, duration, volume, repeat, shuffled, queueOpen, error,
+      current, queue, index, playing, currentTime, duration, volume, playbackMode, queueOpen, error,
       captureRadioSamples,
-      playTracks, playStream, playNow, enqueue, toggle, next, previous, seek, setVolume, cycleRepeat,
-      toggleShuffle: () => setShuffled((value) => !value), setQueueOpen, removeAt, clear,
+      playTracks, playStream, playNow, enqueue, toggle, next, previous, seek, setVolume, cyclePlaybackMode,
+      setQueueOpen, removeAt, clear,
     }}>
       {props.children}
     </PlayerContext.Provider>

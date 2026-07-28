@@ -145,14 +145,28 @@ describe('PlayerProvider', () => {
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('getLyricsBySongId') && String(input).includes('id=track-1'))).toBe(true)
   })
 
+  it('cycles all playback modes through one player button', async () => {
+    render(() => <PlayerProvider><PlayerHarness /><PlayerBar /></PlayerProvider>)
+    await fireEvent.click(screen.getByRole('button', { name: 'play' }))
+
+    await fireEvent.click(screen.getByRole('button', { name: '播放模式：顺序播放，点击切换' }))
+    await fireEvent.click(screen.getByRole('button', { name: '播放模式：随机播放，点击切换' }))
+    await fireEvent.click(screen.getByRole('button', { name: '播放模式：列表循环，点击切换' }))
+    await fireEvent.click(screen.getByRole('button', { name: '播放模式：单曲循环，点击切换' }))
+
+    expect(screen.getByRole('button', { name: '播放模式：顺序播放，点击切换' })).toBeTruthy()
+  })
+
   it('shows listening identification only while a radio stream is playing', async () => {
     render(() => <PlayerProvider><PlayerHarness /><PlayerBar /></PlayerProvider>)
     await fireEvent.click(screen.getByRole('button', { name: 'play' }))
     expect(screen.queryByRole('button', { name: '听歌识曲' })).toBeNull()
+    expect(screen.getByRole('button', { name: '播放模式：顺序播放，点击切换' })).toBeTruthy()
 
     await fireEvent.click(screen.getByRole('button', { name: 'radio' }))
     expect(await screen.findByRole('button', { name: '听歌识曲' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: '显示歌词' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /播放模式/ })).toBeNull()
   })
 
   it('reconnects an interrupted radio stream when the page regains focus', async () => {

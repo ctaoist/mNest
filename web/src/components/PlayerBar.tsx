@@ -18,7 +18,7 @@ import {
   Volume1,
   X,
 } from 'lucide-solid'
-import { usePlayer } from '../context/player'
+import { usePlayer, type PlaybackMode } from '../context/player'
 import { subsonic } from '../lib/api'
 import { identifyNeteaseAudio, type NeteaseAudioMatchResult } from '../lib/neteaseAudioMatch'
 import { formatDuration, trackArtistLabel } from '../lib/utils'
@@ -34,6 +34,13 @@ interface StructuredLyrics {
   displayTitle?: string
   synced: boolean
   line: LyricsLine[]
+}
+
+const playbackModeLabels: Record<PlaybackMode, string> = {
+  sequence: '顺序播放',
+  shuffle: '随机播放',
+  'repeat-all': '列表循环',
+  'repeat-one': '单曲循环',
 }
 
 export function PlayerBar() {
@@ -154,15 +161,27 @@ export function PlayerBar() {
             </button>
             <div class="player-center">
               <div class="player-controls">
-                <button class={`icon-button ${player.shuffled() ? 'is-active' : ''}`} onClick={player.toggleShuffle} aria-label="随机播放"><Shuffle size={16} /></button>
+                <Show when={!track().id.startsWith('radio:')}>
+                  <button
+                    class={`icon-button player-mode-button ${player.playbackMode() !== 'sequence' ? 'is-active' : ''}`}
+                    onClick={player.cyclePlaybackMode}
+                    aria-label={`播放模式：${playbackModeLabels[player.playbackMode()]}，点击切换`}
+                    title={playbackModeLabels[player.playbackMode()]}
+                  >
+                    {player.playbackMode() === 'shuffle'
+                      ? <Shuffle size={16} />
+                      : player.playbackMode() === 'repeat-one'
+                        ? <Repeat1 size={16} />
+                        : player.playbackMode() === 'repeat-all'
+                          ? <Repeat size={16} />
+                          : <ListMusic size={16} />}
+                  </button>
+                </Show>
                 <button class="icon-button" onClick={player.previous} aria-label="上一首"><SkipBack size={19} fill="currentColor" /></button>
                 <button class="play-button" onClick={player.toggle} aria-label={player.playing() ? '暂停' : '播放'}>
                   <Show when={player.playing()} fallback={<Play size={19} fill="currentColor" />}><Pause size={19} fill="currentColor" /></Show>
                 </button>
                 <button class="icon-button" onClick={player.next} aria-label="下一首"><SkipForward size={19} fill="currentColor" /></button>
-                <button class={`icon-button ${player.repeat() !== 'off' ? 'is-active' : ''}`} onClick={player.cycleRepeat} aria-label="循环模式">
-                  {player.repeat() === 'one' ? <Repeat1 size={16} /> : <Repeat size={16} />}
-                </button>
                 <Show when={!track().id.startsWith('radio:')}>
                   <button class={`icon-button player-lyrics-trigger ${lyricsOpen() ? 'is-active' : ''}`} onClick={toggleLyrics} aria-label={lyricsOpen() ? '关闭歌词' : '显示歌词'} title="歌词"><MicVocal size={17} /></button>
                 </Show>
