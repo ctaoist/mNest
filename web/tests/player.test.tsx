@@ -12,8 +12,10 @@ class MockAudio extends EventTarget {
   volume = 1
   paused = true
   preload = ''
+  error: MediaError | null = null
+  loadCalls = 0
   constructor() { super(); MockAudio.latest = this }
-  load() {}
+  load() { this.loadCalls += 1; this.error = null }
   removeAttribute() { this.src = '' }
   play() { this.paused = false; this.dispatchEvent(new Event('play')); return Promise.resolve() }
   pause() { this.paused = true; this.dispatchEvent(new Event('pause')) }
@@ -118,5 +120,24 @@ describe('PlayerProvider', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'radio' }))
     expect(await screen.findByRole('button', { name: '听歌识曲' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: '显示歌词' })).toBeNull()
+  })
+
+  it('reconnects an interrupted radio stream when the page regains focus', async () => {
+    render(() => <PlayerProvider><PlayerHarness /><PlayerBar /></PlayerProvider>)
+    await fireEvent.click(screen.getByRole('button', { name: 'radio' }))
+    const audio = MockAudio.latest
+    expect(audio.loadCalls).toBe(1)
+
+    window.dispatchEvent(new Event('blur'))
+    audio.paused = true
+    audio.dispatchEvent(new Event('pause'))
+    audio.error = { code: 2, message: 'interrupted' } as MediaError
+    audio.dispatchEvent(new Event('error'))
+    window.dispatchEvent(new Event('focus'))
+
+    await waitFor(() => expect(audio.loadCalls).toBe(2))
+    expect(audio.src).toContain('_mnest_reconnect=')
+    expect(screen.queryByText(/电台.*中断/)).toBeNull()
+    expect(screen.getByRole('button', { name: '暂停' })).toBeTruthy()
   })
 })

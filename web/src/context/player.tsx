@@ -111,6 +111,9 @@ export function PlayerProvider(props: ParentProps) {
   let radioCaptureRecorder: AudioWorkletNode | undefined
   let radioCaptureReject: ((reason?: unknown) => void) | undefined
   let radioCaptureTimer = 0
+  let radioReconnectSequence = 0
+  let radioReconnectInFlight = false
+  let resumeRadioAfterInterruption = false
 
   const cancelRadioCapture = (message = '听歌识曲已取消') => {
     window.clearTimeout(radioCaptureTimer)
@@ -277,10 +280,50 @@ export function PlayerProvider(props: ParentProps) {
     persistQueue()
   }
 
+  const reconnectRadio = async (automatic: boolean) => {
+    const track = current()
+    if (!track?.id.startsWith('radio:') || !track.streamUrl || radioReconnectInFlight) return
+    radioReconnectInFlight = true
+    cancelRadioCapture('电台连接正在恢复')
+    setError('')
+    try {
+      const url = new URL(track.streamUrl, window.location.href)
+      url.searchParams.set('_mnest_reconnect', `${Date.now()}-${++radioReconnectSequence}`)
+      audio.pause()
+      audio.src = url.origin === window.location.origin
+        ? `${url.pathname}${url.search}${url.hash}`
+        : url.toString()
+      audio.load()
+      await audio.play()
+    } catch {
+      setPlaying(false)
+      setError(automatic
+        ? '电台播放被系统中断，请点击播放重新连接。'
+        : '电台重新连接失败，请稍后重试。')
+    } finally {
+      radioReconnectInFlight = false
+    }
+  }
+
+  const resumePlayback = () => {
+    const track = current()
+    if (!track) return
+    if (track.id.startsWith('radio:')) {
+      void reconnectRadio(false)
+      return
+    }
+    void audio.play().catch(() => setPlaying(false))
+  }
+
+  const pausePlayback = () => {
+    resumeRadioAfterInterruption = false
+    audio.pause()
+  }
+
   const toggle = () => {
     if (!current()) return
-    if (audio.paused) void audio.play()
-    else audio.pause()
+    if (audio.paused) resumePlayback()
+    else pausePlayback()
   }
 
   const seek = (value: number) => {
@@ -314,6 +357,7 @@ export function PlayerProvider(props: ParentProps) {
 
   const clear = () => {
     cancelRadioCapture()
+    resumeRadioAfterInterruption = false
     audio.pause()
     audio.removeAttribute('src')
     setQueue([])
@@ -329,8 +373,29 @@ export function PlayerProvider(props: ParentProps) {
   }
 
   onMount(async () => {
+    const rememberRadioInterruption = () => {
+      const track = current()
+      if (track?.id.startsWith('radio:') && !audio.paused) {
+        resumeRadioAfterInterruption = true
+      }
+    }
+    const restoreRadioAfterInterruption = () => {
+      if (document.visibilityState === 'hidden' || !resumeRadioAfterInterruption) return
+      resumeRadioAfterInterruption = false
+      const track = current()
+      if (track?.id.startsWith('radio:')) {
+        void reconnectRadio(true)
+      }
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') rememberRadioInterruption()
+      else restoreRadioAfterInterruption()
+    }
+
     audio.volume = volume()
     audio.addEventListener('play', () => {
+      resumeRadioAfterInterruption = false
+      setError('')
       setPlaying(true)
       reportNowPlaying()
     })
@@ -349,11 +414,28 @@ export function PlayerProvider(props: ParentProps) {
     audio.addEventListener('ended', next)
     audio.addEventListener('error', () => {
       const track = current()
+      if (track?.id.startsWith('radio:')) {
+        setPlaying(false)
+        if (!resumeRadioAfterInterruption) {
+          setError('电台连接已中断，请点击播放重新连接。')
+        }
+        return
+      }
       setError(track?.streamUrl?.startsWith('/api/remote_download/preview/')
         ? '128k 试听加载失败，远程来源没有返回可播放音频。'
-        : track?.id.startsWith('radio:')
-          ? '电台播放失败，请检查流地址、服务端网络或音频格式。'
-          : '音频加载失败，请检查文件或转码工具。')
+        : '音频加载失败，请检查文件或转码工具。')
+    })
+    window.addEventListener('blur', rememberRadioInterruption)
+    window.addEventListener('focus', restoreRadioAfterInterruption)
+    window.addEventListener('pagehide', rememberRadioInterruption)
+    window.addEventListener('pageshow', restoreRadioAfterInterruption)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    onCleanup(() => {
+      window.removeEventListener('blur', rememberRadioInterruption)
+      window.removeEventListener('focus', restoreRadioAfterInterruption)
+      window.removeEventListener('pagehide', rememberRadioInterruption)
+      window.removeEventListener('pageshow', restoreRadioAfterInterruption)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
     })
     try {
       const response = await subsonic<{ playQueueByIndex: PlayQueue }>('getPlayQueueByIndex')
@@ -377,8 +459,8 @@ export function PlayerProvider(props: ParentProps) {
       album: track.album,
       artwork: track.coverArt ? [{ src: mediaUrl('getCoverArt', { id: track.coverArt }) }] : [],
     })
-    navigator.mediaSession.setActionHandler('play', () => void audio.play())
-    navigator.mediaSession.setActionHandler('pause', () => audio.pause())
+    navigator.mediaSession.setActionHandler('play', resumePlayback)
+    navigator.mediaSession.setActionHandler('pause', pausePlayback)
     navigator.mediaSession.setActionHandler('previoustrack', previous)
     navigator.mediaSession.setActionHandler('nexttrack', next)
   })
