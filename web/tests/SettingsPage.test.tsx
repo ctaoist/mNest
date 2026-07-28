@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   post: vi.fn(),
   subsonic: vi.fn(),
   notify: vi.fn(),
+  bitrate: 0,
+  saveBitrate: vi.fn(),
 }))
 
 vi.mock('../src/context/auth', () => ({
@@ -20,6 +22,15 @@ vi.mock('../src/context/auth', () => ({
 
 vi.mock('../src/context/theme', () => ({
   useTheme: () => ({ theme: () => 'minimal', setTheme: vi.fn() }),
+}))
+
+vi.mock('../src/context/preferences', () => ({
+  WEB_PLAYBACK_BITRATES: [0, 64, 96, 128, 192, 256, 320],
+  usePreferences: () => ({
+    webPlaybackBitrate: () => mocks.bitrate,
+    loading: () => false,
+    saveWebPlaybackBitrate: mocks.saveBitrate,
+  }),
 }))
 
 vi.mock('../src/context/toast', () => ({
@@ -45,6 +56,8 @@ const lastfm = {
 
 describe('SettingsPage permissions', () => {
   beforeEach(() => {
+    mocks.bitrate = 0
+    mocks.saveBitrate.mockImplementation(async (value: number) => { mocks.bitrate = value })
     mocks.get.mockImplementation((path: string) => {
       if (path === '/api/lastfm/status/') return Promise.resolve(lastfm)
       if (path === '/api/download_sources/') return Promise.resolve([])
@@ -77,10 +90,21 @@ describe('SettingsPage permissions', () => {
 
     await waitFor(() => expect(screen.getByText('Last.fm')).toBeTruthy())
     expect(screen.getByText('界面主题')).toBeTruthy()
+    expect(screen.getByLabelText('网页端播放码率')).toHaveValue('0')
     expect(screen.queryByText('曲库目录')).toBeNull()
     expect(screen.queryByPlaceholderText('Last.fm API Key')).toBeNull()
     expect(mocks.get).not.toHaveBeenCalledWith('/api/config/status/')
     expect(mocks.get).not.toHaveBeenCalledWith('/api/download_sources/')
+  })
+
+  it('saves the web playback bitrate as a personal preference', async () => {
+    render(() => <SettingsPage />)
+    await waitFor(() => expect(screen.getByLabelText('网页端播放码率')).toBeTruthy())
+
+    await fireEvent.change(screen.getByLabelText('网页端播放码率'), { target: { value: '128' } })
+
+    await waitFor(() => expect(mocks.saveBitrate).toHaveBeenCalledWith(128))
+    expect(mocks.notify).toHaveBeenCalledWith('网页播放码率已保存，将从下一次播放开始生效', 'success')
   })
 
   it('shows administrative and personal settings to an administrator', async () => {

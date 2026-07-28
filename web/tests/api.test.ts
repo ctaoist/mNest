@@ -38,4 +38,20 @@ describe('API session handling', () => {
     const url = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost')
     expect(url.searchParams.getAll('songId')).toEqual(['track-1', 'track-2'])
   })
+
+  it('uses form POST for a large OpenSubsonic play queue', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      'subsonic-response': { status: 'ok' },
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const ids = Array.from({ length: 180 }, (_, index) => `track-${index}-${'x'.repeat(24)}`)
+
+    await subsonic('savePlayQueueByIndex', { id: ids, currentIndex: 0, position: 0 })
+
+    const [path, init] = fetchMock.mock.calls[0]
+    expect(path).toBe('/rest/savePlayQueueByIndex')
+    expect(init).toMatchObject({ method: 'POST' })
+    const body = new URLSearchParams(String(init?.body))
+    expect(body.getAll('id')).toEqual(ids)
+  })
 })

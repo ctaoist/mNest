@@ -2,6 +2,7 @@ import { Navigate, Route, Router } from '@solidjs/router'
 import { ProtectedLayout } from './components/AppShell'
 import { AuthProvider } from './context/auth'
 import { PlayerProvider } from './context/player'
+import { PreferencesProvider } from './context/preferences'
 import { ThemeProvider } from './context/theme'
 import { ToastProvider } from './context/toast'
 import { LoginPage } from './pages/LoginPage'
@@ -15,7 +16,9 @@ function Providers(props: { children?: unknown }) {
     <ThemeProvider>
       <ToastProvider>
         <AuthProvider>
-          <PlayerProvider>{props.children as any}</PlayerProvider>
+          <PreferencesProvider>
+            <PlayerProvider>{props.children as any}</PlayerProvider>
+          </PreferencesProvider>
         </AuthProvider>
       </ToastProvider>
     </ThemeProvider>

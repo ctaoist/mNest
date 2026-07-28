@@ -45,7 +45,7 @@ describe('TrackTable', () => {
 
   afterEach(() => vi.unstubAllGlobals())
 
-  it('only queues the clicked track when using a row play button', async () => {
+  it('queues the displayed list and starts from the clicked track', async () => {
     render(() => (
       <PlayerProvider>
         <TrackTable tracks={tracks} />
@@ -55,7 +55,7 @@ describe('TrackTable', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: '播放 晨雾' }))
 
-    await waitFor(() => expect(screen.getByLabelText('播放队列状态')).toHaveTextContent('1:track-2'))
+    await waitFor(() => expect(screen.getByLabelText('播放队列状态')).toHaveTextContent('2:track-2'))
   })
 
   it('opens the artist and album from their own columns', async () => {

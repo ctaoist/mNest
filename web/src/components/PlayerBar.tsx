@@ -258,31 +258,33 @@ export function PlayerBar() {
         </aside>
       </div>
 
-      <div class={`queue-sheet ${player.queueOpen() ? 'is-open' : ''}`} aria-hidden={!player.queueOpen()}>
+      <div class={`queue-sheet play-queue-sheet ${player.queueOpen() ? 'is-open' : ''}`} aria-hidden={!player.queueOpen()}>
         <div class="sheet-backdrop" onClick={() => player.setQueueOpen(false)} />
-        <aside>
+        <aside class="play-queue-panel">
+          <button class="icon-button queue-close" onClick={() => player.setQueueOpen(false)} aria-label="关闭播放列表"><X /></button>
           <header>
             <div><span class="eyebrow">PLAY NEXT</span><h2>播放队列</h2></div>
-            <button class="icon-button" onClick={() => player.setQueueOpen(false)} aria-label="关闭"><X /></button>
           </header>
           <div class="queue-toolbar">
             <span>{player.queue().length} 首歌曲</span>
             <button class="text-button danger" onClick={player.clear}><Trash2 size={15} />清空</button>
           </div>
-          <div class="queue-list">
-            <For each={player.queue()} fallback={<div class="empty-state">队列空空如也</div>}>
-              {(track, index) => (
-                <div class={`queue-row ${player.index() === index() ? 'is-active' : ''}`}>
-                  <button class="queue-main" onClick={() => player.playTracks(player.queue(), index())}>
-                    <CoverArt id={track.coverArt} alt={track.album} />
-                    <span><strong>{track.title}</strong><small>{trackArtistLabel(track)}</small></span>
-                  </button>
-                  <span>{formatDuration(track.duration)}</span>
-                  <button class="icon-button" onClick={() => player.removeAt(index())} aria-label="从队列移除"><ChevronDown class="rotate-90" size={16} /></button>
-                </div>
-              )}
-            </For>
-          </div>
+          <Show when={player.queueOpen()}>
+            <div class="queue-list">
+              <For each={player.queue()} fallback={<div class="empty-state">队列空空如也</div>}>
+                {(track, index) => (
+                  <div class={`queue-row ${player.index() === index() ? 'is-active' : ''}`}>
+                    <button class="queue-main" onClick={() => player.playTracks(player.queue(), index())}>
+                      <CoverArt id={track.coverArt} alt={track.album} />
+                      <span><strong>{track.title}</strong><small>{trackArtistLabel(track)}</small></span>
+                    </button>
+                    <span>{formatDuration(track.duration)}</span>
+                    <button class="icon-button" onClick={() => player.removeAt(index())} aria-label="从队列移除"><ChevronDown class="rotate-90" size={16} /></button>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
         </aside>
       </div>
     </>

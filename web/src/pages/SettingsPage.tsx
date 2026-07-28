@@ -32,9 +32,10 @@ import { GitHubMark } from '../components/GitHubMark'
 import { useAuth } from '../context/auth'
 import { ThemeName, useTheme } from '../context/theme'
 import { useToast } from '../context/toast'
+import { usePreferences, WEB_PLAYBACK_BITRATES } from '../context/preferences'
 import { get, post, request, subscribeJobs, subsonic } from '../lib/api'
 import { safeHttpUrl } from '../lib/utils'
-import type { ConfigStatus, DownloadFilenameFormat, DownloadSource, DownloadSourceKind, JobRecord, LastFmStatus, LibraryRoot, RadioStation } from '../types'
+import type { ConfigStatus, DownloadFilenameFormat, DownloadSource, DownloadSourceKind, JobRecord, LastFmStatus, LibraryRoot, RadioStation, WebPlaybackBitrate } from '../types'
 
 const themes: Array<{ id: ThemeName; name: string; description: string; icon: typeof SunMedium }> = [
   { id: 'archive', name: '唱片档案馆', description: '深墨蓝、暖金与纸张质感', icon: HardDrive },
@@ -91,6 +92,7 @@ type RadioDraft = {
 export function SettingsPage() {
   const auth = useAuth()
   const theme = useTheme()
+  const preferences = usePreferences()
   const toast = useToast()
   const [status, setStatus] = createSignal<ConfigStatus | null>(null)
   const [health, setHealth] = createSignal<{ status: string; version: string } | null>(null)
@@ -453,6 +455,32 @@ export function SettingsPage() {
     </section>
   )
 
+  const saveWebPlaybackBitrate = async (value: WebPlaybackBitrate) => {
+    setBusy('web-playback-bitrate')
+    try {
+      await preferences.saveWebPlaybackBitrate(value)
+      toast.notify('网页播放码率已保存，将从下一次播放开始生效', 'success')
+    } catch (error) {
+      toast.notify(error instanceof Error ? error.message : '网页播放码率保存失败', 'error')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const renderPlaybackSettings = () => {
+    const bitrate = () => preferences.webPlaybackBitrate()
+    return (
+      <section class="panel playback-settings">
+        <div class="section-heading"><div><span class="eyebrow">WEB PLAYBACK</span><div class="settings-section-title">网页播放</div></div><span class="playback-quality-badge">{bitrate() ? `${bitrate()} kbps` : 'SOURCE'}</span></div>
+        <div class="playback-setting-row">
+          <span class="playback-setting-icon"><Gauge /></span>
+          <div><strong>网页端播放码率</strong><small>仅影响当前用户使用 mNest 网页播放器播放的普通歌曲；网络电台和 OpenSubsonic 客户端不受影响。选择固定码率时由服务器转为 MP3。</small></div>
+          <label><span>输出质量</span><select aria-label="网页端播放码率" value={bitrate()} disabled={preferences.loading() || busy() === 'web-playback-bitrate'} onChange={(event) => void saveWebPlaybackBitrate(Number(event.currentTarget.value) as WebPlaybackBitrate)}><For each={WEB_PLAYBACK_BITRATES}>{(value) => <option value={value}>{value ? `${value} kbps` : '原始音质'}</option>}</For></select></label>
+        </div>
+      </section>
+    )
+  }
+
   const renderLastFmSettings = (admin: boolean) => {
     const lastfm = lastFmStatus()
     if (!lastfm) return null
@@ -487,7 +515,7 @@ export function SettingsPage() {
       </header>
 
       <Show when={lastFmStatus()} fallback={<div class="loading-panel"><LoaderCircle class="spin" /><span>正在读取设置…</span></div>}>
-        <Show when={isAdmin()} fallback={<>{renderThemeSettings()}{renderLastFmSettings(false)}</>}>
+        <Show when={isAdmin()} fallback={<>{renderPlaybackSettings()}{renderThemeSettings()}{renderLastFmSettings(false)}</>}>
           <Show when={status()} fallback={<div class="loading-panel"><LoaderCircle class="spin" /><span>正在读取管理员设置…</span></div>}>
             {(config) => (
               <>
@@ -518,6 +546,8 @@ export function SettingsPage() {
                 <div class="config-note"><CircleAlert size={18} /><p>工具路径、Provider、队列与封面缓存由服务器 <code>config.yaml</code> 管理。封面缓存{config().cover_cache.enabled ? <>已启用：<code>{config().cover_cache.path}</code></> : '未启用'}。</p></div>
               </section>
             </div>
+
+            {renderPlaybackSettings()}
 
             {renderThemeSettings()}
 

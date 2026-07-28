@@ -47,6 +47,7 @@ use crate::{
     remote_download::{self, RemoteConnection, RemoteImportRequest, RemoteSearchRequest},
     scanner,
     tags::{ARTWORK_CACHE_CONTROL, AUDIO_EXTENSIONS, AudioMetadata, detect_artwork_mime},
+    user_preferences,
 };
 use uuid::Uuid;
 
@@ -71,6 +72,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/scan/", post(start_scan))
         .route("/api/config/status/", get(config_status))
         .route("/api/config/preferences/", post(save_preferences))
+        .route(
+            "/api/user/preferences/",
+            get(user_preferences).post(save_user_preferences),
+        )
         .route("/api/lastfm/config/", post(save_lastfm_config))
         .route("/api/lastfm/status/", get(lastfm_status))
         .route("/api/lastfm/auth/start/", post(start_lastfm_auth))
@@ -886,6 +891,11 @@ struct UploadSongQuery {
 #[derive(Deserialize)]
 struct SavePreferencesRequest {
     download_filename_format: String,
+}
+
+#[derive(Deserialize)]
+struct SaveUserPreferencesRequest {
+    web_playback_bitrate: u32,
 }
 
 #[derive(Deserialize)]
@@ -2190,6 +2200,38 @@ async fn config_status(
     }))))
 }
 
+async fn user_preferences(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<
+    (
+        [(header::HeaderName, &'static str); 1],
+        Json<ApiResponse<user_preferences::UserPreferences>>,
+    ),
+    ApiError,
+> {
+    let preferences = user_preferences::load(&state.db, &user.id).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(ApiResponse::success(preferences)),
+    ))
+}
+
+async fn save_user_preferences(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Json(request): Json<SaveUserPreferencesRequest>,
+) -> Result<Json<ApiResponse<user_preferences::UserPreferences>>, ApiError> {
+    if !user_preferences::validate_web_playback_bitrate(request.web_playback_bitrate) {
+        return Err(ApiError::bad_request("网页播放码率无效"));
+    }
+    let preferences = user_preferences::UserPreferences {
+        web_playback_bitrate: request.web_playback_bitrate,
+    };
+    user_preferences::save(&state.db, &user.id, preferences).await?;
+    Ok(Json(ApiResponse::success(preferences)))
+}
+
 async fn save_preferences(
     State(state): State<AppState>,
     _user: AdminUser,
@@ -2956,6 +2998,59 @@ mod tests {
             download_filename_format(&state).await.unwrap(),
             "title-artist"
         );
+    }
+
+    #[tokio::test]
+    async fn saves_web_playback_bitrate_per_user() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let listener = crate::entities::user::ActiveModel {
+            id: Set("listener-preferences".into()),
+            username: Set("listener-preferences".into()),
+            password_hash: Set(String::new()),
+            email: Set(String::new()),
+            role: Set("user".into()),
+            subsonic_token: Set(String::new()),
+            subsonic_password: Set(String::new()),
+            created_at: Set(chrono::Utc::now().to_rfc3339()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+
+        let _ = save_user_preferences(
+            State(state.clone()),
+            AuthUser(admin.clone()),
+            Json(SaveUserPreferencesRequest {
+                web_playback_bitrate: 128,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let admin_preferences = user_preferences(State(state.clone()), AuthUser(admin.clone()))
+            .await
+            .unwrap();
+        let listener_preferences = user_preferences(State(state.clone()), AuthUser(listener))
+            .await
+            .unwrap();
+        assert_eq!(admin_preferences.1.0.data.web_playback_bitrate, 128);
+        assert_eq!(listener_preferences.1.0.data.web_playback_bitrate, 0);
+        assert_eq!(admin_preferences.0[0].1, "private, no-store");
+
+        let error = save_user_preferences(
+            State(state),
+            AuthUser(admin),
+            Json(SaveUserPreferencesRequest {
+                web_playback_bitrate: 100,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

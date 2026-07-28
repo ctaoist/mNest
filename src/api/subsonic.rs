@@ -49,6 +49,7 @@ use crate::{
     jobs::{self, ScanPayload},
     lastfm,
     models::{Album, Artist, MusicFolder, Track, User},
+    user_preferences,
 };
 
 #[derive(FromQueryResult)]
@@ -2175,6 +2176,7 @@ async fn delete_user(
         .exec(&transaction)
         .await?;
     lastfm::delete_user_authorization(&transaction, &user.id).await?;
+    user_preferences::delete(&transaction, &user.id).await?;
     user_entity::Entity::delete_by_id(user.id)
         .exec(&transaction)
         .await?;

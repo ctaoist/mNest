@@ -9,6 +9,7 @@ import {
   useContext,
 } from 'solid-js'
 import { mediaUrl, subsonic } from '../lib/api'
+import { usePreferences } from './preferences'
 import { trackArtistLabel } from '../lib/utils'
 import type { PlayQueue, Track } from '../types'
 
@@ -86,6 +87,7 @@ registerProcessor('mnest-radio-recorder', MNestRadioRecorder)
 `
 
 export function PlayerProvider(props: ParentProps) {
+  const preferences = usePreferences()
   const audio = new Audio()
   audio.preload = 'metadata'
   const [queue, setQueue] = createSignal<Track[]>([])
@@ -114,6 +116,8 @@ export function PlayerProvider(props: ParentProps) {
   let radioReconnectSequence = 0
   let radioReconnectInFlight = false
   let resumeRadioAfterInterruption = false
+  let playbackOffset = 0
+  let transcodedPlayback = false
 
   const cancelRadioCapture = (message = '听歌识曲已取消') => {
     window.clearTimeout(radioCaptureTimer)
@@ -197,7 +201,7 @@ export function PlayerProvider(props: ParentProps) {
 
   const updatePlaybackReport = () => {
     const track = current()
-    const position = audio.currentTime
+    const position = playbackOffset + audio.currentTime
     const delta = position - lastPlaybackPosition
     lastPlaybackPosition = position
     if (!track || track.streamUrl || playbackTrackId !== track.id || !playbackStartedAt || scrobbleSent) return
@@ -220,11 +224,28 @@ export function PlayerProvider(props: ParentProps) {
       const tracks = queue()
       if (!tracks.length || tracks.some((track) => track.streamUrl)) return
       void subsonic('savePlayQueueByIndex', {
-        id: tracks.map((track) => track.id).join(','),
+        id: tracks.map((track) => track.id),
         currentIndex: index(),
-        position: Math.round(audio.currentTime * 1000),
-      })
+        position: Math.round((playbackOffset + audio.currentTime) * 1000),
+      }).catch(() => undefined)
     }, 600)
+  }
+
+  const loadTrackSource = (track: Track, position: number) => {
+    const playbackBitrate = track.streamUrl ? 0 : preferences.webPlaybackBitrate()
+    transcodedPlayback = playbackBitrate > 0
+    playbackOffset = transcodedPlayback ? position : 0
+    audio.src = track.streamUrl || mediaUrl('stream', {
+      id: track.id,
+      format: playbackBitrate ? 'mp3' : undefined,
+      maxBitRate: playbackBitrate || undefined,
+      timeOffset: transcodedPlayback && position > 0 ? position.toFixed(3) : undefined,
+    })
+    if (transcodedPlayback) audio.currentTime = 0
+    else if (!track.streamUrl) audio.currentTime = position
+    setCurrentTime(position)
+    setDuration(track.duration > 0 ? track.duration : 0)
+    audio.load()
   }
 
   const activate = (nextIndex: number, autoplay = true, position = 0, persist = true) => {
@@ -234,9 +255,7 @@ export function PlayerProvider(props: ParentProps) {
     setIndex(nextIndex)
     setError('')
     resetPlaybackReport(track, position)
-    audio.src = track.streamUrl || mediaUrl('stream', { id: track.id })
-    if (!track.streamUrl) audio.currentTime = position
-    audio.load()
+    loadTrackSource(track, position)
     if (autoplay) void audio.play().catch(() => setPlaying(false))
     if (persist) persistQueue()
   }
@@ -327,7 +346,19 @@ export function PlayerProvider(props: ParentProps) {
   }
 
   const seek = (value: number) => {
-    audio.currentTime = Math.max(0, Math.min(value, duration()))
+    const position = Math.max(0, Math.min(value, duration()))
+    const track = current()
+    if (track && transcodedPlayback) {
+      const autoplay = !audio.paused
+      cancelRadioCapture('播放位置已改变')
+      setError('')
+      lastPlaybackPosition = position
+      loadTrackSource(track, position)
+      if (autoplay) void audio.play().catch(() => setPlaying(false))
+      persistQueue()
+      return
+    }
+    audio.currentTime = position
     setCurrentTime(audio.currentTime)
   }
 
@@ -358,6 +389,8 @@ export function PlayerProvider(props: ParentProps) {
   const clear = () => {
     cancelRadioCapture()
     resumeRadioAfterInterruption = false
+    playbackOffset = 0
+    transcodedPlayback = false
     audio.pause()
     audio.removeAttribute('src')
     setQueue([])
@@ -404,13 +437,17 @@ export function PlayerProvider(props: ParentProps) {
       if (radioCaptureReject) cancelRadioCapture('电台播放已暂停')
     })
     audio.addEventListener('timeupdate', () => {
-      setCurrentTime(audio.currentTime)
+      setCurrentTime(playbackOffset + audio.currentTime)
       updatePlaybackReport()
     })
     audio.addEventListener('seeking', () => {
-      lastPlaybackPosition = audio.currentTime
+      lastPlaybackPosition = playbackOffset + audio.currentTime
     })
-    audio.addEventListener('durationchange', () => setDuration(Number.isFinite(audio.duration) ? audio.duration : 0))
+    audio.addEventListener('durationchange', () => {
+      const mediaDuration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0
+      const trackDuration = current()?.duration || 0
+      setDuration(transcodedPlayback ? trackDuration : mediaDuration || trackDuration)
+    })
     audio.addEventListener('ended', next)
     audio.addEventListener('error', () => {
       const track = current()

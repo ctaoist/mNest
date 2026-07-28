@@ -46,7 +46,7 @@ export function TrackTable(props: TrackTableProps) {
               <button
                 class="track-play"
                 aria-label={`播放 ${track.title}`}
-                onClick={() => active() ? player.toggle() : player.playTracks([track])}
+                onClick={() => active() ? player.toggle() : player.playTracks(props.tracks, index())}
               >
                 <Show when={active() && player.playing()} fallback={<Play size={15} fill="currentColor" />}>
                   <Pause size={15} fill="currentColor" />

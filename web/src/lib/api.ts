@@ -99,7 +99,14 @@ export function subscribeJobs(
 export async function subsonic<T>(method: string, params: Params = {}, retry = true): Promise<T> {
   const search = new URLSearchParams({ f: 'json', v: '1.16.1', c: 'mNest' })
   appendParams(search, params)
-  const payload = await request<Record<string, any>>(`/rest/${method}?${search.toString()}`)
+  const encoded = search.toString()
+  const payload = encoded.length > 4_096
+    ? await request<Record<string, any>>(`/rest/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: encoded,
+      })
+    : await request<Record<string, any>>(`/rest/${method}?${encoded}`)
   const envelope = payload['subsonic-response']
   if (!envelope || envelope.status !== 'ok') {
     if (retry && envelope?.error?.code === 40 && await refreshSession()) {

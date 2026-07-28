@@ -4,6 +4,16 @@ import { PlayerBar } from '../src/components/PlayerBar'
 import { PlayerProvider, usePlayer } from '../src/context/player'
 import type { Track } from '../src/types'
 
+const preferenceMocks = vi.hoisted(() => ({ bitrate: 0 }))
+
+vi.mock('../src/context/preferences', () => ({
+  usePreferences: () => ({
+    webPlaybackBitrate: () => preferenceMocks.bitrate,
+    loading: () => false,
+    saveWebPlaybackBitrate: vi.fn(),
+  }),
+}))
+
 class MockAudio extends EventTarget {
   static latest: MockAudio
   src = ''
@@ -26,11 +36,12 @@ const radio: Track = { id: 'radio:station-1', title: '测试电台', artists: [{
 
 function PlayerHarness() {
   const player = usePlayer()
-  return <><span>{player.current()?.title || 'empty'}</span><button onClick={() => player.playTracks([track])}>play</button><button onClick={() => player.playStream(radio)}>radio</button></>
+  return <><span>{player.current()?.title || 'empty'}</span><output aria-label="播放进度">{player.currentTime()}:{player.duration()}</output><button onClick={() => player.playTracks([track])}>play</button><button onClick={() => player.playStream(radio)}>radio</button><button onClick={() => player.seek(60)}>seek</button></>
 }
 
 describe('PlayerProvider', () => {
   beforeEach(() => {
+    preferenceMocks.bitrate = 0
     vi.stubGlobal('Audio', MockAudio)
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
       'subsonic-response': { status: 'ok', playQueue: { entry: [] } },
@@ -42,6 +53,28 @@ describe('PlayerProvider', () => {
     render(() => <PlayerProvider><PlayerHarness /></PlayerProvider>)
     await fireEvent.click(screen.getByRole('button', { name: 'play' }))
     await waitFor(() => expect(screen.getByText('夜航')).toBeTruthy())
+  })
+
+  it('uses the current user web playback bitrate for songs', async () => {
+    preferenceMocks.bitrate = 128
+    render(() => <PlayerProvider><PlayerHarness /></PlayerProvider>)
+
+    await fireEvent.click(screen.getByRole('button', { name: 'play' }))
+
+    const stream = new URL(MockAudio.latest.src, 'http://localhost')
+    expect(stream.searchParams.get('format')).toBe('mp3')
+    expect(stream.searchParams.get('maxBitRate')).toBe('128')
+
+    MockAudio.latest.duration = Number.POSITIVE_INFINITY
+    MockAudio.latest.dispatchEvent(new Event('durationchange'))
+    MockAudio.latest.currentTime = 2
+    MockAudio.latest.dispatchEvent(new Event('timeupdate'))
+    expect(screen.getByLabelText('播放进度')).toHaveTextContent('2:180')
+
+    await fireEvent.click(screen.getByRole('button', { name: 'seek' }))
+    const seekStream = new URL(MockAudio.latest.src, 'http://localhost')
+    expect(seekStream.searchParams.get('timeOffset')).toBe('60.000')
+    expect(screen.getByLabelText('播放进度')).toHaveTextContent('60:180')
   })
 
   it('reports now playing and scrobbles after the listening threshold', async () => {

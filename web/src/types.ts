@@ -11,6 +11,12 @@ export interface User {
   email?: string
 }
 
+export type WebPlaybackBitrate = 0 | 64 | 96 | 128 | 192 | 256 | 320
+
+export interface UserPreferences {
+  web_playback_bitrate: WebPlaybackBitrate
+}
+
 export interface Track {
   id: string
   title: string
