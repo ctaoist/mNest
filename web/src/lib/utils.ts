@@ -51,6 +51,19 @@ export function safeHttpUrl(value?: string): string {
   }
 }
 
+export function safeRadioStreamUrl(value?: string): string {
+  const candidate = value?.trim()
+  if (!candidate) return ''
+  try {
+    const url = new URL(candidate)
+    return url.hostname && ['http:', 'https:', 'rtsp:', 'mms:', 'mmsh:', 'mmst:'].includes(url.protocol)
+      ? candidate
+      : ''
+  } catch {
+    return ''
+  }
+}
+
 export function cx(...values: Array<string | false | null | undefined>): string {
   return values.filter(Boolean).join(' ')
 }

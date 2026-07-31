@@ -23,6 +23,30 @@ const PROXY_TOKEN_CONTEXT: &[u8] = b"mnest-internet-radio-proxy-v1\0";
 const PROXY_STREAM_PATH: &str = "/api/internet_radio_stream.mp3";
 const SHARED_STREAM_CHANNEL_CAPACITY: usize = 256;
 
+pub fn is_supported_stream_url(url: &reqwest::Url) -> bool {
+    url.host_str().is_some()
+        && matches!(
+            url.scheme(),
+            "http" | "https" | "rtsp" | "mms" | "mmsh" | "mmst"
+        )
+}
+
+pub fn normalized_ffmpeg_stream_url(url: &reqwest::Url) -> Option<reqwest::Url> {
+    if !is_supported_stream_url(url) {
+        return None;
+    }
+    let mut normalized = url.clone();
+    if normalized.scheme() == "mms" {
+        let transport = if matches!(normalized.port(), Some(80 | 443)) {
+            "mmsh"
+        } else {
+            "mmst"
+        };
+        normalized.set_scheme(transport).ok()?;
+    }
+    Some(normalized)
+}
+
 #[derive(Clone, Debug)]
 pub enum SharedStreamEvent {
     Audio(Bytes),
@@ -238,6 +262,9 @@ pub fn proxy_stream_url(base_url: &str, station_id: &str, secret: &str) -> Strin
 }
 
 pub fn is_proxy_stream_url(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
     let proxy_path = url.path().ends_with(PROXY_STREAM_PATH)
         || url.path().ends_with("/api/internet_radio_stream/");
     proxy_path && url.query_pairs().any(|(key, _)| key == "id")
@@ -312,10 +339,55 @@ mod tests {
         )
         .unwrap();
         let original = reqwest::Url::parse("https://radio.example/live.mp3?id=radio-1").unwrap();
+        let rtsp =
+            reqwest::Url::parse("rtsp://radio.example/api/internet_radio_stream.mp3?id=radio-1")
+                .unwrap();
 
         assert!(is_proxy_stream_url(&proxy));
         assert!(is_proxy_stream_url(&removed_proxy));
         assert!(!is_proxy_stream_url(&original));
+        assert!(!is_proxy_stream_url(&rtsp));
+    }
+
+    #[test]
+    fn validates_and_normalizes_supported_radio_stream_schemes() {
+        for value in [
+            "http://radio.example/live",
+            "https://radio.example/live",
+            "rtsp://radio.example/live",
+            "mmsh://radio.example/live",
+            "mmst://radio.example/live",
+        ] {
+            let url = reqwest::Url::parse(value).unwrap();
+            assert!(is_supported_stream_url(&url));
+            assert_eq!(normalized_ffmpeg_stream_url(&url).unwrap(), url);
+        }
+
+        let mms_default = reqwest::Url::parse("mms://radio.example/live").unwrap();
+        assert_eq!(
+            normalized_ffmpeg_stream_url(&mms_default).unwrap().as_str(),
+            "mmst://radio.example/live"
+        );
+        let mms_over_http = reqwest::Url::parse("mms://radio.example:80/live").unwrap();
+        assert_eq!(
+            normalized_ffmpeg_stream_url(&mms_over_http)
+                .unwrap()
+                .as_str(),
+            "mmsh://radio.example:80/live"
+        );
+        let mms_over_tcp = reqwest::Url::parse("mms://radio.example:1755/live").unwrap();
+        assert_eq!(
+            normalized_ffmpeg_stream_url(&mms_over_tcp)
+                .unwrap()
+                .as_str(),
+            "mmst://radio.example:1755/live"
+        );
+
+        for value in ["file:///tmp/radio", "javascript:alert(1)"] {
+            let url = reqwest::Url::parse(value).unwrap();
+            assert!(!is_supported_stream_url(&url));
+            assert!(normalized_ffmpeg_stream_url(&url).is_none());
+        }
     }
 
     #[tokio::test]

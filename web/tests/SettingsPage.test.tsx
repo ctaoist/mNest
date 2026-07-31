@@ -139,21 +139,21 @@ describe('SettingsPage permissions', () => {
     expect(mocks.notify).toHaveBeenCalledWith('曲库目录已更新，不会自动扫描', 'success')
   })
 
-  it('saves the OpenSubsonic proxy option for an internet radio', async () => {
+  it('saves an RTSP radio with the OpenSubsonic proxy option', async () => {
     mocks.role = 'admin'
     render(() => <SettingsPage />)
     await waitFor(() => expect(screen.getByRole('button', { name: '添加电台' })).toBeTruthy())
 
     await fireEvent.click(screen.getByRole('button', { name: '添加电台' }))
     await fireEvent.input(screen.getByLabelText('电台名称'), { target: { value: '代理电台' } })
-    await fireEvent.input(screen.getByLabelText('音频流地址'), { target: { value: 'https://radio.example/live' } })
+    await fireEvent.input(screen.getByLabelText('音频流地址'), { target: { value: 'rtsp://radio.example/live' } })
     await fireEvent.click(screen.getByLabelText('OpenSubsonic 服务端代理'))
     await fireEvent.click(screen.getByRole('button', { name: '保存电台' }))
 
     await waitFor(() => expect(mocks.subsonic).toHaveBeenCalledWith('createInternetRadioStation', {
       id: undefined,
       name: '代理电台',
-      streamUrl: 'https://radio.example/live',
+      streamUrl: 'rtsp://radio.example/live',
       homepageUrl: '',
       proxy: true,
     }))

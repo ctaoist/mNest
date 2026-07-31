@@ -32,7 +32,7 @@ import {
   writeStoredPageSize,
 } from '../lib/pagination'
 import { sortTracks, type TrackSortDirection, type TrackSortKey } from '../lib/trackSorting'
-import { formatDuration, safeHttpUrl } from '../lib/utils'
+import { formatDuration, safeHttpUrl, safeRadioStreamUrl } from '../lib/utils'
 import type { Album, Artist, Playlist, RadioStation, SearchResult, Track, TrackArtist } from '../types'
 
 type PlayerView = 'songs' | 'albums' | 'artists' | 'playlists' | 'radio'
@@ -644,7 +644,7 @@ function RadioGrid(props: { stations: RadioStation[] }) {
       <For each={props.stations} fallback={<div class="empty-state">系统设置中还没有配置网络电台</div>}>
         {(station) => {
           const active = () => player.current()?.id === `radio:${station.id}`
-          const streamUrl = () => safeHttpUrl(station.streamUrl)
+          const streamUrl = () => safeRadioStreamUrl(station.streamUrl)
           const homePageUrl = () => safeHttpUrl(station.homePageUrl)
           const proxyUrl = () => `/api/internet_radio_stream.mp3?${new URLSearchParams({ id: station.id }).toString()}`
           return (

@@ -57,6 +57,13 @@ struct IntValue {
     value: Option<i64>,
 }
 
+#[derive(FromQueryResult)]
+struct ArtistCoverRow {
+    artist_id: String,
+    track_id: String,
+    album_id: Option<String>,
+}
+
 const API_VERSION: &str = "1.16.1";
 const XML_NAMESPACE: &str = "http://subsonic.org/restapi";
 const MAX_COLLECTION_ITEMS: usize = 10_000;
@@ -557,32 +564,22 @@ async fn binary_endpoint(
         }
         "getCoverArt" => {
             let id = required_anyhow(p, "id")?;
-            let path = if let Some(track_id) = id.strip_prefix("tr-") {
-                track(state, track_id).await?.path
-            } else if let Some(album_id) = id.strip_prefix("al-") {
+            let image_id = id.strip_prefix("img-").context("invalid cover art id")?;
+            let path = if album_entity::Entity::find_by_id(image_id)
+                .one(&state.db)
+                .await?
+                .is_some()
+            {
                 track_entity::Entity::find()
-                    .filter(track_entity::Column::AlbumId.eq(album_id))
+                    .filter(track_entity::Column::AlbumId.eq(image_id))
                     .order_by_asc(track_entity::Column::DiscNumber)
                     .order_by_asc(track_entity::Column::TrackNumber)
                     .one(&state.db)
                     .await?
                     .context("album cover source not found")?
                     .path
-            } else if let Some(artist_id) = id.strip_prefix("ar-") {
-                let track_ids = track_artist_entity::Entity::find()
-                    .select_only()
-                    .column(track_artist_entity::Column::TrackId)
-                    .filter(track_artist_entity::Column::ArtistId.eq(artist_id))
-                    .order_by_asc(track_artist_entity::Column::Position)
-                    .into_query();
-                track_entity::Entity::find()
-                    .filter(track_entity::Column::Id.in_subquery(track_ids))
-                    .one(&state.db)
-                    .await?
-                    .context("artist cover source not found")?
-                    .path
             } else {
-                track(state, id).await?.path
+                track(state, image_id).await?.path
             };
             let tags = state.tags.clone();
             let artwork =
@@ -707,6 +704,47 @@ async fn library_artists(
         .await?)
 }
 
+async fn artist_cover_art_map(
+    state: &AppState,
+    artist_ids: &[String],
+    folder_id: Option<&str>,
+) -> Result<HashMap<String, String>, ApiFailure> {
+    let mut artist_ids = artist_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    artist_ids.sort_unstable();
+    artist_ids.dedup();
+    if artist_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    const SELECT: &str = "SELECT ta.artist_id,t.id AS track_id,t.album_id FROM track_artists ta JOIN tracks t ON t.id=ta.track_id";
+    const ORDER: &str = " ORDER BY ta.artist_id,CASE WHEN t.album_id IS NULL THEN 1 ELSE 0 END,ta.position,t.album_id,t.disc_number,t.track_number,t.title,t.id";
+    let mut covers = HashMap::new();
+    for chunk in artist_ids.chunks(500) {
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let folder_filter = folder_id
+            .map(|_| format!(" AND t.folder_id=${}", chunk.len() + 1))
+            .unwrap_or_default();
+        let mut query = db::raw(
+            &state.db,
+            format!("{SELECT} WHERE ta.artist_id IN ({placeholders}){folder_filter}{ORDER}"),
+        );
+        for artist_id in chunk {
+            query = query.bind(*artist_id);
+        }
+        if let Some(folder_id) = folder_id {
+            query = query.bind(folder_id);
+        }
+        for row in query.all::<ArtistCoverRow>().await? {
+            covers.entry(row.artist_id).or_insert_with(|| {
+                canonical_track_cover_art(&row.track_id, row.album_id.as_deref())
+            });
+        }
+    }
+    Ok(covers)
+}
+
 async fn library_last_modified(
     state: &AppState,
     folder_id: Option<&str>,
@@ -727,12 +765,18 @@ async fn library_last_modified(
 async fn artists(state: &AppState, p: &HashMap<String, String>) -> Result<Value, ApiFailure> {
     let folder_id = requested_music_folder(state, p).await?;
     let artists = library_artists(state, folder_id.as_deref()).await?;
+    let artist_ids = artists
+        .iter()
+        .map(|artist| artist.id.clone())
+        .collect::<Vec<_>>();
+    let cover_art = artist_cover_art_map(state, &artist_ids, folder_id.as_deref()).await?;
     let mut groups: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
     for artist in artists {
+        let artist_cover_art = cover_art.get(&artist.id).map(String::as_str);
         groups
             .entry(initial(&artist.name))
             .or_default()
-            .push(artist_json(&artist));
+            .push(artist_json(&artist, artist_cover_art));
     }
     Ok(
         json!({"artists":{"ignoredArticles":"","index":groups.into_iter().map(|(name,artist)|json!({"name":name,"artist":artist})).collect::<Vec<_>>()}}),
@@ -784,7 +828,8 @@ async fn get_artist(state: &AppState, id: &str) -> Result<Value, ApiFailure> {
         .order_by_asc(album_entity::Column::Name)
         .all(&state.db)
         .await?;
-    let mut data = artist_json(&artist);
+    let cover_art = artist_cover_art_map(state, std::slice::from_ref(&artist.id), None).await?;
+    let mut data = artist_json(&artist, cover_art.get(id).map(String::as_str));
     data["album"] = Value::Array(albums.iter().map(album_json).collect());
     Ok(json!({"artist":data}))
 }
@@ -816,8 +861,13 @@ async fn music_directory(state: &AppState, id: &str) -> Result<Value, ApiFailure
         let folder_id = folder.id.clone();
         let parent_id = folder_api_id(&folder.id).to_string();
         let artists = library_artists(state, Some(&folder_id)).await?;
+        let artist_ids = artists
+            .iter()
+            .map(|artist| artist.id.clone())
+            .collect::<Vec<_>>();
+        let cover_art = artist_cover_art_map(state, &artist_ids, Some(&folder_id)).await?;
         return Ok(
-            json!({"directory":{"id":parent_id,"name":folder.name,"child":artists.into_iter().map(|artist|json!({"id":artist.id,"parent":parent_id,"title":artist.name,"artist":artist.name,"isDir":true,"coverArt":format!("ar-{}",artist.id)})).collect::<Vec<_>>()}}),
+            json!({"directory":{"id":parent_id,"name":folder.name,"child":artists.iter().map(|artist|artist_child_json(artist,Some(&parent_id),cover_art.get(&artist.id).map(String::as_str))).collect::<Vec<_>>()}}),
         );
     }
     if let Some(artist) = artist_entity::Entity::find_by_id(id).one(&state.db).await? {
@@ -838,7 +888,7 @@ async fn music_directory(state: &AppState, id: &str) -> Result<Value, ApiFailure
             .all(&state.db)
             .await?;
         return Ok(
-            json!({"directory":{"id":artist.id,"name":artist.name,"child":albums.into_iter().map(|a|json!({"id":a.id,"parent":artist.id,"title":a.name,"album":a.name,"artist":a.artist_name,"isDir":true,"coverArt":format!("al-{}",a.id)})).collect::<Vec<_>>()}}),
+            json!({"directory":{"id":artist.id,"name":artist.name,"child":albums.into_iter().map(|a|json!({"id":a.id,"parent":artist.id,"title":a.name,"album":a.name,"artist":a.artist_name,"isDir":true,"coverArt":format!("img-{}",a.id)})).collect::<Vec<_>>()}}),
         );
     }
     let album = album(state, id).await?;
@@ -1100,6 +1150,16 @@ async fn starred(
         .order_by_desc(favorite_entity::Column::CreatedAt)
         .all(&state.db)
         .await?;
+    let starred_artist_ids = stars
+        .iter()
+        .filter(|star| star.item_type == "artist")
+        .map(|star| star.item_id.clone())
+        .collect::<Vec<_>>();
+    let artist_cover_art = if method.ends_with('2') {
+        artist_cover_art_map(state, &starred_artist_ids, folder_id.as_deref()).await?
+    } else {
+        HashMap::new()
+    };
     let mut songs = Vec::new();
     let mut albums = Vec::new();
     let mut artists = Vec::new();
@@ -1165,7 +1225,10 @@ async fn starred(
                         .await?
                 {
                     let mut value = if method.ends_with('2') {
-                        artist_json(&artist)
+                        artist_json(
+                            &artist,
+                            artist_cover_art.get(&artist.id).map(String::as_str),
+                        )
                     } else {
                         legacy_artist_json(&artist)
                     };
@@ -1211,8 +1274,13 @@ async fn legacy_search(state: &AppState, p: &HashMap<String, String>) -> Result<
             .order_by_asc(artist_entity::Column::Name)
             .all(&state.db)
             .await?;
-        matches.extend(artists.into_iter().map(|artist| {
-            json!({"id":artist.id,"isDir":true,"title":artist.name,"artist":artist.name,"coverArt":format!("ar-{}",artist.id)})
+        let artist_ids = artists
+            .iter()
+            .map(|artist| artist.id.clone())
+            .collect::<Vec<_>>();
+        let cover_art = artist_cover_art_map(state, &artist_ids, None).await?;
+        matches.extend(artists.iter().map(|artist| {
+            artist_child_json(artist, None, cover_art.get(&artist.id).map(String::as_str))
         }));
     }
     if let Some(query) = album_query {
@@ -1319,7 +1387,15 @@ async fn search(
         albums.iter().map(album_child_json).collect::<Vec<_>>()
     };
     let artists = if method == "search3" {
-        artists.iter().map(artist_json).collect::<Vec<_>>()
+        let artist_ids = artists
+            .iter()
+            .map(|artist| artist.id.clone())
+            .collect::<Vec<_>>();
+        let cover_art = artist_cover_art_map(state, &artist_ids, folder_id.as_deref()).await?;
+        artists
+            .iter()
+            .map(|artist| artist_json(artist, cover_art.get(&artist.id).map(String::as_str)))
+            .collect::<Vec<_>>()
     } else {
         artists.iter().map(legacy_artist_json).collect::<Vec<_>>()
     };
@@ -1931,9 +2007,12 @@ async fn radio_stations(
         .await?;
     let proxied = internet_radio::proxy_enabled_ids(&state.db).await?;
     let proxy_base_url = p.get("_mnest_base_url");
+    let pulse_client = p
+        .get("c")
+        .is_some_and(|client| client.trim().eq_ignore_ascii_case("Pulse"));
     Ok(
         json!({"internetRadioStations":{"internetRadioStation":rows.iter().map(|v| {
-            let stream_url = if proxied.contains(&v.id) {
+            let stream_url = if !pulse_client && proxied.contains(&v.id) {
                 proxy_base_url
                     .map(|base_url| internet_radio::proxy_stream_url(base_url, &v.id, &state.settings.auth.jwt_secret))
                     .unwrap_or_else(|| v.stream_url.clone())
@@ -2019,10 +2098,19 @@ fn validate_radio_url(value: &str, parameter: &str) -> Result<String, ApiFailure
     }
     let url = Url::parse(value)
         .map_err(|_| ApiFailure::new(10, format!("Invalid internet radio {parameter}")))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    let valid_url = if parameter == "streamUrl" {
+        internet_radio::is_supported_stream_url(&url)
+    } else {
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+    };
+    if !valid_url {
         return Err(ApiFailure::new(
             10,
-            format!("Internet radio {parameter} must use HTTP or HTTPS"),
+            if parameter == "streamUrl" {
+                "Internet radio streamUrl must use HTTP, HTTPS, RTSP, MMS, MMSH or MMST".into()
+            } else {
+                format!("Internet radio {parameter} must use HTTP or HTTPS")
+            },
         ));
     }
     if parameter == "streamUrl" && internet_radio::is_proxy_stream_url(&url) {
@@ -2538,14 +2626,29 @@ fn track_select(tail: &str) -> String {
         "SELECT id,folder_id,path,relative_path,title,artist_id,artist_name,artists_json,album_id,album_name,album_artist,genre,year,track_number,disc_number,duration,bit_rate,size,suffix,mimetype,lyrics,comment,cover_path,mtime,fingerprint,play_count,needs_scrape,created_at,updated_at FROM tracks {tail}"
     )
 }
-fn artist_json(a: &Artist) -> Value {
-    json!({"id":a.id,"name":a.name,"albumCount":a.album_count,"coverArt":format!("ar-{}",a.id),"sortName":a.sort_name})
+fn artist_json(a: &Artist, cover_art: Option<&str>) -> Value {
+    let mut value =
+        json!({"id":a.id,"name":a.name,"albumCount":a.album_count,"sortName":a.sort_name});
+    if let Some(cover_art) = cover_art {
+        value["coverArt"] = json!(cover_art);
+    }
+    value
 }
 fn legacy_artist_json(a: &Artist) -> Value {
     json!({"id":a.id,"name":a.name})
 }
+fn artist_child_json(a: &Artist, parent: Option<&str>, cover_art: Option<&str>) -> Value {
+    let mut value = json!({"id":a.id,"isDir":true,"title":a.name,"artist":a.name});
+    if let Some(parent) = parent {
+        value["parent"] = json!(parent);
+    }
+    if let Some(cover_art) = cover_art {
+        value["coverArt"] = json!(cover_art);
+    }
+    value
+}
 fn album_json(a: &Album) -> Value {
-    let mut value = json!({"id":a.id,"name":a.name,"artist":a.artist_name,"artistId":a.artist_id,"displayArtist":a.artist_name,"coverArt":format!("al-{}",a.id),"songCount":a.song_count,"duration":a.duration as i64,"year":a.year,"genre":a.genre,"created":a.created_at});
+    let mut value = json!({"id":a.id,"name":a.name,"artist":a.artist_name,"artistId":a.artist_id,"displayArtist":a.artist_name,"coverArt":format!("img-{}",a.id),"songCount":a.song_count,"duration":a.duration as i64,"year":a.year,"genre":a.genre,"created":a.created_at});
     let artist_names = parse_artist_names(&a.artist_name);
     // The album table stores only one artist ID, so do not attach that ID to a combined name.
     if artist_names.len() == 1 {
@@ -2554,14 +2657,10 @@ fn album_json(a: &Album) -> Value {
     value
 }
 fn album_child_json(album: &Album) -> Value {
-    json!({"id":album.id,"parent":album.artist_id,"isDir":true,"title":album.name,"album":album.name,"artist":album.artist_name,"artistId":album.artist_id,"albumId":album.id,"coverArt":format!("al-{}",album.id),"duration":album.duration as i64,"year":album.year,"genre":album.genre,"created":album.created_at,"type":"music"})
+    json!({"id":album.id,"parent":album.artist_id,"isDir":true,"title":album.name,"album":album.name,"artist":album.artist_name,"artistId":album.artist_id,"albumId":album.id,"coverArt":format!("img-{}",album.id),"duration":album.duration as i64,"year":album.year,"genre":album.genre,"created":album.created_at,"type":"music"})
 }
 fn track_json(t: &Track, starred: Option<String>) -> Value {
-    let cover_art = t
-        .album_id
-        .as_ref()
-        .map(|album_id| format!("al-{album_id}"))
-        .unwrap_or_else(|| format!("tr-{}", t.id));
+    let cover_art = canonical_track_cover_art(&t.id, t.album_id.as_deref());
     let artists = serde_json::from_str::<Vec<ArtistCredit>>(&t.artists_json).unwrap_or_default();
     let artist = artists
         .iter()
@@ -2584,6 +2683,9 @@ fn track_json(t: &Track, starred: Option<String>) -> Value {
         v["starred"] = Value::String(value);
     }
     v
+}
+fn canonical_track_cover_art(track_id: &str, album_id: Option<&str>) -> String {
+    format!("img-{}", album_id.unwrap_or(track_id))
 }
 async fn playlist_json(
     state: &AppState,
@@ -3075,6 +3177,22 @@ mod tests {
             )
         );
 
+        for stream_url in [
+            "rtsp://radio.example/live",
+            "mms://radio.example/live",
+            "mmsh://radio.example/live",
+            "mmst://radio.example:1755/live",
+        ] {
+            let fields = HashMap::from([
+                ("name".into(), "Legacy Radio".into()),
+                ("streamUrl".into(), stream_url.into()),
+            ]);
+            assert_eq!(
+                validated_radio_fields(&fields).unwrap().1,
+                stream_url.to_owned()
+            );
+        }
+
         for invalid in [
             HashMap::from([
                 ("name".into(), "Radio".into()),
@@ -3147,6 +3265,22 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(direct_stream_url, "https://direct.example/live");
+
+        let pulse_list_params = HashMap::from([
+            ("_mnest_base_url".into(), "https://music.example".into()),
+            ("c".into(), "Pulse".into()),
+        ]);
+        let pulse_stations = radio_stations(&state, &pulse_list_params).await.unwrap();
+        let pulse_stations = pulse_stations["internetRadioStations"]["internetRadioStation"]
+            .as_array()
+            .unwrap();
+        let pulse_stream_url = pulse_stations
+            .iter()
+            .find(|station| station["name"] == "Radio One")
+            .unwrap()["streamUrl"]
+            .as_str()
+            .unwrap();
+        assert_eq!(pulse_stream_url, "https://radio.example/live");
 
         let update = HashMap::from([
             ("id".into(), created.id.clone()),
@@ -3328,9 +3462,10 @@ mod tests {
             album_count: 2,
             song_count: 3,
         };
-        let artist = artist_json(&artist);
+        let artist = artist_json(&artist, Some("img-album-1"));
         assert!(artist.get("songCount").is_none());
         assert_eq!(artist["sortName"], "artist");
+        assert_eq!(artist["coverArt"], "img-album-1");
         let legacy_artist = legacy_artist_json(&Artist {
             id: "artist-1".into(),
             name: "Artist".into(),
@@ -3359,6 +3494,12 @@ mod tests {
 
         album.artist_name = "Artist A".into();
         assert_eq!(album_json(&album)["artists"][0]["name"], "Artist A");
+        assert_eq!(album_json(&album)["coverArt"], "img-album-1");
+        assert_eq!(canonical_track_cover_art("track-1", None), "img-track-1");
+        assert_eq!(
+            canonical_track_cover_art("track-1", Some("album-1")),
+            "img-album-1"
+        );
     }
 
     #[test]
@@ -3421,6 +3562,81 @@ mod tests {
             .unwrap();
         let user = get_user(&state, &user, &user.username).await.unwrap();
         assert_eq!(user["user"]["folder"][0], folder_api_id("folder-1"));
+    }
+
+    #[tokio::test]
+    async fn artist_covers_reuse_the_representative_album_image_id() {
+        let state = test_state().await;
+        music_folder_entity::ActiveModel {
+            id: Set("folder-1".into()),
+            name: Set("Music".into()),
+            path: Set("/music".into()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        for (id, name) in [("artist-1", "Artist A"), ("artist-2", "Artist B")] {
+            artist_entity::ActiveModel {
+                id: Set(id.into()),
+                name: Set(name.into()),
+                sort_name: Set(name.to_lowercase()),
+                cover_path: Set(None),
+                album_count: Set(1),
+                song_count: Set(1),
+            }
+            .insert(&state.db)
+            .await
+            .unwrap();
+        }
+        album_entity::ActiveModel {
+            id: Set("album-1".into()),
+            name: Set("Album".into()),
+            artist_id: Set("artist-1".into()),
+            artist_name: Set("Artist A; Artist B".into()),
+            year: Set(2026),
+            genre: Set(String::new()),
+            cover_path: Set(None),
+            song_count: Set(1),
+            duration: Set(180.0),
+            created_at: Set("2026-01-01T00:00:00Z".into()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let mut track = test_track();
+        track.album_id = Some("album-1".into());
+        track.into_active_model().insert(&state.db).await.unwrap();
+        for (id, position) in [("artist-1", 0), ("artist-2", 1)] {
+            track_artist_entity::ActiveModel {
+                track_id: Set("track-1".into()),
+                artist_id: Set(id.into()),
+                position: Set(position),
+            }
+            .insert(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let covers = artist_cover_art_map(&state, &["artist-1".into(), "artist-2".into()], None)
+            .await
+            .unwrap();
+        assert_eq!(covers["artist-1"], "img-album-1");
+        assert_eq!(covers["artist-2"], "img-album-1");
+
+        let response = artists(&state, &HashMap::new()).await.unwrap();
+        let returned = response["artists"]["index"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|index| index["artist"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(returned.len(), 2);
+        assert!(
+            returned
+                .iter()
+                .all(|artist| artist["coverArt"] == "img-album-1")
+        );
     }
 
     #[test]

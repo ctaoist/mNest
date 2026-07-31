@@ -1214,15 +1214,18 @@ async fn internet_radio_stream(
     }
     let url = reqwest::Url::parse(station.stream_url.trim())
         .map_err(|_| ApiError::bad_request("网络电台流地址无效"))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(ApiError::bad_request(
-            "网络电台流地址必须使用 HTTP 或 HTTPS",
-        ));
-    }
+    let ffmpeg_url = internet_radio::normalized_ffmpeg_stream_url(&url).ok_or_else(|| {
+        ApiError::bad_request("网络电台流地址必须使用 HTTP、HTTPS、RTSP、MMS、MMSH 或 MMST")
+    })?;
     if internet_radio::is_proxy_stream_url(&url) {
         return Err(ApiError::bad_request(
             "网络电台原始地址不能使用 mNest 代理地址",
         ));
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        let input = RadioTranscodeInput::from_url(&ffmpeg_url)
+            .ok_or_else(|| ApiError::bad_request("网络电台流协议不受支持"))?;
+        return transcode_radio(&state, &station.id, &ffmpeg_url, input, None).await;
     }
     let client = reqwest::Client::builder()
         .connect_timeout(RADIO_UPSTREAM_PROBE_TIMEOUT)
@@ -1318,35 +1321,53 @@ fn is_hls_radio_stream(url: &reqwest::Url, content_type: Option<&str>) -> bool {
     )
 }
 
-const HLS_RADIO_MAX_RESTARTS: u8 = 3;
-const HLS_RADIO_STABLE_RUNTIME: Duration = Duration::from_secs(10);
-const HLS_RADIO_STABLE_BYTES: u64 = 128 * 1024;
-const HLS_RADIO_OUTPUT_BUFFER_BYTES: usize = 1024;
-const HLS_RADIO_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(8);
+const RADIO_TRANSCODE_MAX_RESTARTS: u8 = 3;
+const RADIO_TRANSCODE_STABLE_RUNTIME: Duration = Duration::from_secs(10);
+const RADIO_TRANSCODE_STABLE_BYTES: u64 = 128 * 1024;
+const RADIO_TRANSCODE_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(8);
 const HLS_RADIO_REFRESH_MIN_LEAD: Duration = Duration::from_secs(5);
 const HLS_RADIO_REFRESH_MAX_LEAD: Duration = Duration::from_secs(60);
 const HLS_RADIO_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(2);
 const HLS_RADIO_MAX_EXPIRY_AHEAD: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const RADIO_UPSTREAM_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct HlsRadioProcess {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RadioTranscodeInput {
+    Hls,
+    Rtsp,
+    Mmsh,
+    Mmst,
+}
+
+impl RadioTranscodeInput {
+    fn from_url(url: &reqwest::Url) -> Option<Self> {
+        match url.scheme() {
+            "rtsp" => Some(Self::Rtsp),
+            "mmsh" => Some(Self::Mmsh),
+            "mmst" => Some(Self::Mmst),
+            _ => None,
+        }
+    }
+}
+
+struct RadioProcess {
     stdout: ReaderStream<tokio::process::ChildStdout>,
     child: Child,
     started_at: Instant,
     output_bytes: u64,
 }
 
-struct HlsRadioReplacement {
+struct RadioReplacement {
     first_chunk: axum::body::Bytes,
-    process: HlsRadioProcess,
+    process: RadioProcess,
 }
 
-enum HlsRadioProducerEvent {
+enum RadioProducerEvent {
     Shutdown,
     Cancelled,
     Output(Option<io::Result<axum::body::Bytes>>),
     Refresh,
-    Replacement(Box<io::Result<HlsRadioReplacement>>),
+    Replacement(Box<io::Result<RadioReplacement>>),
 }
 
 fn hls_radio_refresh_interval(
@@ -1404,30 +1425,64 @@ fn parse_unix_timestamp(value: &str, radix: u32) -> Option<u64> {
     })
 }
 
-fn spawn_hls_radio_process(ffmpeg: &Path, source_url: &str) -> io::Result<HlsRadioProcess> {
-    let mut command = Command::new(ffmpeg);
-    command.kill_on_drop(true);
-    command
-        .args([
-            "-nostdin",
-            "-v",
-            "error",
-            "-reconnect",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "5",
-            "-rw_timeout",
-            "30000000",
-            "-user_agent",
-            "mNest/internet-radio",
-            "-f",
-            "hls",
-            "-live_start_index",
-            "-1",
-            "-i",
-            source_url,
+fn radio_ffmpeg_arguments(source_url: &str, input: RadioTranscodeInput) -> Vec<String> {
+    let mut arguments = vec!["-nostdin".into(), "-v".into(), "error".into()];
+    match input {
+        RadioTranscodeInput::Hls => arguments.extend(
+            [
+                "-reconnect",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                "5",
+                "-rw_timeout",
+                "30000000",
+                "-user_agent",
+                "mNest/internet-radio",
+                "-re",
+                "-f",
+                "hls",
+                "-live_start_index",
+                "-1",
+                "-i",
+                source_url,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        ),
+        RadioTranscodeInput::Rtsp => arguments.extend(
+            [
+                "-rw_timeout",
+                "30000000",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                source_url,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        ),
+        RadioTranscodeInput::Mmsh => arguments.extend(
+            [
+                "-rw_timeout",
+                "30000000",
+                "-user_agent",
+                "mNest/internet-radio",
+                "-i",
+                source_url,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        ),
+        RadioTranscodeInput::Mmst => arguments.extend(
+            ["-rw_timeout", "30000000", "-i", source_url]
+                .into_iter()
+                .map(str::to_owned),
+        ),
+    }
+    arguments.extend(
+        [
             "-map",
             "0:a:0",
             "-vn",
@@ -1442,7 +1497,22 @@ fn spawn_hls_radio_process(ffmpeg: &Path, source_url: &str) -> io::Result<HlsRad
             "-write_xing",
             "0",
             "pipe:1",
-        ])
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    arguments
+}
+
+fn spawn_radio_process(
+    ffmpeg: &Path,
+    source_url: &str,
+    input: RadioTranscodeInput,
+) -> io::Result<RadioProcess> {
+    let mut command = Command::new(ffmpeg);
+    command.kill_on_drop(true);
+    command
+        .args(radio_ffmpeg_arguments(source_url, input))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let mut child = command.spawn()?;
@@ -1450,27 +1520,27 @@ fn spawn_hls_radio_process(ffmpeg: &Path, source_url: &str) -> io::Result<HlsRad
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("ffmpeg stdout unavailable"))?;
-    Ok(HlsRadioProcess {
-        stdout: ReaderStream::with_capacity(stdout, HLS_RADIO_OUTPUT_BUFFER_BYTES),
+    Ok(RadioProcess {
+        stdout: ReaderStream::new(stdout),
         child,
         started_at: Instant::now(),
         output_bytes: 0,
     })
 }
 
-fn hls_radio_restart_delay(
+fn radio_transcode_restart_delay(
     restart_attempts: &mut u8,
     runtime: Duration,
     output_bytes: u64,
     error: &io::Error,
 ) -> io::Result<Duration> {
-    if runtime >= HLS_RADIO_STABLE_RUNTIME && output_bytes >= HLS_RADIO_STABLE_BYTES {
+    if runtime >= RADIO_TRANSCODE_STABLE_RUNTIME && output_bytes >= RADIO_TRANSCODE_STABLE_BYTES {
         *restart_attempts = 0;
     }
     *restart_attempts = restart_attempts.saturating_add(1);
-    if *restart_attempts > HLS_RADIO_MAX_RESTARTS {
+    if *restart_attempts > RADIO_TRANSCODE_MAX_RESTARTS {
         return Err(io::Error::other(format!(
-            "network radio transcoder stopped after {HLS_RADIO_MAX_RESTARTS} restart attempts: {error}"
+            "network radio transcoder stopped after {RADIO_TRANSCODE_MAX_RESTARTS} restart attempts: {error}"
         )));
     }
     let delay = Duration::from_millis(250 * (1_u64 << (*restart_attempts - 1)));
@@ -1483,7 +1553,7 @@ fn hls_radio_restart_delay(
     Ok(delay)
 }
 
-async fn wait_for_hls_radio_restart(
+async fn wait_for_radio_transcode_restart(
     shutdown: &CancellationToken,
     cancellation: &CancellationToken,
     delay: Duration,
@@ -1495,17 +1565,18 @@ async fn wait_for_hls_radio_restart(
     }
 }
 
-async fn prepare_hls_radio_replacement(
+async fn prepare_radio_replacement(
     ffmpeg: PathBuf,
     source_url: String,
+    input: RadioTranscodeInput,
     shutdown: CancellationToken,
     cancellation: CancellationToken,
-) -> io::Result<HlsRadioReplacement> {
-    let mut process = spawn_hls_radio_process(&ffmpeg, &source_url)?;
+) -> io::Result<RadioReplacement> {
+    let mut process = spawn_radio_process(&ffmpeg, &source_url, input)?;
     let first_chunk = tokio::select! {
         _ = shutdown.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "server is shutting down")),
         _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "internet radio stream was cancelled")),
-        result = tokio::time::timeout(HLS_RADIO_FIRST_CHUNK_TIMEOUT, process.stdout.next()) => {
+        result = tokio::time::timeout(RADIO_TRANSCODE_FIRST_CHUNK_TIMEOUT, process.stdout.next()) => {
             match result {
                 Ok(Some(Ok(chunk))) => Ok(chunk),
                 Ok(Some(Err(error))) => Err(error),
@@ -1519,7 +1590,7 @@ async fn prepare_hls_radio_replacement(
             process.output_bytes = process
                 .output_bytes
                 .saturating_add(first_chunk.len() as u64);
-            Ok(HlsRadioReplacement {
+            Ok(RadioReplacement {
                 first_chunk,
                 process,
             })
@@ -1540,8 +1611,8 @@ async fn wait_for_hls_radio_refresh(refresh: &mut Option<std::pin::Pin<Box<tokio
 }
 
 async fn wait_for_hls_radio_replacement(
-    replacement: &mut Option<tokio::task::JoinHandle<io::Result<HlsRadioReplacement>>>,
-) -> io::Result<HlsRadioReplacement> {
+    replacement: &mut Option<tokio::task::JoinHandle<io::Result<RadioReplacement>>>,
+) -> io::Result<RadioReplacement> {
     match replacement {
         Some(replacement) => replacement.await.map_err(io::Error::other)?,
         None => std::future::pending().await,
@@ -1549,7 +1620,7 @@ async fn wait_for_hls_radio_replacement(
 }
 
 async fn stop_hls_radio_replacement(
-    replacement: &mut Option<tokio::task::JoinHandle<io::Result<HlsRadioReplacement>>>,
+    replacement: &mut Option<tokio::task::JoinHandle<io::Result<RadioReplacement>>>,
 ) {
     if let Some(replacement) = replacement.take() {
         replacement.abort();
@@ -1557,9 +1628,10 @@ async fn stop_hls_radio_replacement(
     }
 }
 
-async fn run_shared_hls_radio_producer(
+async fn run_shared_radio_producer(
     ffmpeg: PathBuf,
     source_url: String,
+    input: RadioTranscodeInput,
     refresh_interval: Option<Duration>,
     shutdown: CancellationToken,
     producer: &internet_radio::SharedStreamProducer,
@@ -1570,12 +1642,16 @@ async fn run_shared_hls_radio_producer(
         if shutdown.is_cancelled() || cancellation.is_cancelled() {
             return Ok(());
         }
-        let mut process = match spawn_hls_radio_process(&ffmpeg, &source_url) {
+        let mut process = match spawn_radio_process(&ffmpeg, &source_url, input) {
             Ok(process) => process,
             Err(error) => {
-                let delay =
-                    hls_radio_restart_delay(&mut restart_attempts, Duration::ZERO, 0, &error)?;
-                if !wait_for_hls_radio_restart(&shutdown, &cancellation, delay).await {
+                let delay = radio_transcode_restart_delay(
+                    &mut restart_attempts,
+                    Duration::ZERO,
+                    0,
+                    &error,
+                )?;
+                if !wait_for_radio_transcode_restart(&shutdown, &cancellation, delay).await {
                     return Ok(());
                 }
                 continue;
@@ -1586,31 +1662,31 @@ async fn run_shared_hls_radio_producer(
 
         loop {
             let event = tokio::select! {
-                _ = shutdown.cancelled() => HlsRadioProducerEvent::Shutdown,
-                _ = cancellation.cancelled() => HlsRadioProducerEvent::Cancelled,
-                next = process.stdout.next() => HlsRadioProducerEvent::Output(next),
-                _ = wait_for_hls_radio_refresh(&mut refresh) => HlsRadioProducerEvent::Refresh,
-                result = wait_for_hls_radio_replacement(&mut replacement) => HlsRadioProducerEvent::Replacement(Box::new(result)),
+                _ = shutdown.cancelled() => RadioProducerEvent::Shutdown,
+                _ = cancellation.cancelled() => RadioProducerEvent::Cancelled,
+                next = process.stdout.next() => RadioProducerEvent::Output(next),
+                _ = wait_for_hls_radio_refresh(&mut refresh) => RadioProducerEvent::Refresh,
+                result = wait_for_hls_radio_replacement(&mut replacement) => RadioProducerEvent::Replacement(Box::new(result)),
             };
             match event {
-                HlsRadioProducerEvent::Shutdown | HlsRadioProducerEvent::Cancelled => {
+                RadioProducerEvent::Shutdown | RadioProducerEvent::Cancelled => {
                     stop_hls_radio_replacement(&mut replacement).await;
                     let _ = process.child.kill().await;
                     let _ = process.child.wait().await;
                     return Ok(());
                 }
-                HlsRadioProducerEvent::Refresh => {
+                RadioProducerEvent::Refresh => {
                     refresh = None;
                     let ffmpeg = ffmpeg.clone();
                     let source_url = source_url.clone();
                     let shutdown = shutdown.clone();
                     let cancellation = cancellation.clone();
                     replacement = Some(tokio::spawn(async move {
-                        prepare_hls_radio_replacement(ffmpeg, source_url, shutdown, cancellation)
+                        prepare_radio_replacement(ffmpeg, source_url, input, shutdown, cancellation)
                             .await
                     }));
                 }
-                HlsRadioProducerEvent::Replacement(result) => {
+                RadioProducerEvent::Replacement(result) => {
                     replacement = None;
                     match *result {
                         Ok(mut next) => {
@@ -1644,7 +1720,7 @@ async fn run_shared_hls_radio_producer(
                         }
                     }
                 }
-                HlsRadioProducerEvent::Output(Some(Ok(chunk))) => {
+                RadioProducerEvent::Output(Some(Ok(chunk))) => {
                     process.output_bytes = process.output_bytes.saturating_add(chunk.len() as u64);
                     if !producer.send_audio(chunk) {
                         stop_hls_radio_replacement(&mut replacement).await;
@@ -1653,24 +1729,24 @@ async fn run_shared_hls_radio_producer(
                         return Ok(());
                     }
                 }
-                HlsRadioProducerEvent::Output(Some(Err(error))) => {
+                RadioProducerEvent::Output(Some(Err(error))) => {
                     stop_hls_radio_replacement(&mut replacement).await;
                     let runtime = process.started_at.elapsed();
                     let output_bytes = process.output_bytes;
                     let _ = process.child.kill().await;
                     let _ = process.child.wait().await;
-                    let delay = hls_radio_restart_delay(
+                    let delay = radio_transcode_restart_delay(
                         &mut restart_attempts,
                         runtime,
                         output_bytes,
                         &error,
                     )?;
-                    if !wait_for_hls_radio_restart(&shutdown, &cancellation, delay).await {
+                    if !wait_for_radio_transcode_restart(&shutdown, &cancellation, delay).await {
                         return Ok(());
                     }
                     break;
                 }
-                HlsRadioProducerEvent::Output(None) => {
+                RadioProducerEvent::Output(None) => {
                     stop_hls_radio_replacement(&mut replacement).await;
                     let runtime = process.started_at.elapsed();
                     let output_bytes = process.output_bytes;
@@ -1680,13 +1756,13 @@ async fn run_shared_hls_radio_producer(
                     } else {
                         format!("ffmpeg exited with status {status}")
                     });
-                    let delay = hls_radio_restart_delay(
+                    let delay = radio_transcode_restart_delay(
                         &mut restart_attempts,
                         runtime,
                         output_bytes,
                         &error,
                     )?;
-                    if !wait_for_hls_radio_restart(&shutdown, &cancellation, delay).await {
+                    if !wait_for_radio_transcode_restart(&shutdown, &cancellation, delay).await {
                         return Ok(());
                     }
                     break;
@@ -1696,7 +1772,7 @@ async fn run_shared_hls_radio_producer(
     }
 }
 
-async fn receive_shared_hls_chunk(
+async fn receive_shared_radio_chunk(
     subscription: &mut internet_radio::SharedStreamSubscription,
 ) -> io::Result<Option<axum::body::Bytes>> {
     loop {
@@ -1717,10 +1793,11 @@ async fn receive_shared_hls_chunk(
     }
 }
 
-async fn transcode_hls_radio(
+async fn transcode_radio(
     state: &AppState,
     station_id: &str,
     source_url: &reqwest::Url,
+    input: RadioTranscodeInput,
     refresh_interval: Option<Duration>,
 ) -> Result<Response, ApiError> {
     let (mut subscription, producer) = state
@@ -1732,9 +1809,10 @@ async fn transcode_hls_radio(
         let source_url = source_url.as_str().to_owned();
         let shutdown = state.shutdown.clone();
         tokio::spawn(async move {
-            let error = run_shared_hls_radio_producer(
+            let error = run_shared_radio_producer(
                 ffmpeg,
                 source_url,
+                input,
                 refresh_interval,
                 shutdown,
                 &producer,
@@ -1746,24 +1824,24 @@ async fn transcode_hls_radio(
         });
     }
     let first_chunk = match tokio::time::timeout(
-        HLS_RADIO_FIRST_CHUNK_TIMEOUT,
-        receive_shared_hls_chunk(&mut subscription),
+        RADIO_TRANSCODE_FIRST_CHUNK_TIMEOUT,
+        receive_shared_radio_chunk(&mut subscription),
     )
     .await
     {
         Ok(Ok(Some(chunk))) => chunk,
         Ok(Ok(None)) => {
-            return Err(ApiError::bad_gateway("网络电台 HLS 转码没有输出音频"));
+            return Err(ApiError::bad_gateway("网络电台转码没有输出音频"));
         }
         Ok(Err(error)) => {
             return Err(ApiError::bad_gateway(format!(
-                "网络电台 HLS 转码未能启动：{error}"
+                "网络电台转码未能启动：{error}"
             )));
         }
-        Err(_) => return Err(ApiError::bad_gateway("网络电台 HLS 转码首帧超时")),
+        Err(_) => return Err(ApiError::bad_gateway("网络电台转码首帧超时")),
     };
     let stream = futures::stream::try_unfold(subscription, |mut subscription| async move {
-        receive_shared_hls_chunk(&mut subscription)
+        receive_shared_radio_chunk(&mut subscription)
             .await
             .map(|chunk| chunk.map(|chunk| (chunk, subscription)))
     });
@@ -1777,6 +1855,22 @@ async fn transcode_hls_radio(
         HeaderValue::from_static("private, no-store"),
     );
     Ok(response)
+}
+
+async fn transcode_hls_radio(
+    state: &AppState,
+    station_id: &str,
+    source_url: &reqwest::Url,
+    refresh_interval: Option<Duration>,
+) -> Result<Response, ApiError> {
+    transcode_radio(
+        state,
+        station_id,
+        source_url,
+        RadioTranscodeInput::Hls,
+        refresh_interval,
+    )
+    .await
 }
 
 async fn remote_download_import(
@@ -2945,6 +3039,44 @@ mod tests {
     }
 
     #[test]
+    fn configures_ffmpeg_for_each_radio_input_protocol() {
+        let hls =
+            radio_ffmpeg_arguments("https://radio.example/live.m3u8", RadioTranscodeInput::Hls);
+        let hls_input = hls.iter().position(|value| value == "-i").unwrap();
+        assert!(
+            hls[..hls_input]
+                .windows(2)
+                .any(|values| values == ["-f", "hls"])
+        );
+        assert!(hls[..hls_input].iter().any(|value| value == "-re"));
+
+        let rtsp = radio_ffmpeg_arguments("rtsp://radio.example/live", RadioTranscodeInput::Rtsp);
+        let rtsp_input = rtsp.iter().position(|value| value == "-i").unwrap();
+        assert!(
+            rtsp[..rtsp_input]
+                .windows(2)
+                .any(|values| values == ["-rtsp_transport", "tcp"])
+        );
+        assert!(!rtsp[..rtsp_input].iter().any(|value| value == "-re"));
+        assert!(!rtsp.windows(2).any(|values| values == ["-f", "hls"]));
+
+        let mmsh = radio_ffmpeg_arguments("mmsh://radio.example/live", RadioTranscodeInput::Mmsh);
+        assert!(
+            mmsh.iter()
+                .any(|value| value == "mmsh://radio.example/live")
+        );
+        assert!(mmsh.iter().any(|value| value == "mNest/internet-radio"));
+
+        let mmst =
+            radio_ffmpeg_arguments("mmst://radio.example:1755/live", RadioTranscodeInput::Mmst);
+        assert!(
+            mmst.iter()
+                .any(|value| value == "mmst://radio.example:1755/live")
+        );
+        assert!(!mmst.iter().any(|value| value == "-user_agent"));
+    }
+
+    #[test]
     fn schedules_refresh_only_for_redirected_urls_with_explicit_expiry() {
         let source = reqwest::Url::parse("https://radio.example/live").unwrap();
         let expires = SystemTime::now()
@@ -3593,6 +3725,79 @@ exec sleep 30
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn transcodes_rtsp_radio_without_an_http_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_ffmpeg = temp.path().join("ffmpeg");
+        let arguments = temp.path().join("arguments");
+        std::fs::write(
+            &fake_ffmpeg,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'RTSP-RADIO'\nexec sleep 30\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_ffmpeg).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_ffmpeg, permissions).unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.tools.ffmpeg = fake_ffmpeg;
+        let state = test_state_with_settings(settings).await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let (token, _) = crate::auth::issue_tokens(
+            &admin,
+            &state.settings.auth.jwt_secret,
+            state.settings.auth.access_token_minutes,
+            state.settings.auth.refresh_token_days,
+        )
+        .unwrap();
+        internet_radio_station::ActiveModel {
+            id: Set("radio-rtsp".into()),
+            name: Set("RTSP radio".into()),
+            stream_url: Set("rtsp://radio.example/live".into()),
+            home_page_url: Set(String::new()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+
+        let response = router()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/internet_radio_stream.mp3?id=radio-rtsp")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            b"RTSP-RADIO".as_slice()
+        );
+        drop(body);
+
+        let arguments = std::fs::read_to_string(arguments).unwrap();
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|values| values == ["-rtsp_transport", "tcp"])
+        );
+        assert!(arguments.contains(&"rtsp://radio.example/live"));
+        assert!(!arguments.windows(2).any(|values| values == ["-f", "hls"]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn falls_back_to_forced_hls_when_the_http_probe_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3673,6 +3878,15 @@ exec sleep 30
         let arguments = std::fs::read_to_string(arguments).unwrap();
         let arguments = arguments.lines().collect::<Vec<_>>();
         assert!(arguments.windows(2).any(|values| values == ["-f", "hls"]));
+        let read_at_realtime_rate = arguments
+            .iter()
+            .position(|value| *value == "-re")
+            .expect("ffmpeg should pace the HLS input at its native rate");
+        let input = arguments
+            .iter()
+            .position(|value| *value == "-i")
+            .expect("ffmpeg input argument should be present");
+        assert!(read_at_realtime_rate < input);
         assert!(
             arguments
                 .iter()
@@ -3824,6 +4038,15 @@ exec sleep 30
         );
         let arguments = arguments.lines().collect::<Vec<_>>();
         assert!(arguments.windows(2).any(|values| values == ["-f", "hls"]));
+        let read_at_realtime_rate = arguments
+            .iter()
+            .position(|value| *value == "-re")
+            .expect("ffmpeg should pace the HLS input at its native rate");
+        let input = arguments
+            .iter()
+            .position(|value| *value == "-i")
+            .expect("ffmpeg input argument should be present");
+        assert!(read_at_realtime_rate < input);
         assert!(arguments.contains(&"-reconnect"));
         assert!(!arguments.contains(&"-reconnect_at_eof"));
         assert!(

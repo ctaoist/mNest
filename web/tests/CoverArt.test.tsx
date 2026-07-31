@@ -8,8 +8,8 @@ function CoverHarness() {
   return (
     <>
       <CoverArt id={id()} alt="测试封面" kind="track" />
-      <button onClick={() => setId('tr-track-1')}>设置封面</button>
-      <button onClick={() => setId('tr-track-2')}>切换封面</button>
+      <button onClick={() => setId('img-track-1')}>设置封面</button>
+      <button onClick={() => setId('img-track-2')}>切换封面</button>
     </>
   )
 }
@@ -21,7 +21,7 @@ describe('CoverArt', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: '设置封面' }))
 
-    await waitFor(() => expect(screen.getByRole('img', { name: '测试封面' })).toHaveAttribute('src', '/rest/getCoverArt?v=1.16.1&c=mNest&id=tr-track-1'))
+    await waitFor(() => expect(screen.getByRole('img', { name: '测试封面' })).toHaveAttribute('src', '/rest/getCoverArt?v=1.16.1&c=mNest&id=img-track-1'))
   })
 
   it('retries after a failed cover when the track changes', async () => {
@@ -32,6 +32,6 @@ describe('CoverArt', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: '切换封面' }))
 
-    await waitFor(() => expect(screen.getByRole('img', { name: '测试封面' })).toHaveAttribute('src', '/rest/getCoverArt?v=1.16.1&c=mNest&id=tr-track-2'))
+    await waitFor(() => expect(screen.getByRole('img', { name: '测试封面' })).toHaveAttribute('src', '/rest/getCoverArt?v=1.16.1&c=mNest&id=img-track-2'))
   })
 })

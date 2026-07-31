@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatBytes, formatDuration, joinPath, normalizeArtistMetadata, parentPath, safeHttpUrl } from '../src/lib/utils'
+import { formatBytes, formatDuration, joinPath, normalizeArtistMetadata, parentPath, safeHttpUrl, safeRadioStreamUrl } from '../src/lib/utils'
 
 describe('format helpers', () => {
   it('formats durations and file sizes', () => {
@@ -25,5 +25,18 @@ describe('format helpers', () => {
     expect(safeHttpUrl('javascript:alert(1)')).toBe('')
     expect(safeHttpUrl('file:///tmp/radio')).toBe('')
     expect(safeHttpUrl('/relative')).toBe('')
+  })
+
+  it('accepts server-proxied radio stream protocols', () => {
+    for (const value of [
+      'https://radio.example/live',
+      'rtsp://radio.example/live',
+      'mms://radio.example/live',
+      'mmsh://radio.example/live',
+      'mmst://radio.example:1755/live',
+    ]) expect(safeRadioStreamUrl(` ${value} `)).toBe(value)
+    expect(safeRadioStreamUrl('file:///tmp/radio')).toBe('')
+    expect(safeRadioStreamUrl('javascript:alert(1)')).toBe('')
+    expect(safeRadioStreamUrl('/relative')).toBe('')
   })
 })
