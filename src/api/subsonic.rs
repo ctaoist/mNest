@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::SeekFrom,
-    path::PathBuf,
+    io::{self, SeekFrom},
+    path::{Path as FsPath, PathBuf},
 };
 
 use anyhow::Context;
@@ -26,8 +26,8 @@ use sea_orm::{
 };
 use serde_json::{Map, Value, json};
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    process::Command,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    process::{Child, ChildStdout, Command},
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use uuid::Uuid;
@@ -49,7 +49,7 @@ use crate::{
     jobs::{self, ScanPayload},
     lastfm,
     models::{Album, Artist, MusicFolder, Track, User},
-    user_preferences,
+    transcode_cache, user_preferences,
 };
 
 #[derive(FromQueryResult)]
@@ -557,7 +557,8 @@ async fn binary_endpoint(
                     &track,
                     requested_format.map(String::as_str).unwrap_or("mp3"),
                     max_bitrate,
-                    time_offset,
+                    time_offset.map(String::as_str),
+                    p.get("_range").map(String::as_str),
                 )
                 .await
             }
@@ -565,7 +566,7 @@ async fn binary_endpoint(
         "getCoverArt" => {
             let id = required_anyhow(p, "id")?;
             let image_id = id.strip_prefix("img-").context("invalid cover art id")?;
-            let path = if album_entity::Entity::find_by_id(image_id)
+            let source = if album_entity::Entity::find_by_id(image_id)
                 .one(&state.db)
                 .await?
                 .is_some()
@@ -577,15 +578,22 @@ async fn binary_endpoint(
                     .one(&state.db)
                     .await?
                     .context("album cover source not found")?
-                    .path
             } else {
-                track(state, image_id).await?.path
+                track_entity::Entity::find_by_id(image_id)
+                    .one(&state.db)
+                    .await?
+                    .context("track cover source not found")?
             };
             let tags = state.tags.clone();
-            let artwork =
-                tokio::task::spawn_blocking(move || tags.read_artwork(std::path::Path::new(&path)))
-                    .await??
-                    .context("cover art not found")?;
+            let artwork = tokio::task::spawn_blocking(move || {
+                tags.read_artwork_cached(
+                    std::path::Path::new(&source.path),
+                    &source.id,
+                    source.mtime,
+                )
+            })
+            .await??
+            .context("cover art not found")?;
             Ok((
                 [
                     (header::CONTENT_TYPE, artwork.mime_type),
@@ -2548,7 +2556,8 @@ async fn transcode(
     track: &Track,
     format: &str,
     max_bitrate: Option<u32>,
-    offset: Option<&String>,
+    offset: Option<&str>,
+    range_header: Option<&str>,
 ) -> anyhow::Result<Response> {
     let (muxer, mime_extension) = match format.to_ascii_lowercase().as_str() {
         "mp3" => ("mp3", "mp3"),
@@ -2558,6 +2567,18 @@ async fn transcode(
         "ogg" => ("ogg", "ogg"),
         _ => anyhow::bail!("unsupported transcode format"),
     };
+    let cache_path = transcode_cache_path(state, track, mime_extension, max_bitrate, offset).await;
+    if let Some(path) = cache_path.as_ref() {
+        match transcode_cache_is_fresh(FsPath::new(&track.path), path).await {
+            Ok(true) => {
+                return serve_file(path.clone(), false, range_header, state.shutdown.clone()).await;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, cache = %path.display(), "failed to validate transcode cache");
+            }
+        }
+    }
     let mut command = Command::new(&state.settings.tools.ffmpeg);
     command.kill_on_drop(true);
     command.arg("-v").arg("error");
@@ -2574,18 +2595,45 @@ async fn transcode(
         .stderr(std::process::Stdio::null());
     let mut child = command.spawn()?;
     let stdout = child.stdout.take().context("ffmpeg stdout unavailable")?;
+    let cache = match cache_path {
+        Some(path) => match PendingTranscodeCache::create(path).await {
+            Ok(cache) => Some(cache),
+            Err(error) => {
+                tracing::warn!(%error, "failed to create transcode cache file");
+                None
+            }
+        },
+        None => None,
+    };
     let stream = futures::stream::try_unfold(
-        (ReaderStream::new(stdout), child),
-        |(mut stdout, mut child)| async move {
-            match stdout.next().await {
-                Some(Ok(chunk)) => Ok(Some((chunk, (stdout, child)))),
+        TranscodeOutputState {
+            stdout: ReaderStream::new(stdout),
+            child,
+            cache,
+        },
+        |mut state| async move {
+            match state.stdout.next().await {
+                Some(Ok(chunk)) => {
+                    if let Some(cache) = state.cache.as_mut()
+                        && let Err(error) = cache.write_chunk(&chunk).await
+                    {
+                        tracing::warn!(%error, "failed to write transcode cache; continuing playback");
+                        state.cache = None;
+                    }
+                    Ok(Some((chunk, state)))
+                }
                 Some(Err(error)) => {
-                    let _ = child.kill().await;
+                    let _ = state.child.kill().await;
                     Err(error)
                 }
                 None => {
-                    let status = child.wait().await?;
+                    let status = state.child.wait().await?;
                     if status.success() {
+                        if let Some(cache) = state.cache.as_mut()
+                            && let Err(error) = cache.commit().await
+                        {
+                            tracing::warn!(%error, "failed to finalize transcode cache");
+                        }
                         Ok(None)
                     } else {
                         Err(std::io::Error::other(format!(
@@ -2607,6 +2655,182 @@ async fn transcode(
         )?,
     );
     Ok(response)
+}
+
+struct TranscodeOutputState {
+    stdout: ReaderStream<ChildStdout>,
+    child: Child,
+    cache: Option<PendingTranscodeCache>,
+}
+
+struct PendingTranscodeCache {
+    file: Option<tokio::fs::File>,
+    partial_path: Option<PathBuf>,
+    publish_path: Option<PathBuf>,
+    final_path: PathBuf,
+}
+
+impl PendingTranscodeCache {
+    async fn create(final_path: PathBuf) -> io::Result<Self> {
+        let parent = final_path
+            .parent()
+            .ok_or_else(|| io::Error::other("transcode cache path has no parent"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let temporary_directory = FsPath::new("/tmp/mnest-transcodes");
+        tokio::fs::create_dir_all(temporary_directory).await?;
+        let extension = final_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("audio");
+        let partial_path =
+            temporary_directory.join(format!("{}.{}.partial", Uuid::new_v4().simple(), extension));
+        let file = tokio::fs::File::create(&partial_path).await?;
+        Ok(Self {
+            file: Some(file),
+            partial_path: Some(partial_path),
+            publish_path: None,
+            final_path,
+        })
+    }
+
+    async fn write_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.write_all(chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn commit(&mut self) -> io::Result<()> {
+        if let Some(mut file) = self.file.take() {
+            file.flush().await?;
+            drop(file);
+        }
+        let Some(partial_path) = self.partial_path.take() else {
+            return Ok(());
+        };
+        match tokio::fs::rename(&partial_path, &self.final_path).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let extension = self
+                    .final_path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("audio");
+                let publish_path = self.final_path.with_extension(format!(
+                    "{extension}.publishing-{}",
+                    Uuid::new_v4().simple()
+                ));
+                self.publish_path = Some(publish_path.clone());
+                if let Err(error) = tokio::fs::copy(&partial_path, &publish_path).await {
+                    self.partial_path = Some(partial_path);
+                    return Err(error);
+                }
+                match tokio::fs::rename(&publish_path, &self.final_path).await {
+                    Ok(()) => {
+                        self.publish_path = None;
+                        let _ = tokio::fs::remove_file(partial_path).await;
+                        Ok(())
+                    }
+                    Err(_)
+                        if tokio::fs::metadata(&self.final_path)
+                            .await
+                            .is_ok_and(|metadata| metadata.len() > 0) =>
+                    {
+                        self.publish_path = None;
+                        let _ = tokio::fs::remove_file(publish_path).await;
+                        let _ = tokio::fs::remove_file(partial_path).await;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.partial_path = Some(partial_path);
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PendingTranscodeCache {
+    fn drop(&mut self) {
+        if let Some(path) = self.partial_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = self.publish_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn transcode_cache_path(
+    state: &AppState,
+    track: &Track,
+    format: &str,
+    max_bitrate: Option<u32>,
+    offset: Option<&str>,
+) -> Option<PathBuf> {
+    let settings = match transcode_cache::load(&state.db, &track.folder_id).await {
+        Ok(settings) if settings.enabled => settings,
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read transcode cache settings");
+            return None;
+        }
+    };
+    if let Err(error) = settings.prepare().await {
+        tracing::warn!(%error, path = %settings.path.display(), "transcode cache is unavailable");
+        return None;
+    }
+    let artist = transcode_cache_artist_name(track);
+    match settings.entry_path(transcode_cache::TranscodeCacheEntry {
+        folder_id: &track.folder_id,
+        artist: &artist,
+        album: &track.album_name,
+        title: &track.title,
+        format,
+        bitrate: transcode_cache_bitrate(track, max_bitrate),
+        offset,
+    }) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            tracing::warn!(%error, source = %track.path, "failed to build transcode cache key");
+            None
+        }
+    }
+}
+
+fn transcode_cache_artist_name(track: &Track) -> String {
+    let artists = serde_json::from_str::<Vec<ArtistCredit>>(&track.artists_json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|artist| artist.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if artists.is_empty() {
+        parse_artist_names(&track.artist_name).join("-")
+    } else {
+        artists.join("-")
+    }
+}
+
+fn transcode_cache_bitrate(track: &Track, max_bitrate: Option<u32>) -> u32 {
+    max_bitrate
+        .map(|rate| rate.clamp(16, 320))
+        .or_else(|| u32::try_from(track.bit_rate).ok().filter(|rate| *rate > 0))
+        .unwrap_or(128)
+}
+
+async fn transcode_cache_is_fresh(source: &FsPath, cache: &FsPath) -> io::Result<bool> {
+    let source_metadata = tokio::fs::metadata(source).await?;
+    let cache_metadata = match tokio::fs::metadata(cache).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if cache_metadata.len() == 0 {
+        return Ok(false);
+    }
+    Ok(cache_metadata.modified()? >= source_metadata.modified()?)
 }
 
 async fn track(state: &AppState, id: &str) -> anyhow::Result<Track> {
@@ -3092,6 +3316,10 @@ mod tests {
     use super::*;
 
     async fn test_state() -> AppState {
+        test_state_with_settings(crate::config::Settings::default()).await
+    }
+
+    async fn test_state_with_settings(settings: crate::config::Settings) -> AppState {
         let db = crate::db::connect(&crate::config::DatabaseSettings {
             driver: "sqlite".into(),
             url: "sqlite::memory:".into(),
@@ -3100,7 +3328,7 @@ mod tests {
         .await
         .unwrap();
         crate::db::migrate(&db).await.unwrap();
-        let settings = Arc::new(crate::config::Settings::default());
+        let settings = Arc::new(settings);
         crate::db::bootstrap_admin(&db, &settings.admin, &settings.auth.jwt_secret)
             .await
             .unwrap();
@@ -3159,6 +3387,88 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn joins_multiple_cache_artists_with_hyphens() {
+        assert_eq!(
+            transcode_cache_artist_name(&test_track()),
+            "Artist A-Artist B"
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_an_existing_transcode_result_without_starting_ffmpeg() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("song.flac");
+        tokio::fs::write(&source, b"source audio").await.unwrap();
+        let mut server_settings = crate::config::Settings::default();
+        server_settings.tools.ffmpeg = directory.path().join("missing-ffmpeg");
+        let state = test_state_with_settings(server_settings).await;
+        let cache_settings = transcode_cache::TranscodeCacheSettings {
+            enabled: true,
+            path: directory.path().join("transcodes"),
+        };
+        let mut track = test_track();
+        track.path = source.to_string_lossy().into_owned();
+        cache_settings.prepare().await.unwrap();
+        transcode_cache::save(&state.db, &track.folder_id, &cache_settings)
+            .await
+            .unwrap();
+        let cache_path = cache_settings
+            .entry_path(transcode_cache::TranscodeCacheEntry {
+                folder_id: &track.folder_id,
+                artist: &transcode_cache_artist_name(&track),
+                album: &track.album_name,
+                title: &track.title,
+                format: "mp3",
+                bitrate: 128,
+                offset: None,
+            })
+            .unwrap();
+        tokio::fs::create_dir_all(cache_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&cache_path, b"cached audio")
+            .await
+            .unwrap();
+
+        let response = transcode(&state, &track, "mp3", Some(128), None, Some("bytes=0-5"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        assert_eq!(&body[..], b"cached");
+    }
+
+    #[tokio::test]
+    async fn treats_a_cache_older_than_its_source_as_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("song.flac");
+        let cache = directory.path().join("song.mp3");
+        tokio::fs::write(&cache, b"old cache").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::write(&source, b"new source").await.unwrap();
+
+        assert!(!transcode_cache_is_fresh(&source, &cache).await.unwrap());
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::write(&cache, b"new cache").await.unwrap();
+        assert!(transcode_cache_is_fresh(&source, &cache).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn writes_in_progress_transcodes_under_tmp() {
+        let directory = tempfile::tempdir().unwrap();
+        let final_path = directory.path().join("cache/result.mp3");
+        let cache = PendingTranscodeCache::create(final_path).await.unwrap();
+        let partial_path = cache.partial_path.as_ref().unwrap().clone();
+
+        assert!(partial_path.starts_with("/tmp/mnest-transcodes"));
+        assert!(partial_path.is_file());
+        drop(cache);
+        assert!(!partial_path.exists());
     }
 
     #[test]

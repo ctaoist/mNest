@@ -104,6 +104,10 @@ export interface LibraryRoot {
   name: string
   path: string
   enabled: number
+  transcode_cache: {
+    enabled: boolean
+    path: string
+  }
 }
 
 export interface FileNode {
@@ -181,6 +185,7 @@ export interface ConfigStatus {
   cover_cache: {
     enabled: boolean
     path: string
+    concurrency: number
   }
   lastfm: LastFmStatus
   tools: {

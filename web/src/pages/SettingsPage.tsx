@@ -105,6 +105,8 @@ export function SettingsPage() {
   const [editingRootId, setEditingRootId] = createSignal('')
   const [rootName, setRootName] = createSignal('')
   const [rootPath, setRootPath] = createSignal('')
+  const [rootTranscodeCacheEnabled, setRootTranscodeCacheEnabled] = createSignal(false)
+  const [rootTranscodeCachePath, setRootTranscodeCachePath] = createSignal('/data/cache/transcodes')
   const [sourceDialog, setSourceDialog] = createSignal(false)
   const [sourceDraft, setSourceDraft] = createSignal<DownloadSourceDraft>({ kind: 'netease', name: sourceNames.netease, base_url: '', username: '', password: '', enabled: true })
   const [neteaseLogin, setNeteaseLogin] = createSignal<{ source_id: string; key: string; qr_image: string; message: string } | null>(null)
@@ -188,6 +190,8 @@ export function SettingsPage() {
     setEditingRootId(root?.id || '')
     setRootName(root?.name || '')
     setRootPath(root?.path || '')
+    setRootTranscodeCacheEnabled(root?.transcode_cache.enabled || false)
+    setRootTranscodeCachePath(root?.transcode_cache.path || '/data/cache/transcodes')
     setRootDialog(true)
   }
 
@@ -196,17 +200,27 @@ export function SettingsPage() {
     setEditingRootId('')
     setRootName('')
     setRootPath('')
+    setRootTranscodeCacheEnabled(false)
+    setRootTranscodeCachePath('/data/cache/transcodes')
   }
 
   const saveRoot = async (event: SubmitEvent) => {
     event.preventDefault()
     setBusy('root')
+    const payload = {
+      name: rootName().trim(),
+      path: rootPath().trim(),
+      transcode_cache: {
+        enabled: rootTranscodeCacheEnabled(),
+        path: rootTranscodeCachePath().trim(),
+      },
+    }
     try {
       if (editingRootId()) {
-        await post('/api/library_roots/update/', { id: editingRootId(), name: rootName().trim(), path: rootPath().trim() })
+        await post('/api/library_roots/update/', { id: editingRootId(), ...payload })
         toast.notify('曲库目录已更新，不会自动扫描', 'success')
       } else {
-        await post('/api/library_roots/', { name: rootName().trim(), path: rootPath().trim() })
+        await post('/api/library_roots/', payload)
         toast.notify('曲库目录已添加，已开始后台扫描', 'success')
       }
       closeRootDialog()
@@ -534,7 +548,7 @@ export function SettingsPage() {
             <div class="settings-grid">
               <section class="panel library-settings">
                 <div class="section-heading"><div><span class="eyebrow">MUSIC FOLDERS</span><h2>曲库目录</h2></div><button class="primary-button small" onClick={() => openRootDialog()}><Plus size={16} />新增曲库</button></div>
-                <div class="root-list"><For each={config().library_roots} fallback={<div class="empty-state">尚未添加曲库目录</div>}>{(root) => <article><span class="root-icon"><HardDrive /></span><div><strong>{root.name}</strong><code>{root.path}</code></div><span class="status-pill"><span class="pulse-dot" />ENABLED</span><div class="root-list-tools"><button class="icon-button" onClick={() => openRootDialog(root)} aria-label={`编辑曲库 ${root.name}`}><Edit3 size={17} /></button><button class="icon-button danger" onClick={() => void removeRoot(root.id, root.name)} aria-label={`删除曲库 ${root.name}`}><Trash2 size={17} /></button></div></article>}</For></div>
+                <div class="root-list"><For each={config().library_roots} fallback={<div class="empty-state">尚未添加曲库目录</div>}>{(root) => <article><span class="root-icon"><HardDrive /></span><div><strong>{root.name}</strong><code>{root.path}</code><small class={`root-cache-summary ${root.transcode_cache.enabled ? 'is-active' : ''}`}>{root.transcode_cache.enabled ? `转码缓存 · ${root.transcode_cache.path}` : '转码缓存未启用'}</small></div><span class="status-pill"><span class="pulse-dot" />ENABLED</span><div class="root-list-tools"><button class="icon-button" onClick={() => openRootDialog(root)} aria-label={`编辑曲库 ${root.name}`}><Edit3 size={17} /></button><button class="icon-button danger" onClick={() => void removeRoot(root.id, root.name)} aria-label={`删除曲库 ${root.name}`}><Trash2 size={17} /></button></div></article>}</For></div>
                 <div class="scan-console">
                   <div><span class="eyebrow">LIBRARY SCAN</span><h3>{activeJob()?.kind === 'scan' ? '正在建立曲库索引' : '扫描音乐文件与标签'}</h3><p>{activeJob()?.kind === 'scan' ? activeJob()?.message || '扫描任务正在后台运行' : '新增文件或修改标签后，可重新扫描曲库。'}</p></div>
                   <Show when={activeJob()?.kind === 'scan'} fallback={<button class="secondary-button" disabled={busy() === 'scan'} onClick={scan}>{busy() === 'scan' ? <LoaderCircle class="spin" /> : <Play size={16} fill="currentColor" />}立即扫描</button>}>
@@ -580,7 +594,7 @@ export function SettingsPage() {
       </Show>
 
       <Show when={rootDialog()}>
-        <div class="dialog-layer"><div class="sheet-backdrop" onClick={closeRootDialog} /><section class="dialog"><header><div><span class="eyebrow">MUSIC FOLDER</span><h2>{editingRootId() ? '编辑曲库目录' : '新增曲库目录'}</h2></div><button class="icon-button" onClick={closeRootDialog}><X /></button></header><form onSubmit={saveRoot}><label class="field wide"><span>曲库名称</span><input value={rootName()} onInput={(event) => setRootName(event.currentTarget.value)} required placeholder="例如：无损音乐" /></label><label class="field wide"><span>服务器绝对路径</span><input value={rootPath()} onInput={(event) => setRootPath(event.currentTarget.value)} required placeholder="例如：/mnt/music" /></label><p class="form-tip">{editingRootId() ? '仅更新目录配置和已有歌曲的绝对路径，不会重新扫描曲库。' : 'Docker 部署时填写容器内部路径，目录必须已挂载且后端可访问。'}</p><div class="dialog-actions"><button type="button" class="secondary-button" onClick={closeRootDialog}>取消</button><button class="primary-button" disabled={busy() === 'root'}>{busy() === 'root' ? <LoaderCircle class="spin" /> : editingRootId() ? <Edit3 size={16} /> : <FolderPlus size={16} />}{editingRootId() ? '保存修改' : '保存目录'}</button></div></form></section></div>
+        <div class="dialog-layer"><div class="sheet-backdrop" onClick={closeRootDialog} /><section class="dialog library-root-dialog"><header><div><span class="eyebrow">MUSIC FOLDER</span><h2>{editingRootId() ? '编辑曲库目录' : '新增曲库目录'}</h2></div><button class="icon-button" onClick={closeRootDialog}><X /></button></header><form onSubmit={saveRoot}><label class="field wide"><span>曲库名称</span><input value={rootName()} onInput={(event) => setRootName(event.currentTarget.value)} required placeholder="例如：无损音乐" /></label><label class="field wide"><span>服务器绝对路径</span><input value={rootPath()} onInput={(event) => setRootPath(event.currentTarget.value)} required placeholder="例如：/mnt/music" /></label><div class="library-cache-fields"><label class={`transcode-cache-toggle ${rootTranscodeCacheEnabled() ? 'is-active' : ''}`}><input type="checkbox" checked={rootTranscodeCacheEnabled()} onChange={(event) => setRootTranscodeCacheEnabled(event.currentTarget.checked)} aria-label="缓存该曲库的转码结果" /><span class="transcode-cache-check"><Check size={14} /></span><span><strong>缓存转码结果</strong><small>命中相同源文件和参数时直接读取磁盘文件。</small></span></label><label class="transcode-cache-path"><span>该曲库的缓存目录</span><input aria-label="曲库转码缓存路径" value={rootTranscodeCachePath()} onInput={(event) => setRootTranscodeCachePath(event.currentTarget.value)} placeholder="/data/cache/transcodes" spellcheck={false} /></label></div><p class="form-tip">{editingRootId() ? '仅更新目录配置和已有歌曲的绝对路径，不会重新扫描曲库。' : 'Docker 部署时填写容器内部路径，目录必须已挂载且后端可访问。'} 转码临时文件统一写入 <code>/tmp/mnest-transcodes</code>。</p><div class="dialog-actions"><button type="button" class="secondary-button" onClick={closeRootDialog}>取消</button><button class="primary-button" disabled={busy() === 'root' || (rootTranscodeCacheEnabled() && !rootTranscodeCachePath().trim())}>{busy() === 'root' ? <LoaderCircle class="spin" /> : editingRootId() ? <Edit3 size={16} /> : <FolderPlus size={16} />}{editingRootId() ? '保存修改' : '保存目录'}</button></div></form></section></div>
       </Show>
 
       <Show when={sourceDialog()}>

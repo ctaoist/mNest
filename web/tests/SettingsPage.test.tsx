@@ -65,10 +65,10 @@ describe('SettingsPage permissions', () => {
       if (path === '/api/config/status/') return Promise.resolve({
         database: 'sqlite',
         queue: 'database',
-        library_roots: [{ id: 'root-1', name: 'Music', path: '/music', enabled: 1 }],
+        library_roots: [{ id: 'root-1', name: 'Music', path: '/music', enabled: 1, transcode_cache: { enabled: false, path: '/data/cache/transcodes' } }],
         providers: [],
         download_filename_format: 'artist-title',
-        cover_cache: { enabled: true, path: '/data/cache/covers' },
+        cover_cache: { enabled: true, path: '/data/cache/covers', concurrency: 4 },
         lastfm,
         tools: { ffmpeg: true, fpcalc: true, taglib_configured: false },
       })
@@ -134,9 +134,28 @@ describe('SettingsPage permissions', () => {
 
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/api/library_roots/update/', {
       id: 'root-1', name: 'Music', path: '/mnt/music',
+      transcode_cache: { enabled: false, path: '/data/cache/transcodes' },
     }))
     expect(mocks.post).not.toHaveBeenCalledWith('/api/scan/', expect.anything())
     expect(mocks.notify).toHaveBeenCalledWith('曲库目录已更新，不会自动扫描', 'success')
+  })
+
+  it('saves transcode cache settings with the edited library root', async () => {
+    mocks.role = 'admin'
+    render(() => <SettingsPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '编辑曲库 Music' })).toBeTruthy())
+
+    await fireEvent.click(screen.getByRole('button', { name: '编辑曲库 Music' }))
+    await fireEvent.click(screen.getByLabelText('缓存该曲库的转码结果'))
+    await fireEvent.input(screen.getByLabelText('曲库转码缓存路径'), { target: { value: '/mnt/cache/transcodes' } })
+    await fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+
+    await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/api/library_roots/update/', {
+      id: 'root-1',
+      name: 'Music',
+      path: '/music',
+      transcode_cache: { enabled: true, path: '/mnt/cache/transcodes' },
+    }))
   })
 
   it('saves an RTSP radio with the OpenSubsonic proxy option', async () => {

@@ -118,6 +118,9 @@ pub async fn scan_all(
             .map(|track| track.id)
             .collect::<Vec<_>>()
     };
+    if let Err(error) = tags.clear_artwork_caches(removed_ids.iter().map(String::as_str)) {
+        tracing::warn!(%error, removed = removed_ids.len(), "failed to clear artwork cache for missing tracks");
+    }
     let removed = remove_track_records(db, &removed_ids).await?;
     rebuild_aggregates(db).await?;
     Ok(ScanReport {
@@ -612,8 +615,10 @@ pub fn is_audio(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use md5::{Digest, Md5};
+
     use super::*;
-    use crate::config::{DatabaseSettings, ToolSettings};
+    use crate::config::{CoverCacheSettings, DatabaseSettings, ToolSettings};
 
     fn write_wav(path: &Path) {
         std::fs::write(
@@ -738,15 +743,28 @@ mod tests {
     #[tokio::test]
     async fn scan_removes_missing_track_references() {
         let directory = tempfile::tempdir().unwrap();
+        let cover_cache = tempfile::tempdir().unwrap();
         let path = directory.path().join("tone.wav");
         write_wav(&path);
         let db = test_database().await;
         add_library(&db, "library", directory.path()).await;
-        let tags = Arc::new(TagService::new(ToolSettings::default()));
+        let tags = Arc::new(TagService::with_cover_cache(
+            ToolSettings::default(),
+            CoverCacheSettings {
+                enabled: true,
+                path: cover_cache.path().to_path_buf(),
+                concurrency: 2,
+            },
+        ));
         refresh_paths(&db, tags.clone(), std::slice::from_ref(&path))
             .await
             .unwrap();
         let track_id = track::Entity::find().one(&db).await.unwrap().unwrap().id;
+        let artwork_cache = cover_cache.path().join(format!(
+            "{}-stale.artwork",
+            hex::encode(Md5::digest(track_id.as_bytes()))
+        ));
+        std::fs::write(&artwork_cache, b"stale artwork").unwrap();
         let now = Utc::now().to_rfc3339();
         playlist_track::ActiveModel {
             playlist_id: Set("playlist".into()),
@@ -825,6 +843,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.removed, 1);
+        assert!(!artwork_cache.exists());
         assert!(track::Entity::find().one(&db).await.unwrap().is_none());
         assert!(
             playlist_track::Entity::find()

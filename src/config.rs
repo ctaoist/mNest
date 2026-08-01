@@ -86,6 +86,9 @@ impl Settings {
                 bail!("cover_cache.path cannot be the filesystem root");
             }
         }
+        if !(1..=64).contains(&self.cover_cache.concurrency) {
+            bail!("cover_cache.concurrency must be between 1 and 64");
+        }
         match self.database.driver.as_str() {
             "sqlite" => {
                 if !cfg!(feature = "sqlite") {
@@ -267,12 +270,14 @@ impl Default for ToolSettings {
 pub struct CoverCacheSettings {
     pub enabled: bool,
     pub path: PathBuf,
+    pub concurrency: usize,
 }
 impl Default for CoverCacheSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             path: "/data/cache/covers".into(),
+            concurrency: 4,
         }
     }
 }
@@ -335,6 +340,7 @@ auth: { jwt_secret: "12345678901234567890123456789012" }
         settings.validate().unwrap();
         assert_eq!(settings.server.port, 4535);
         assert!(!settings.cover_cache.enabled);
+        assert_eq!(settings.cover_cache.concurrency, 4);
     }
 
     #[test]
@@ -374,6 +380,10 @@ auth: { jwt_secret: "12345678901234567890123456789012" }
         settings.validate().unwrap();
         settings.prepare_runtime().unwrap();
         assert!(settings.cover_cache.path.is_dir());
+
+        settings.cover_cache.concurrency = 0;
+        assert!(settings.validate().is_err());
+        settings.cover_cache.concurrency = 4;
 
         settings.cover_cache.path = PathBuf::from("relative/covers");
         assert!(settings.validate().is_err());

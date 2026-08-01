@@ -23,6 +23,7 @@ pub mod remote_download;
 pub mod scanner;
 pub mod state;
 pub mod tags;
+pub mod transcode_cache;
 pub mod user_preferences;
 
 pub use state::AppState;

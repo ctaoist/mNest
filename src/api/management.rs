@@ -23,7 +23,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
     QuerySelect, Set, TransactionTrait,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
@@ -47,6 +47,7 @@ use crate::{
     remote_download::{self, RemoteConnection, RemoteImportRequest, RemoteSearchRequest},
     scanner,
     tags::{ARTWORK_CACHE_CONTROL, AUDIO_EXTENSIONS, AudioMetadata, detect_artwork_mime},
+    transcode_cache::{self, TranscodeCacheSettings},
     user_preferences,
 };
 use uuid::Uuid;
@@ -404,8 +405,16 @@ async fn music_artwork(
         &Path::new(&request.file_path).join(&request.file_name),
     )
     .await?;
+    let indexed_track = track::Entity::find()
+        .filter(track::Column::Path.eq(path.to_string_lossy().into_owned()))
+        .one(&state.db)
+        .await?;
     let tags = state.tags.clone();
-    let artwork = tokio::task::spawn_blocking(move || tags.read_artwork(&path)).await??;
+    let artwork = tokio::task::spawn_blocking(move || match indexed_track {
+        Some(track) => tags.read_artwork_cached(&path, &track.id, track.mtime),
+        None => tags.read_artwork(&path),
+    })
+    .await??;
     let Some(artwork) = artwork else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
@@ -2288,6 +2297,7 @@ async fn config_status(
         "cover_cache": {
             "enabled": state.settings.cover_cache.enabled,
             "path": state.settings.cover_cache.path.to_string_lossy(),
+            "concurrency": state.settings.cover_cache.concurrency,
         },
         "lastfm": lastfm,
         "tools": {"ffmpeg":state.settings.tools.ffmpeg.exists(),"fpcalc":state.settings.tools.fpcalc.exists(),"taglib_configured":state.settings.tools.taglib.is_some()}
@@ -2422,23 +2432,46 @@ async fn disconnect_lastfm(
 async fn library_roots(
     State(state): State<AppState>,
     _user: AdminUser,
-) -> Result<Json<ApiResponse<Vec<MusicFolder>>>, ApiError> {
+) -> Result<Json<ApiResponse<Vec<LibraryRootConfig>>>, ApiError> {
     Ok(Json(ApiResponse::success(
         fetch_library_roots(&state).await?,
     )))
+}
+
+#[derive(Serialize)]
+struct LibraryRootConfig {
+    id: String,
+    name: String,
+    path: String,
+    enabled: i64,
+    transcode_cache: TranscodeCacheSettings,
+}
+
+impl LibraryRootConfig {
+    fn new(folder: MusicFolder, transcode_cache: TranscodeCacheSettings) -> Self {
+        Self {
+            id: folder.id,
+            name: folder.name,
+            path: folder.path,
+            enabled: folder.enabled,
+            transcode_cache,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct LibraryRootRequest {
     name: String,
     path: String,
+    #[serde(default)]
+    transcode_cache: Option<TranscodeCacheSettings>,
 }
 
 async fn add_library_root(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Json(request): Json<LibraryRootRequest>,
-) -> Result<Json<ApiResponse<MusicFolder>>, ApiError> {
+) -> Result<Json<ApiResponse<LibraryRootConfig>>, ApiError> {
     if user.role != "admin" {
         return Err(ApiError::forbidden("需要管理员权限"));
     }
@@ -2468,24 +2501,42 @@ async fn add_library_root(
     if duplicate.is_some() {
         return Err(ApiError::bad_request("曲库名称或路径已经存在"));
     }
+    let transcode_cache = request.transcode_cache.unwrap_or_default().normalized();
+    transcode_cache
+        .prepare()
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let transaction = state.db.begin().await?;
     let folder = music_folder::ActiveModel {
         id: Set(Uuid::new_v4().to_string()),
         name: Set(name.to_owned()),
         path: Set(path),
         enabled: Set(1),
     }
-    .insert(&state.db)
+    .insert(&transaction)
     .await?;
+    transcode_cache::save(&transaction, &folder.id, &transcode_cache).await?;
+    transaction.commit().await?;
     if let Err(error) = jobs::enqueue(&state, "scan", &ScanPayload {}).await {
-        if let Err(cleanup_error) = music_folder::Entity::delete_by_id(&folder.id)
-            .exec(&state.db)
-            .await
-        {
+        let cleanup = async {
+            let transaction = state.db.begin().await?;
+            music_folder::Entity::delete_by_id(&folder.id)
+                .exec(&transaction)
+                .await?;
+            transcode_cache::delete(&transaction, &folder.id).await?;
+            transaction.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(cleanup_error) = cleanup {
             tracing::warn!(folder_id = %folder.id, %cleanup_error, "failed to roll back library root after scan enqueue failure");
         }
         return Err(error.into());
     }
-    Ok(Json(ApiResponse::success(folder)))
+    Ok(Json(ApiResponse::success(LibraryRootConfig::new(
+        folder,
+        transcode_cache,
+    ))))
 }
 
 #[derive(Deserialize)]
@@ -2498,13 +2549,15 @@ struct UpdateLibraryRootRequest {
     id: String,
     name: String,
     path: String,
+    #[serde(default)]
+    transcode_cache: Option<TranscodeCacheSettings>,
 }
 
 async fn update_library_root(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Json(request): Json<UpdateLibraryRootRequest>,
-) -> Result<Json<ApiResponse<MusicFolder>>, ApiError> {
+) -> Result<Json<ApiResponse<LibraryRootConfig>>, ApiError> {
     if user.role != "admin" {
         return Err(ApiError::forbidden("需要管理员权限"));
     }
@@ -2539,6 +2592,14 @@ async fn update_library_root(
     if duplicate.is_some() {
         return Err(ApiError::bad_request("曲库名称或路径已经存在"));
     }
+    let transcode_cache = match request.transcode_cache {
+        Some(settings) => settings.normalized(),
+        None => transcode_cache::load(&state.db, &request.id).await?,
+    };
+    transcode_cache
+        .prepare()
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
     let path_changed = folder.path != path;
     let transaction = state.db.begin().await?;
@@ -2571,8 +2632,12 @@ async fn update_library_root(
             active.update(&transaction).await?;
         }
     }
+    transcode_cache::save(&transaction, &folder_id, &transcode_cache).await?;
     transaction.commit().await?;
-    Ok(Json(ApiResponse::success(folder)))
+    Ok(Json(ApiResponse::success(LibraryRootConfig::new(
+        folder,
+        transcode_cache,
+    ))))
 }
 
 async fn delete_library_root(
@@ -2597,9 +2662,12 @@ async fn delete_library_root(
         .all(&state.db)
         .await?;
     scanner::remove_track_records(&state.db, &track_ids).await?;
+    let transaction = state.db.begin().await?;
     music_folder::Entity::delete_by_id(&request.id)
-        .exec(&state.db)
+        .exec(&transaction)
         .await?;
+    transcode_cache::delete(&transaction, &request.id).await?;
+    transaction.commit().await?;
     scanner::rebuild_aggregates(&state.db).await?;
     Ok(Json(ApiResponse::success(json!([]))))
 }
@@ -2654,8 +2722,10 @@ async fn delete_track(
             if !path.starts_with(&root) {
                 return Err(ApiError::forbidden("歌曲文件不在所属曲库目录中"));
             }
-            if let Err(error) = state.tags.clear_artwork_cache(&path) {
-                tracing::warn!(path = %path.display(), %error, "failed to clear deleted track artwork cache");
+            for track_id in &track_ids {
+                if let Err(error) = state.tags.clear_artwork_cache(track_id) {
+                    tracing::warn!(%track_id, %error, "failed to clear deleted track artwork cache");
+                }
             }
             tokio::fs::remove_file(&path).await?;
             true
@@ -2674,7 +2744,17 @@ async fn delete_track(
     }))))
 }
 
-async fn fetch_library_roots(state: &AppState) -> Result<Vec<MusicFolder>, ApiError> {
+async fn fetch_library_roots(state: &AppState) -> Result<Vec<LibraryRootConfig>, ApiError> {
+    let folders = fetch_library_root_models(state).await?;
+    let mut roots = Vec::with_capacity(folders.len());
+    for folder in folders {
+        let settings = transcode_cache::load(&state.db, &folder.id).await?;
+        roots.push(LibraryRootConfig::new(folder, settings));
+    }
+    Ok(roots)
+}
+
+async fn fetch_library_root_models(state: &AppState) -> Result<Vec<MusicFolder>, ApiError> {
     Ok(music_folder::Entity::find()
         .filter(music_folder::Column::Enabled.eq(1))
         .order_by_asc(music_folder::Column::Name)
@@ -2693,7 +2773,7 @@ async fn allowed_path(state: &AppState, value: impl AsRef<Path>) -> Result<PathB
             .canonicalize()?;
         parent.join(value.file_name().unwrap_or_default())
     };
-    let roots = fetch_library_roots(state).await?;
+    let roots = fetch_library_root_models(state).await?;
     let allowed = roots.iter().any(|root| {
         PathBuf::from(&root.path)
             .canonicalize()
@@ -3130,6 +3210,43 @@ mod tests {
             download_filename_format(&state).await.unwrap(),
             "title-artist"
         );
+    }
+
+    #[tokio::test]
+    async fn saves_transcode_cache_settings_with_the_library_root() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("transcodes");
+
+        let response = add_library_root(
+            State(state.clone()),
+            AuthUser(admin),
+            Json(LibraryRootRequest {
+                name: "Cached Music".into(),
+                path: library.path().to_string_lossy().into_owned(),
+                transcode_cache: Some(TranscodeCacheSettings {
+                    enabled: true,
+                    path: path.clone(),
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.0.data.transcode_cache.enabled);
+        assert_eq!(response.0.data.transcode_cache.path, path);
+        assert_eq!(
+            transcode_cache::load(&state.db, &response.0.data.id)
+                .await
+                .unwrap(),
+            response.0.data.transcode_cache
+        );
+        assert!(path.is_dir());
     }
 
     #[tokio::test]
@@ -4122,6 +4239,7 @@ exec sleep 30
             Json(LibraryRootRequest {
                 name: "Music".into(),
                 path: directory.path().to_string_lossy().into_owned(),
+                transcode_cache: None,
             }),
         )
         .await;
@@ -4278,6 +4396,10 @@ exec sleep 30
                 id: root_id.clone(),
                 name: "Replacement".into(),
                 path: replacement.path().to_string_lossy().into_owned(),
+                transcode_cache: Some(TranscodeCacheSettings {
+                    enabled: true,
+                    path: replacement.path().join("transcodes"),
+                }),
             }),
         )
         .await
@@ -4287,6 +4409,7 @@ exec sleep 30
 
         assert_eq!(result.name, "Replacement");
         assert_eq!(result.path, replacement.path().to_string_lossy());
+        assert!(result.transcode_cache.enabled);
         let indexed_track = track::Entity::find()
             .filter(track::Column::FolderId.eq(&root_id))
             .one(&state.db)

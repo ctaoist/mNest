@@ -35,6 +35,7 @@ tools:
 cover_cache:
   enabled: false
   path: /data/cache/covers
+  concurrency: 4
 
 scraper:
   enabled: [netease, qmusic, migu, kuwo, kugou, acoustid]
