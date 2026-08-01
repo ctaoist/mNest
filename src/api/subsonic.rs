@@ -1663,10 +1663,8 @@ async fn get_lyrics_by_song(state: &AppState, id: &str) -> Result<Value, ApiFail
     if track.lyrics.trim().is_empty() {
         return Ok(json!({"lyricsList":{"structuredLyrics":[]}}));
     }
-    let timed_lines = track
-        .lyrics
-        .lines()
-        .filter_map(parse_lrc_line)
+    let timed_lines = parse_lrc(&track.lyrics)
+        .into_iter()
         .map(|(start, value)| json!({"start":start,"value":value}))
         .collect::<Vec<_>>();
     let synced = !timed_lines.is_empty();
@@ -1690,18 +1688,42 @@ async fn get_lyrics_by_song(state: &AppState, id: &str) -> Result<Value, ApiFail
     )
 }
 
-fn parse_lrc_line(line: &str) -> Option<(i64, String)> {
-    let end = line.find(']')?;
-    let timestamp = line.strip_prefix('[')?[..end - 1].split_once(':')?;
+fn parse_lrc(lyrics: &str) -> Vec<(i64, String)> {
+    let mut lines = lyrics.lines().flat_map(parse_lrc_line).collect::<Vec<_>>();
+    lines.sort_by_key(|(start, _)| *start);
+    lines
+}
+
+fn parse_lrc_line(line: &str) -> Vec<(i64, String)> {
+    let mut remaining = line;
+    let mut starts = Vec::new();
+    while let Some(value) = remaining.strip_prefix('[') {
+        let Some(end) = value.find(']') else {
+            break;
+        };
+        let Some(start) = parse_lrc_timestamp(&value[..end]) else {
+            break;
+        };
+        starts.push(start);
+        remaining = &value[end + 1..];
+    }
+    starts
+        .into_iter()
+        .map(|start| (start, remaining.to_owned()))
+        .collect()
+}
+
+fn parse_lrc_timestamp(value: &str) -> Option<i64> {
+    let timestamp = value.split_once(':')?;
     let minutes = timestamp.0.parse::<u64>().ok()?;
-    let seconds = timestamp.1.parse::<f64>().ok()?;
+    let seconds = timestamp.1.replace(',', ".").parse::<f64>().ok()?;
     if !(0.0..60.0).contains(&seconds) {
         return None;
     }
     let start = minutes
         .checked_mul(60_000)?
         .checked_add((seconds * 1000.0).round() as u64)?;
-    Some((i64::try_from(start).ok()?, line[end + 1..].to_owned()))
+    i64::try_from(start).ok()
 }
 async fn favorite(
     state: &AppState,
@@ -3971,10 +3993,29 @@ mod tests {
 
     #[test]
     fn parses_synced_lrc_timestamps_in_milliseconds() {
-        let (start, value) = parse_lrc_line("[01:02.50]Line").unwrap();
-        assert_eq!(start, 62_500);
-        assert_eq!(value, "Line");
-        assert!(parse_lrc_line("[ar:Artist]").is_none());
+        assert_eq!(
+            parse_lrc_line("[01:02.50]Line"),
+            vec![(62_500, "Line".to_owned())]
+        );
+        assert!(parse_lrc_line("[ar:Artist]").is_empty());
+    }
+
+    #[test]
+    fn expands_and_sorts_repeated_lrc_timestamps() {
+        let lines = parse_lrc(
+            "[01:56.29][00:16.47]万家穿针乞巧心系檀郎\n\
+             [00:31.94]\n\
+             [00:01,5]作曲 : 银临",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                (1_500, "作曲 : 银临".to_owned()),
+                (16_470, "万家穿针乞巧心系檀郎".to_owned()),
+                (31_940, String::new()),
+                (116_290, "万家穿针乞巧心系檀郎".to_owned()),
+            ]
+        );
     }
 
     #[test]
