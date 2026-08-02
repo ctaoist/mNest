@@ -82,9 +82,9 @@ RUN --mount=type=cache,target=/var/cache/media-sources \
         --enable-libmp3lame \
         --enable-libopus \
         --enable-libvorbis \
-        --enable-encoder=aac,flac,libmp3lame,libopus,libvorbis \
+        --enable-encoder=aac,flac,libmp3lame,libopus,libvorbis,pcm_f32le \
         --enable-filter=aformat,anull,aresample,asetpts,atrim \
-        --enable-muxer=adts,flac,mp3,ogg,opus \
+        --enable-muxer=adts,flac,mp3,ogg,opus,pcm_f32le \
         --enable-openssl \
         --enable-pthreads \
         --enable-small \
@@ -96,7 +96,19 @@ RUN --mount=type=cache,target=/var/cache/media-sources \
         --extra-libs="-lpthread -lm" \
         --pkg-config-flags=--static \
     && make -j"$(getconf _NPROCESSORS_ONLN)" \
-    && make install
+    && make install \
+    && /opt/media/bin/ffmpeg \
+        -nostdin \
+        -v error \
+        -f f32le \
+        -ar 8000 \
+        -ac 1 \
+        -i /dev/zero \
+        -t 0.01 \
+        -c:a pcm_f32le \
+        -f f32le \
+        -y /tmp/ffmpeg-f32le.raw \
+    && test -s /tmp/ffmpeg-f32le.raw
 
 COPY docker/chromaprint /tmp/chromaprint-patches
 

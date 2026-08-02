@@ -39,7 +39,8 @@ use crate::{
     db,
     entities::{
         album as album_entity, artist as artist_entity, bookmark as bookmark_entity,
-        favorite as favorite_entity, internet_radio_station as radio_entity, job as job_entity,
+        download_source as download_source_entity, favorite as favorite_entity,
+        internet_radio_station as radio_entity, job as job_entity,
         music_folder as music_folder_entity, play_queue as play_queue_entity,
         playlist as playlist_entity, playlist_track as playlist_track_entity,
         rating as rating_entity, scrobble as scrobble_entity, share as share_entity,
@@ -233,7 +234,7 @@ async fn dispatch(
         params.insert("_mnest_base_url".into(), base_url);
     }
     if method == "getOpenSubsonicExtensions" {
-        return subsonic_response(&params, open_subsonic_extensions());
+        return subsonic_response(&params, open_subsonic_extensions(&state).await);
     }
     if web_user.is_none()
         && let Err(error) = validate_protocol_request(&params)
@@ -417,14 +418,26 @@ fn validate_authentication_request(p: &HashMap<String, String>) -> Result<i32, A
     ))
 }
 
-fn open_subsonic_extensions() -> Value {
-    json!({"openSubsonicExtensions":[
-        {"name":"apiKeyAuthentication","versions":[1]},
-        {"name":"formPost","versions":[1]},
-        {"name":"songLyrics","versions":[1]},
-        {"name":"transcodeOffset","versions":[1]},
-        {"name":"indexBasedQueue","versions":[1]}
-    ]})
+async fn open_subsonic_extensions(state: &AppState) -> Value {
+    let radio_recognition = download_source_entity::Entity::find()
+        .filter(download_source_entity::Column::Kind.eq("netease"))
+        .filter(download_source_entity::Column::Enabled.eq(1))
+        .one(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let mut extensions = vec![
+        json!({"name":"apiKeyAuthentication","versions":[1]}),
+        json!({"name":"formPost","versions":[1]}),
+        json!({"name":"songLyrics","versions":[1]}),
+        json!({"name":"transcodeOffset","versions":[1]}),
+        json!({"name":"indexBasedQueue","versions":[1]}),
+    ];
+    if radio_recognition {
+        extensions.push(json!({"name":"mnestRadioRecognition","versions":[1]}));
+    }
+    json!({"openSubsonicExtensions": extensions})
 }
 
 async fn json_endpoint(
@@ -4030,7 +4043,7 @@ mod tests {
     async fn exposes_extensions_without_authentication() {
         let state = test_state().await;
         let response = request_json(
-            router().with_state(state),
+            router().with_state(state.clone()),
             "/rest/getOpenSubsonicExtensions?f=json",
         )
         .await;
@@ -4045,6 +4058,37 @@ mod tests {
         assert!(names.contains(&"apiKeyAuthentication"));
         assert!(names.contains(&"indexBasedQueue"));
         assert!(!names.contains(&"playbackReport"));
+        assert!(!names.contains(&"mnestRadioRecognition"));
+
+        let now = chrono::Utc::now().to_rfc3339();
+        download_source_entity::ActiveModel {
+            id: Set("netease-recognition".into()),
+            kind: Set("netease".into()),
+            name: Set("Netease".into()),
+            base_url: Set("https://netease.example.test".into()),
+            username: Set(String::new()),
+            password: Set(String::new()),
+            cookie: Set(String::new()),
+            account_name: Set(String::new()),
+            enabled: Set(1),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let configured = request_json(
+            router().with_state(state),
+            "/rest/getOpenSubsonicExtensions?f=json",
+        )
+        .await;
+        let configured_names = configured["subsonic-response"]["openSubsonicExtensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|extension| extension["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(configured_names.contains(&"mnestRadioRecognition"));
     }
 
     #[tokio::test]

@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 urlencoding = "2.1"
 uuid = { version = "1.17", default-features = false, features = ["v4"] }
 walkdir = "2.5"
+wasmi = { version = "1.1", default-features = false, features = ["std"] }
 
 [target.'cfg(not(target_env = "musl"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "gzip", "stream"] }
@@ -66,6 +67,7 @@ sea-orm = { version = "1.1.20", default-features = false, features = ["macros", 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+wat = "1"
 
 [profile.release]
 opt-level = "z"

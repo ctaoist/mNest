@@ -3,12 +3,13 @@ use std::{
     convert::Infallible,
     io,
     path::{Component, Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Multipart, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
@@ -28,15 +29,16 @@ use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
+    sync::Semaphore,
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
 
 use crate::{
     AppState,
     auth::{
-        AdminUser, AuthUser, authenticate_password_with_subsonic, cookie_value, decode_token,
-        decrypt_server_secret, encrypt_server_secret, issue_tokens, user_by_id,
-        web_user_from_headers,
+        AdminUser, AuthUser, authenticate_password_with_subsonic, authenticate_subsonic,
+        cookie_value, decode_token, decrypt_server_secret, encrypt_server_secret, issue_tokens,
+        user_by_id, web_user_from_headers,
     },
     entities::{app_setting, download_source, internet_radio_station, job, music_folder, track},
     internet_radio,
@@ -114,6 +116,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/remote_download/netease/audio-match/",
             post(netease_audio_match).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/remote_download/netease/audio-match/media",
+            post(netease_audio_match_media).layer(DefaultBodyLimit::max(
+                remote_download::NETEASE_AUDIO_MATCH_MEDIA_MAX_BYTES,
+            )),
         )
         .route(
             "/api/remote_download/netease/audio-match/runtime.js",
@@ -1116,6 +1124,78 @@ async fn netease_audio_match(
         .await
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Json(ApiResponse::success(matches)))
+}
+
+async fn netease_audio_match_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(parameters): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Json<ApiResponse<Vec<remote_download::NeteaseAudioMatchResult>>>, ApiError> {
+    authenticate_audio_match_request(&state, &headers, &parameters).await?;
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        != Some("application/octet-stream")
+    {
+        return Err(ApiError::bad_request(
+            "听歌识曲媒体样本必须使用 application/octet-stream",
+        ));
+    }
+    if body.is_empty() {
+        return Err(ApiError::bad_request("听歌识曲媒体样本不能为空"));
+    }
+
+    static RECOGNITION_LIMIT: OnceLock<Semaphore> = OnceLock::new();
+    let semaphore = RECOGNITION_LIMIT.get_or_init(|| Semaphore::new(2));
+    let _permit = tokio::time::timeout(Duration::from_secs(2), semaphore.acquire())
+        .await
+        .map_err(|_| ApiError::bad_request("听歌识曲任务繁忙，请稍后重试"))?
+        .map_err(|_| ApiError::bad_gateway("听歌识曲服务不可用"))?;
+    let matches = tokio::time::timeout(Duration::from_secs(60), async {
+        let source = load_netease_download_source(&state).await?;
+        let connection = remote_connection(&source);
+        let fingerprint = remote_download::netease_audio_fingerprint_from_media(
+            &state.settings.tools.ffmpeg,
+            &connection,
+            &body,
+        )
+        .await
+        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+        remote_download::netease_audio_match(
+            &connection,
+            &remote_download::NeteaseAudioMatchRequest {
+                duration: 3,
+                audio_fp: fingerprint,
+            },
+        )
+        .await
+        .map_err(|error| ApiError::bad_gateway(error.to_string()))
+    })
+    .await
+    .map_err(|_| ApiError::bad_gateway("听歌识曲处理超时"))??;
+    Ok(Json(ApiResponse::success(matches)))
+}
+
+async fn authenticate_audio_match_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    parameters: &HashMap<String, String>,
+) -> Result<(), ApiError> {
+    match web_user_from_headers(&state.db, headers, &state.settings.auth.jwt_secret).await {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(_) => return Err(ApiError::unauthorized("认证令牌无效或已过期")),
+    }
+    if authenticate_subsonic(&state.db, parameters, &state.settings.auth.jwt_secret)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(ApiError::unauthorized("缺少有效的认证信息"))
 }
 
 async fn netease_audio_match_runtime(
@@ -3210,6 +3290,37 @@ mod tests {
             download_filename_format(&state).await.unwrap(),
             "title-artist"
         );
+    }
+
+    #[tokio::test]
+    async fn media_audio_match_accepts_subsonic_api_key_authentication() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = admin.into_active_model();
+        active.subsonic_token = Set("radio-recognition-key".into());
+        active.update(&state.db).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        let error = netease_audio_match_media(
+            State(state),
+            headers,
+            Query(HashMap::from([(
+                "apiKey".into(),
+                "radio-recognition-key".into(),
+            )])),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "听歌识曲媒体样本不能为空");
     }
 
     #[tokio::test]
