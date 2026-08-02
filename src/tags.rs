@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
 use lofty::{
     config::{ParseOptions, WriteOptions},
     file::{AudioFile, TaggedFileExt},
@@ -137,6 +138,79 @@ impl TagService {
             .cover_cache
             .enabled
             .then(|| self.cover_cache_limiter.acquire());
+        self.read_artwork_cached_after_lock(path, track_id, modified)
+    }
+
+    pub fn read_artwork_cached_with_size(
+        &self,
+        path: &Path,
+        track_id: &str,
+        image_id: &str,
+        modified: i64,
+        size: Option<u32>,
+    ) -> anyhow::Result<Option<AudioArtwork>> {
+        let Some(size) = size.filter(|size| *size > 0) else {
+            return self.read_artwork_cached(path, track_id, modified);
+        };
+
+        if self.cover_cache.enabled {
+            match self.read_cached_resized_artwork(image_id, modified, size) {
+                Ok(Some(artwork)) => return Ok(Some(artwork)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%image_id, modified, size, %error, "failed to read cached resized artwork");
+                }
+            }
+        }
+
+        let _permit = self
+            .cover_cache
+            .enabled
+            .then(|| self.cover_cache_limiter.acquire());
+        if self.cover_cache.enabled {
+            match self.read_cached_resized_artwork(image_id, modified, size) {
+                Ok(Some(artwork)) => return Ok(Some(artwork)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%image_id, modified, size, %error, "failed to recheck cached resized artwork");
+                }
+            }
+        }
+
+        let Some(artwork) = self.read_artwork_cached_after_lock(path, track_id, modified)? else {
+            if self.cover_cache.enabled
+                && let Err(error) = self.remove_resized_artwork_caches(image_id)
+            {
+                tracing::warn!(%image_id, %error, "failed to remove stale resized artwork cache");
+            }
+            return Ok(None);
+        };
+
+        let resized = match resize_artwork_to_fit(&artwork, size) {
+            Ok(Some(resized)) => resized,
+            Ok(None) => return Ok(Some(artwork)),
+            Err(error) => {
+                tracing::warn!(%image_id, modified, size, %error, "failed to resize artwork; returning original");
+                return Ok(Some(artwork));
+            }
+        };
+
+        if self.cover_cache.enabled
+            && let Err(error) =
+                self.write_cached_resized_artwork(image_id, modified, size, &resized)
+        {
+            tracing::warn!(%image_id, modified, size, %error, "failed to update resized artwork cache");
+        }
+
+        Ok(Some(resized))
+    }
+
+    fn read_artwork_cached_after_lock(
+        &self,
+        path: &Path,
+        track_id: &str,
+        modified: i64,
+    ) -> anyhow::Result<Option<AudioArtwork>> {
         if self.cover_cache.enabled {
             match self.read_cached_artwork(track_id, modified) {
                 Ok(Some(artwork)) => return Ok(Some(artwork)),
@@ -193,7 +267,10 @@ impl TagService {
                 .to_str()
                 .and_then(|name| name.get(..33))
                 .is_some_and(|prefix| prefixes.contains(prefix));
-            if matches_track && path.extension().is_some_and(|value| value == "artwork") {
+            let is_artwork_cache = path
+                .extension()
+                .is_some_and(|value| value == "artwork" || value == "thumbnail");
+            if matches_track && is_artwork_cache {
                 fs::remove_file(path)?;
             }
         }
@@ -226,19 +303,33 @@ impl TagService {
         modified: i64,
     ) -> anyhow::Result<Option<AudioArtwork>> {
         let (path, _) = self.artwork_cache_entry(track_id, modified);
-        let metadata = match fs::symlink_metadata(&path) {
+        self.read_cached_artwork_file(&path)
+    }
+
+    fn read_cached_resized_artwork(
+        &self,
+        image_id: &str,
+        modified: i64,
+        size: u32,
+    ) -> anyhow::Result<Option<AudioArtwork>> {
+        let (path, _, _) = self.resized_artwork_cache_entry(image_id, modified, size);
+        self.read_cached_artwork_file(&path)
+    }
+
+    fn read_cached_artwork_file(&self, path: &Path) -> anyhow::Result<Option<AudioArtwork>> {
+        let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_file() => metadata,
             Ok(_) => return Ok(None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         if metadata.len() == 0 || metadata.len() > MAX_CACHED_ARTWORK_BYTES {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path);
             return Ok(None);
         }
-        let data = fs::read(&path)?;
+        let data = fs::read(path)?;
         let Some(mime_type) = detect_artwork_mime(&data) else {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path);
             return Ok(None);
         };
         Ok(Some(AudioArtwork {
@@ -266,9 +357,37 @@ impl TagService {
         Ok(())
     }
 
+    fn write_cached_resized_artwork(
+        &self,
+        image_id: &str,
+        modified: i64,
+        size: u32,
+        artwork: &AudioArtwork,
+    ) -> anyhow::Result<()> {
+        let (path, image_prefix, version_prefix) =
+            self.resized_artwork_cache_entry(image_id, modified, size);
+        fs::create_dir_all(&self.cover_cache.path)?;
+        if artwork.data.len() as u64 <= MAX_CACHED_ARTWORK_BYTES
+            && detect_artwork_mime(&artwork.data).is_some()
+        {
+            atomic_write(&path, &artwork.data, false)?;
+            self.prune_resized_artwork_cache(&image_prefix, Some(&version_prefix));
+        } else {
+            self.prune_resized_artwork_cache(&image_prefix, None);
+        }
+        Ok(())
+    }
+
     fn remove_stale_artwork_cache(&self, track_id: &str) -> anyhow::Result<()> {
         let prefix = self.artwork_cache_prefix(track_id);
         self.prune_artwork_cache(&prefix, None);
+        self.remove_resized_artwork_caches(track_id)?;
+        Ok(())
+    }
+
+    fn remove_resized_artwork_caches(&self, image_id: &str) -> anyhow::Result<()> {
+        let prefix = self.artwork_cache_prefix(image_id);
+        self.prune_resized_artwork_cache(&prefix, None);
         Ok(())
     }
 
@@ -287,6 +406,24 @@ impl TagService {
         format!("{}-", hex::encode(Md5::digest(track_id.as_bytes())))
     }
 
+    fn resized_artwork_cache_entry(
+        &self,
+        image_id: &str,
+        modified: i64,
+        size: u32,
+    ) -> (PathBuf, String, String) {
+        let image_prefix = self.artwork_cache_prefix(image_id);
+        let version = hex::encode(Md5::digest(format!("{image_id}:{modified}").as_bytes()));
+        let version_prefix = format!("{image_prefix}{version}-");
+        (
+            self.cover_cache
+                .path
+                .join(format!("{version_prefix}{size}.thumbnail")),
+            image_prefix,
+            version_prefix,
+        )
+    }
+
     fn prune_artwork_cache(&self, prefix: &str, keep: Option<&Path>) {
         let Ok(entries) = fs::read_dir(&self.cover_cache.path) else {
             return;
@@ -298,6 +435,28 @@ impl TagService {
                 .to_str()
                 .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".artwork"));
             if matches_source && keep.is_none_or(|keep| keep != path) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    fn prune_resized_artwork_cache(&self, image_prefix: &str, keep_version: Option<&str>) {
+        let Ok(entries) = fs::read_dir(&self.cover_cache.path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let matches_source = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(image_prefix) && name.ends_with(".thumbnail"));
+            let keep = keep_version.is_some_and(|version| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(version))
+            });
+            if matches_source && !keep {
                 let _ = fs::remove_file(path);
             }
         }
@@ -663,6 +822,56 @@ fn decode_image(value: &str) -> anyhow::Result<(String, Vec<u8>)> {
     Ok((mime.to_owned(), data))
 }
 
+fn resize_artwork_to_fit(
+    artwork: &AudioArtwork,
+    requested_size: u32,
+) -> anyhow::Result<Option<AudioArtwork>> {
+    let Some(format) = resizeable_artwork_format(&artwork.mime_type) else {
+        return Ok(None);
+    };
+    let original = image::load_from_memory_with_format(&artwork.data, format)
+        .context("failed to decode artwork for resizing")?;
+    let (width, height) = original.dimensions();
+    let original_size = width.max(height);
+    if original_size == 0 {
+        bail!("artwork has invalid dimensions");
+    }
+    if requested_size >= original_size {
+        return Ok(Some(artwork.clone()));
+    }
+
+    let (target_width, target_height) = if width >= height {
+        (
+            requested_size,
+            ((u64::from(height) * u64::from(requested_size)) / u64::from(width)).max(1) as u32,
+        )
+    } else {
+        (
+            ((u64::from(width) * u64::from(requested_size)) / u64::from(height)).max(1) as u32,
+            requested_size,
+        )
+    };
+    let resized: DynamicImage =
+        original.resize_exact(target_width, target_height, FilterType::CatmullRom);
+    let mut encoded = io::Cursor::new(Vec::new());
+    resized
+        .write_to(&mut encoded, format)
+        .context("failed to encode resized artwork")?;
+    Ok(Some(AudioArtwork {
+        mime_type: artwork.mime_type.clone(),
+        data: encoded.into_inner(),
+    }))
+}
+
+fn resizeable_artwork_format(mime_type: &str) -> Option<ImageFormat> {
+    match mime_type {
+        "image/jpeg" => Some(ImageFormat::Jpeg),
+        "image/png" => Some(ImageFormat::Png),
+        "image/webp" => Some(ImageFormat::WebP),
+        _ => None,
+    }
+}
+
 pub fn detect_artwork_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
@@ -900,6 +1109,44 @@ mod tests {
         );
     }
 
+    fn encoded_artwork(
+        width: u32,
+        height: u32,
+        format: ImageFormat,
+        mime_type: &str,
+    ) -> AudioArtwork {
+        let image = DynamicImage::new_rgb8(width, height);
+        let mut data = io::Cursor::new(Vec::new());
+        image.write_to(&mut data, format).unwrap();
+        AudioArtwork {
+            mime_type: mime_type.into(),
+            data: data.into_inner(),
+        }
+    }
+
+    fn png_artwork(width: u32, height: u32) -> AudioArtwork {
+        encoded_artwork(width, height, ImageFormat::Png, "image/png")
+    }
+
+    #[test]
+    fn resizes_artwork_by_its_longest_edge_without_upscaling() {
+        for (format, mime_type) in [
+            (ImageFormat::Jpeg, "image/jpeg"),
+            (ImageFormat::Png, "image/png"),
+            (ImageFormat::WebP, "image/webp"),
+        ] {
+            let landscape = encoded_artwork(400, 200, format, mime_type);
+            let resized = resize_artwork_to_fit(&landscape, 100).unwrap().unwrap();
+            let decoded = image::load_from_memory(&resized.data).unwrap();
+            assert_eq!(decoded.dimensions(), (100, 50));
+            assert_eq!(resized.mime_type, mime_type);
+        }
+
+        let smaller = png_artwork(40, 20);
+        let unchanged = resize_artwork_to_fit(&smaller, 100).unwrap().unwrap();
+        assert_eq!(unchanged.data, smaller.data);
+    }
+
     #[test]
     fn marks_audio_with_any_required_metadata_missing() {
         let complete = AudioMetadata {
@@ -1012,5 +1259,57 @@ mod tests {
 
         service.remove_stale_artwork_cache("track-1").unwrap();
         assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn caches_resized_artwork_by_image_id_mtime_and_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("covers");
+        let service = TagService::with_cover_cache(
+            ToolSettings::default(),
+            CoverCacheSettings {
+                enabled: true,
+                path: cache.clone(),
+                concurrency: 2,
+            },
+        );
+        let artwork = png_artwork(100, 50);
+
+        service
+            .write_cached_resized_artwork("img-album-1", 100, 100, &artwork)
+            .unwrap();
+        service
+            .write_cached_resized_artwork("img-album-1", 100, 200, &artwork)
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 2);
+        assert!(
+            service
+                .read_cached_resized_artwork("img-album-1", 100, 100)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            service
+                .read_cached_resized_artwork("img-album-1", 100, 300)
+                .unwrap()
+                .is_none()
+        );
+
+        service
+            .write_cached_resized_artwork("img-album-1", 101, 100, &artwork)
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        assert!(
+            service
+                .read_cached_resized_artwork("img-album-1", 100, 200)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            service
+                .read_cached_resized_artwork("img-album-1", 101, 100)
+                .unwrap()
+                .is_some()
+        );
     }
 }

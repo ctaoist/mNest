@@ -579,6 +579,10 @@ async fn binary_endpoint(
         "getCoverArt" => {
             let id = required_anyhow(p, "id")?;
             let image_id = id.strip_prefix("img-").context("invalid cover art id")?;
+            let requested_size = p
+                .get("size")
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|size| *size > 0);
             let source = if album_entity::Entity::find_by_id(image_id)
                 .one(&state.db)
                 .await?
@@ -598,11 +602,14 @@ async fn binary_endpoint(
                     .context("track cover source not found")?
             };
             let tags = state.tags.clone();
+            let artwork_id = id.to_owned();
             let artwork = tokio::task::spawn_blocking(move || {
-                tags.read_artwork_cached(
+                tags.read_artwork_cached_with_size(
                     std::path::Path::new(&source.path),
                     &source.id,
+                    &artwork_id,
                     source.mtime,
+                    requested_size,
                 )
             })
             .await??
