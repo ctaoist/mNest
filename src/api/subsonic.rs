@@ -226,6 +226,11 @@ async fn dispatch(
     .await
     .ok()
     .flatten();
+    let if_none_match = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let mut params = match collect_params(request).await {
         Ok(value) => value,
         Err(error) => return subsonic_error(&HashMap::new(), 10, &error.to_string()),
@@ -265,7 +270,8 @@ async fn dispatch(
     };
 
     if matches!(method, "stream" | "download" | "getCoverArt" | "getAvatar") {
-        return match binary_endpoint(&state, &user, method, &params).await {
+        return match binary_endpoint(&state, &user, method, &params, if_none_match.as_deref()).await
+        {
             Ok(response) => response,
             Err(error) => subsonic_error(&params, 70, &error.to_string()),
         };
@@ -540,6 +546,7 @@ async fn binary_endpoint(
     _user: &User,
     method: &str,
     p: &HashMap<String, String>,
+    if_none_match: Option<&str>,
 ) -> anyhow::Result<Response> {
     match method {
         "stream" | "download" => {
@@ -601,6 +608,18 @@ async fn binary_endpoint(
                     .await?
                     .context("track cover source not found")?
             };
+            let etag = cover_art_etag(&source.id, source.mtime, requested_size);
+            if if_none_match.is_some_and(|value| if_none_match_matches(value, &etag)) {
+                let mut response = StatusCode::NOT_MODIFIED.into_response();
+                response
+                    .headers_mut()
+                    .insert(header::ETAG, HeaderValue::from_str(&etag)?);
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(crate::tags::ARTWORK_CACHE_CONTROL),
+                );
+                return Ok(response);
+            }
             let tags = state.tags.clone();
             let artwork_id = id.to_owned();
             let artwork = tokio::task::spawn_blocking(move || {
@@ -625,6 +644,7 @@ async fn binary_endpoint(
                         header::HeaderName::from_static("x-content-type-options"),
                         "nosniff".to_owned(),
                     ),
+                    (header::ETAG, etag),
                 ],
                 artwork.data,
             )
@@ -650,6 +670,22 @@ async fn binary_endpoint(
         }
         _ => anyhow::bail!("unsupported binary endpoint"),
     }
+}
+
+fn cover_art_etag(source_id: &str, modified: i64, requested_size: Option<u32>) -> String {
+    let requested_size = requested_size
+        .map(|size| size.to_string())
+        .unwrap_or_else(|| "original".to_owned());
+    let digest =
+        Md5::digest(format!("cover-v1:{source_id}:{modified}:{requested_size}").as_bytes());
+    format!("W/\"{}\"", hex::encode(digest))
+}
+
+fn if_none_match_matches(value: &str, etag: &str) -> bool {
+    let etag = etag.strip_prefix("W/").unwrap_or(etag);
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
 }
 
 async fn music_folders(state: &AppState) -> Result<Value, ApiFailure> {
@@ -3782,6 +3818,68 @@ mod tests {
         assert_eq!(parse_range("bytes=10-19", 100), Some((10, 19)));
         assert_eq!(parse_range("bytes=90-", 100), Some((90, 99)));
         assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+    }
+
+    #[test]
+    fn cover_art_etags_track_the_source_version_and_requested_size() {
+        let original = cover_art_etag("track-1", 123, None);
+
+        assert!(original.starts_with("W/\""));
+        assert!(original.ends_with('"'));
+        assert_eq!(original, cover_art_etag("track-1", 123, None));
+        assert_ne!(original, cover_art_etag("track-1", 124, None));
+        assert_ne!(original, cover_art_etag("track-2", 123, None));
+        assert_ne!(original, cover_art_etag("track-1", 123, Some(300)));
+    }
+
+    #[test]
+    fn matches_weak_and_strong_if_none_match_values() {
+        let etag = cover_art_etag("track-1", 123, Some(300));
+        let strong_etag = etag.strip_prefix("W/").unwrap();
+
+        assert!(if_none_match_matches(&etag, &etag));
+        assert!(if_none_match_matches(strong_etag, &etag));
+        assert!(if_none_match_matches(
+            &format!("\"unrelated\", {strong_etag}"),
+            &etag
+        ));
+        assert!(if_none_match_matches("*", &etag));
+        assert!(!if_none_match_matches("\"unrelated\"", &etag));
+    }
+
+    #[tokio::test]
+    async fn matching_cover_art_etag_returns_not_modified_without_reading_the_file() {
+        let state = test_state().await;
+        let mut track = test_track();
+        track.mtime = 123;
+        track.into_active_model().insert(&state.db).await.unwrap();
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let params = HashMap::from([
+            ("id".to_owned(), "img-track-1".to_owned()),
+            ("size".to_owned(), "300".to_owned()),
+        ]);
+        let etag = cover_art_etag("track-1", 123, Some(300));
+
+        let response = binary_endpoint(&state, &user, "getCoverArt", &params, Some(&etag))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), &etag);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            crate::tags::ARTWORK_CACHE_CONTROL
+        );
+        assert!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
