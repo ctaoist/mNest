@@ -20,9 +20,9 @@ use md5::{Digest, Md5};
 use rand_core::OsRng;
 use reqwest::Url;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, FromQueryResult, IntoActiveModel,
-    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
-    sea_query::{Expr, Order},
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, FromQueryResult,
+    IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
+    sea_query::{Expr, OnConflict, Order},
 };
 use serde_json::{Map, Value, json};
 use tokio::{
@@ -45,6 +45,7 @@ use crate::{
         playlist as playlist_entity, playlist_track as playlist_track_entity,
         rating as rating_entity, scrobble as scrobble_entity, share as share_entity,
         track as track_entity, track_artist as track_artist_entity, user as user_entity,
+        user_track_stat as user_track_stat_entity,
     },
     internet_radio,
     jobs::{self, ScanPayload},
@@ -452,7 +453,7 @@ async fn json_endpoint(
     method: &str,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
-    match method {
+    let mut value = match method {
         "ping" => Ok(json!({})),
         "getLicense" => Ok(
             json!({"license":{"valid":true,"email":user.email,"licenseExpires":"2099-12-31T23:59:59.000Z"}}),
@@ -538,6 +539,77 @@ async fn json_endpoint(
             0,
             format!("Endpoint {method} is not implemented"),
         )),
+    }?;
+    apply_user_play_counts(state, user, &mut value).await?;
+    Ok(value)
+}
+
+async fn apply_user_play_counts(
+    state: &AppState,
+    user: &User,
+    value: &mut Value,
+) -> Result<(), ApiFailure> {
+    let mut track_ids = HashSet::new();
+    collect_track_json_ids(value, &mut track_ids);
+    if track_ids.is_empty() {
+        return Ok(());
+    }
+    let counts = user_track_stat_entity::Entity::find()
+        .filter(user_track_stat_entity::Column::UserId.eq(&user.id))
+        .filter(user_track_stat_entity::Column::TrackId.is_in(track_ids))
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|row| (row.track_id, row.play_count))
+        .collect::<HashMap<_, _>>();
+    set_track_json_play_counts(value, &counts);
+    Ok(())
+}
+
+fn collect_track_json_ids(value: &Value, track_ids: &mut HashSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_track_json_ids(value, track_ids);
+            }
+        }
+        Value::Object(fields) => {
+            if fields.get("isDir").and_then(Value::as_bool) == Some(false)
+                && fields.contains_key("playCount")
+                && let Some(id) = fields.get("id").and_then(Value::as_str)
+            {
+                track_ids.insert(id.to_owned());
+            }
+            for value in fields.values() {
+                collect_track_json_ids(value, track_ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn set_track_json_play_counts(value: &mut Value, counts: &HashMap<String, i64>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                set_track_json_play_counts(value, counts);
+            }
+        }
+        Value::Object(fields) => {
+            if fields.get("isDir").and_then(Value::as_bool) == Some(false)
+                && fields.contains_key("playCount")
+                && let Some(id) = fields.get("id").and_then(Value::as_str)
+            {
+                fields.insert(
+                    "playCount".to_owned(),
+                    json!(counts.get(id).copied().unwrap_or(0)),
+                );
+            }
+            for value in fields.values_mut() {
+                set_track_json_play_counts(value, counts);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1978,6 +2050,20 @@ async fn scrobble(
         .into_iter()
         .map(|track| (track.id.clone(), track))
         .collect::<HashMap<_, _>>();
+    let mut submitted = HashMap::<String, (i64, String)>::new();
+    if submission {
+        for (id, (played_at, _)) in ids.iter().zip(&played_times) {
+            submitted
+                .entry(id.clone())
+                .and_modify(|(count, latest)| {
+                    *count += 1;
+                    if played_at > latest {
+                        latest.clone_from(played_at);
+                    }
+                })
+                .or_insert_with(|| (1, played_at.clone()));
+        }
+    }
     let transaction = state.db.begin().await?;
     for (id, (played_at, _)) in ids.iter().zip(&played_times) {
         scrobble_entity::ActiveModel {
@@ -1989,16 +2075,17 @@ async fn scrobble(
         }
         .insert(&transaction)
         .await?;
-        if submission {
-            track_entity::Entity::update_many()
-                .col_expr(
-                    track_entity::Column::PlayCount,
-                    Expr::col(track_entity::Column::PlayCount).add(1),
-                )
-                .filter(track_entity::Column::Id.eq(id))
-                .exec(&transaction)
-                .await?;
-        }
+    }
+    for (id, (count, last_played_at)) in submitted {
+        track_entity::Entity::update_many()
+            .col_expr(
+                track_entity::Column::PlayCount,
+                Expr::col(track_entity::Column::PlayCount).add(count),
+            )
+            .filter(track_entity::Column::Id.eq(&id))
+            .exec(&transaction)
+            .await?;
+        increment_user_track_stats(&transaction, &user.id, &id, count, &last_played_at).await?;
     }
     transaction.commit().await?;
     let reports = ids
@@ -2014,6 +2101,49 @@ async fn scrobble(
         }
     });
     Ok(json!({}))
+}
+
+async fn increment_user_track_stats(
+    db: &DatabaseTransaction,
+    user_id: &str,
+    track_id: &str,
+    count: i64,
+    last_played_at: &str,
+) -> Result<(), sea_orm::DbErr> {
+    if count <= 0 {
+        return Ok(());
+    }
+    user_track_stat_entity::Entity::insert(user_track_stat_entity::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        track_id: Set(track_id.to_owned()),
+        play_count: Set(count),
+        last_played_at: Set(last_played_at.to_owned()),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            user_track_stat_entity::Column::UserId,
+            user_track_stat_entity::Column::TrackId,
+        ])
+        .value(
+            user_track_stat_entity::Column::PlayCount,
+            Expr::col((
+                user_track_stat_entity::Entity,
+                user_track_stat_entity::Column::PlayCount,
+            ))
+            .add(count),
+        )
+        .value(
+            user_track_stat_entity::Column::LastPlayedAt,
+            Expr::cust(
+                "CASE WHEN user_track_stats.last_played_at >= excluded.last_played_at \
+                 THEN user_track_stats.last_played_at ELSE excluded.last_played_at END",
+            ),
+        )
+        .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await?;
+    Ok(())
 }
 
 async fn shares(state: &AppState, user: &User) -> Result<Value, ApiFailure> {
@@ -2340,6 +2470,10 @@ async fn delete_user(
         .await?;
     scrobble_entity::Entity::delete_many()
         .filter(scrobble_entity::Column::UserId.eq(&user.id))
+        .exec(&transaction)
+        .await?;
+    user_track_stat_entity::Entity::delete_many()
+        .filter(user_track_stat_entity::Column::UserId.eq(&user.id))
         .exec(&transaction)
         .await?;
     share_entity::Entity::delete_many()
@@ -4087,6 +4221,73 @@ mod tests {
                 .iter()
                 .all(|artist| artist["coverArt"] == "img-album-1")
         );
+    }
+
+    #[tokio::test]
+    async fn formal_scrobbles_update_and_return_the_authenticated_users_play_count() {
+        let state = test_state().await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        test_track()
+            .into_active_model()
+            .insert(&state.db)
+            .await
+            .unwrap();
+
+        scrobble(
+            &state,
+            &user,
+            &HashMap::from([
+                ("id".into(), "track-1".into()),
+                ("submission".into(), "false".into()),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            user_track_stat_entity::Entity::find()
+                .one(&state.db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        scrobble(
+            &state,
+            &user,
+            &HashMap::from([("id".into(), "track-1,track-1".into())]),
+        )
+        .await
+        .unwrap();
+        let stats = user_track_stat_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.user_id, user.id);
+        assert_eq!(stats.play_count, 2);
+
+        let mut track = track_entity::Entity::find_by_id("track-1")
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        track.play_count = Set(99);
+        track.update(&state.db).await.unwrap();
+        let response = json_endpoint(
+            &state,
+            &user,
+            "getSong",
+            &HashMap::from([("id".into(), "track-1".into())]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["song"]["playCount"], 2);
     }
 
     #[test]

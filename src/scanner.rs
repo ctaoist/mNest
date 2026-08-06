@@ -17,7 +17,7 @@ use crate::{
     artist_credit,
     entities::{
         album, artist, bookmark, favorite, music_folder, play_queue, playlist_track, rating,
-        scrobble, share, track, track_artist,
+        scrobble, share, track, track_artist, user_track_stat,
     },
     models::MusicFolder,
     tags::{AUDIO_EXTENSIONS, TagService},
@@ -460,6 +460,10 @@ pub(crate) async fn remove_track_records(
             .filter(scrobble::Column::TrackId.is_in(chunk.clone()))
             .exec(&transaction)
             .await?;
+        user_track_stat::Entity::delete_many()
+            .filter(user_track_stat::Column::TrackId.is_in(chunk.clone()))
+            .exec(&transaction)
+            .await?;
         favorite::Entity::delete_many()
             .filter(favorite::Column::ItemType.eq("track"))
             .filter(favorite::Column::ItemId.is_in(chunk.clone()))
@@ -812,6 +816,15 @@ mod tests {
         .insert(&db)
         .await
         .unwrap();
+        user_track_stat::ActiveModel {
+            user_id: Set("user".into()),
+            track_id: Set(track_id.clone()),
+            play_count: Set(1),
+            last_played_at: Set(now.clone()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
         play_queue::ActiveModel {
             user_id: Set("user".into()),
             track_ids: Set(serde_json::to_string(&[&track_id]).unwrap()),
@@ -856,6 +869,13 @@ mod tests {
         assert!(rating::Entity::find().one(&db).await.unwrap().is_none());
         assert!(bookmark::Entity::find().one(&db).await.unwrap().is_none());
         assert!(scrobble::Entity::find().one(&db).await.unwrap().is_none());
+        assert!(
+            user_track_stat::Entity::find()
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let queue = play_queue::Entity::find().one(&db).await.unwrap().unwrap();
         assert_eq!(queue.track_ids, "[]");
         assert_eq!(queue.current_id, None);

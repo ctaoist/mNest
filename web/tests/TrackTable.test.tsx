@@ -26,8 +26,8 @@ class MockAudio extends EventTarget {
 }
 
 const tracks: Track[] = [
-  { id: 'track-1', title: '夜航', artists: [{ id: 'artist-1', name: '测试艺术家' }, { id: 'artist-2', name: '合作歌手' }], album: '远方', albumId: 'album-1', duration: 180 },
-  { id: 'track-2', title: '晨雾', artists: [{ id: 'artist-1', name: '测试艺术家' }], album: '远方', albumId: 'album-1', duration: 210 },
+  { id: 'track-1', title: '夜航', artists: [{ id: 'artist-1', name: '测试艺术家' }, { id: 'artist-2', name: '合作歌手' }], album: '远方', albumId: 'album-1', duration: 180, playCount: 12 },
+  { id: 'track-2', title: '晨雾', artists: [{ id: 'artist-1', name: '测试艺术家' }], album: '远方', albumId: 'album-1', duration: 210, playCount: 3 },
 ]
 
 function QueueState() {
@@ -108,7 +108,10 @@ describe('TrackTable', () => {
     ))
 
     expect(screen.getByRole('button', { name: '按标题降序排序' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByLabelText('夜航 播放次数')).toHaveTextContent('12')
     await fireEvent.click(screen.getByRole('button', { name: '按艺术家升序排序' }))
     expect(onSort).toHaveBeenCalledWith('artist')
+    await fireEvent.click(screen.getByRole('button', { name: '按播放次数升序排序' }))
+    expect(onSort).toHaveBeenCalledWith('playCount')
   })
 })

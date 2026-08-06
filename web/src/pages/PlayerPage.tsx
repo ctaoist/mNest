@@ -100,7 +100,7 @@ export function PlayerPage() {
       setSongSortDirection((direction) => direction === 'asc' ? 'desc' : 'asc')
     } else {
       setSongSortKey(key)
-      setSongSortDirection('asc')
+      setSongSortDirection(key === 'playCount' ? 'desc' : 'asc')
     }
     setSongPage(1)
   }

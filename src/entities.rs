@@ -370,6 +370,23 @@ pub mod scrobble {
     empty_relation!();
 }
 
+pub mod user_track_stat {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "user_track_stats")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub user_id: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub track_id: String,
+        pub play_count: i64,
+        pub last_played_at: String,
+    }
+
+    empty_relation!();
+}
+
 pub mod schema_migration {
     use super::*;
 

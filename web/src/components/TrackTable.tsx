@@ -34,6 +34,7 @@ export function TrackTable(props: TrackTableProps) {
           <TrackHeaderButton class="track-header-artist" label="艺术家" sortKey="artist" activeKey={props.sortKey} direction={props.sortDirection} onSort={props.onSort} />
           <TrackHeaderButton class="track-header-album" label="专辑" sortKey="album" activeKey={props.sortKey} direction={props.sortDirection} onSort={props.onSort} />
           <TrackHeaderButton class="track-header-kind" label="类型" sortKey="kind" activeKey={props.sortKey} direction={props.sortDirection} onSort={props.onSort} />
+          <TrackHeaderButton class="track-header-play-count" label="播放次数" sortKey="playCount" activeKey={props.sortKey} direction={props.sortDirection} onSort={props.onSort} />
           <TrackHeaderButton class="track-header-duration" label="时长" sortKey="duration" activeKey={props.sortKey} direction={props.sortDirection} onSort={props.onSort} />
           <span class="track-header-actions">操作</span>
         </div>
@@ -65,6 +66,7 @@ export function TrackTable(props: TrackTableProps) {
               </span>
               <button class="track-link track-album" disabled={!props.onAlbum || !track.albumId} onClick={() => props.onAlbum?.(track)} aria-label={`查看专辑 ${track.album || '未知专辑'}`}>{track.album || '未知专辑'}</button>
               <span class="track-meta">{track.genre || track.suffix?.toUpperCase() || '音乐'}</span>
+              <span class="track-play-count" aria-label={`${track.title} 播放次数`}>{(track.playCount ?? 0).toLocaleString('zh-CN')}</span>
               <span class="track-duration">{formatDuration(track.duration)}</span>
               <div class="track-actions">
                 <Show when={props.onFavorite}>

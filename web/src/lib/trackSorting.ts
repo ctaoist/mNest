@@ -1,6 +1,6 @@
 import type { Track } from '../types'
 
-export type TrackSortKey = 'title' | 'artist' | 'album' | 'kind' | 'duration'
+export type TrackSortKey = 'title' | 'artist' | 'album' | 'kind' | 'playCount' | 'duration'
 export type TrackSortDirection = 'asc' | 'desc'
 
 const collator = new Intl.Collator('zh-CN', {
@@ -18,6 +18,8 @@ function trackSortValue(track: Track, key: TrackSortKey): string | number {
       return track.album.trim()
     case 'kind':
       return (track.genre || track.suffix || '').trim()
+    case 'playCount':
+      return track.playCount ?? 0
     case 'duration':
       return track.duration
   }

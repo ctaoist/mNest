@@ -7,7 +7,7 @@ use sea_orm::{
 
 use crate::entities::schema_migration;
 
-pub(crate) const BASELINE: &str = "baseline-2";
+pub(crate) const BASELINE: &str = "baseline-3";
 
 pub async fn run(db: &DatabaseConnection) -> anyhow::Result<()> {
     create_schema_migrations(db).await?;
@@ -15,6 +15,7 @@ pub async fn run(db: &DatabaseConnection) -> anyhow::Result<()> {
     if !applied(db, BASELINE).await? {
         let transaction = db.begin().await?;
         create_baseline(&transaction).await?;
+        backfill_user_track_stats(&transaction).await?;
         record(&transaction, BASELINE).await?;
         remove_non_baseline_versions(&transaction).await?;
         transaction.commit().await?;
@@ -259,6 +260,15 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         .col(bigint_default("submission", 0));
     execute(db, scrobbles).await?;
 
+    let mut user_track_stats = create_table("user_track_stats");
+    user_track_stats
+        .col(required_text("user_id"))
+        .col(required_text("track_id"))
+        .col(bigint_default("play_count", 0))
+        .col(required_text("last_played_at"))
+        .primary_key(Index::create().col(alias("user_id")).col(alias("track_id")));
+    execute(db, user_track_stats).await?;
+
     let mut track_artists = create_table("track_artists");
     track_artists
         .col(required_text("track_id"))
@@ -327,10 +337,34 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
             "download_sources",
             &["kind", "enabled"][..],
         ),
+        (
+            "idx_user_track_stats_track",
+            "user_track_stats",
+            &["track_id"][..],
+        ),
     ] {
         create_index(db, name, table, columns, false).await?;
     }
 
+    Ok(())
+}
+
+async fn backfill_user_track_stats<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    let sql = match db.get_database_backend() {
+        DbBackend::Sqlite => {
+            "INSERT OR IGNORE INTO user_track_stats(user_id,track_id,play_count,last_played_at) \
+             SELECT user_id,track_id,COUNT(*),MAX(played_at) FROM scrobbles \
+             WHERE submission=1 GROUP BY user_id,track_id"
+        }
+        DbBackend::Postgres => {
+            "INSERT INTO user_track_stats(user_id,track_id,play_count,last_played_at) \
+             SELECT user_id,track_id,COUNT(*),MAX(played_at) FROM scrobbles \
+             WHERE submission=1 GROUP BY user_id,track_id \
+             ON CONFLICT(user_id,track_id) DO NOTHING"
+        }
+        other => anyhow::bail!("unsupported database backend: {other:?}"),
+    };
+    db.execute_unprepared(sql).await?;
     Ok(())
 }
 

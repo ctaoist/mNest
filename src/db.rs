@@ -182,7 +182,9 @@ mod tests {
 
     use super::*;
     use crate::config::{AdminSettings, DatabaseSettings};
-    use crate::entities::{app_setting, download_source, schema_migration};
+    use crate::entities::{
+        app_setting, download_source, schema_migration, scrobble, user_track_stat,
+    };
 
     #[tokio::test]
     async fn migrates_and_bootstraps_admin_once() {
@@ -278,6 +280,59 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn backfills_user_track_stats_when_upgrading_the_baseline() {
+        let db = connect(&DatabaseSettings {
+            driver: "sqlite".into(),
+            url: "sqlite::memory:".into(),
+            max_connections: 1,
+        })
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        scrobble::ActiveModel {
+            id: Set("play-1".into()),
+            user_id: Set("user-1".into()),
+            track_id: Set("track-1".into()),
+            played_at: Set("2026-08-02T00:00:00+00:00".into()),
+            submission: Set(1),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        scrobble::ActiveModel {
+            id: Set("now-playing".into()),
+            user_id: Set("user-1".into()),
+            track_id: Set("track-1".into()),
+            played_at: Set("2026-08-03T00:00:00+00:00".into()),
+            submission: Set(0),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        schema_migration::Entity::delete_by_id(migrations::BASELINE)
+            .exec(&db)
+            .await
+            .unwrap();
+        schema_migration::ActiveModel {
+            version: Set("baseline-2".into()),
+            applied_at: Set(Utc::now().to_rfc3339()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        let stats = user_track_stat::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.play_count, 1);
+        assert_eq!(stats.last_played_at, "2026-08-02T00:00:00+00:00");
     }
 
     #[tokio::test]
