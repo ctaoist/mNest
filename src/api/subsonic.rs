@@ -35,17 +35,21 @@ use uuid::Uuid;
 use crate::{
     AppState,
     artist_credit::{ArtistCredit, parse_artist_names},
-    auth::{authenticate_subsonic, encrypt_subsonic_password, user_by_name, web_user_from_headers},
+    auth::{
+        authenticate_subsonic, encrypt_subsonic_password, protect_subsonic_api_key, user_by_name,
+        web_user_from_headers,
+    },
     db,
     entities::{
         album as album_entity, artist as artist_entity, bookmark as bookmark_entity,
         download_source as download_source_entity, favorite as favorite_entity,
         internet_radio_station as radio_entity, job as job_entity,
         music_folder as music_folder_entity, play_queue as play_queue_entity,
-        playlist as playlist_entity, playlist_track as playlist_track_entity,
-        rating as rating_entity, scrobble as scrobble_entity, share as share_entity,
-        track as track_entity, track_artist as track_artist_entity, user as user_entity,
-        user_track_stat as user_track_stat_entity,
+        playback_state as playback_state_entity, playlist as playlist_entity,
+        playlist_track as playlist_track_entity, rating as rating_entity,
+        scrobble as scrobble_entity, share as share_entity, track as track_entity,
+        track_artist as track_artist_entity, user as user_entity,
+        user_subsonic_access as access_entity, user_track_stat as user_track_stat_entity,
     },
     internet_radio,
     jobs::{self, ScanPayload},
@@ -66,10 +70,103 @@ struct ArtistCoverRow {
     album_id: Option<String>,
 }
 
+#[derive(FromQueryResult)]
+struct ArtistStatsRow {
+    artist_id: String,
+    album_count: i64,
+    song_count: i64,
+}
+
+#[derive(FromQueryResult)]
+struct AlbumStatsRow {
+    album_id: String,
+    song_count: i64,
+    duration: f64,
+}
+
 const API_VERSION: &str = "1.16.1";
 const XML_NAMESPACE: &str = "http://subsonic.org/restapi";
 const MAX_COLLECTION_ITEMS: usize = 10_000;
 const MAX_SCROBBLE_BATCH: usize = 1_000;
+const MAX_CATALOG_MUTATION_ITEMS: usize = 1_000;
+
+#[derive(Clone, Debug)]
+struct SubsonicAccess {
+    ldap_authenticated: bool,
+    settings_role: bool,
+    stream_role: bool,
+    jukebox_role: bool,
+    download_role: bool,
+    upload_role: bool,
+    playlist_role: bool,
+    cover_art_role: bool,
+    comment_role: bool,
+    podcast_role: bool,
+    share_role: bool,
+    video_conversion_role: bool,
+    max_bit_rate: i64,
+    folder_ids: Option<HashSet<String>>,
+}
+
+impl SubsonicAccess {
+    fn fallback(user: &User) -> Self {
+        let admin = user.role == "admin";
+        Self {
+            ldap_authenticated: false,
+            settings_role: admin,
+            stream_role: true,
+            jukebox_role: false,
+            download_role: true,
+            upload_role: admin,
+            playlist_role: true,
+            cover_art_role: true,
+            comment_role: true,
+            podcast_role: false,
+            share_role: true,
+            video_conversion_role: false,
+            max_bit_rate: 0,
+            folder_ids: None,
+        }
+    }
+
+    fn from_model(model: access_entity::Model) -> Self {
+        Self {
+            ldap_authenticated: model.ldap_authenticated != 0,
+            settings_role: model.settings_role != 0,
+            stream_role: model.stream_role != 0,
+            jukebox_role: model.jukebox_role != 0,
+            download_role: model.download_role != 0,
+            upload_role: model.upload_role != 0,
+            playlist_role: model.playlist_role != 0,
+            cover_art_role: model.cover_art_role != 0,
+            comment_role: model.comment_role != 0,
+            podcast_role: model.podcast_role != 0,
+            share_role: model.share_role != 0,
+            video_conversion_role: model.video_conversion_role != 0,
+            max_bit_rate: model.max_bit_rate,
+            folder_ids: (model.folder_ids != "*").then(|| {
+                serde_json::from_str::<Vec<String>>(&model.folder_ids)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            }),
+        }
+    }
+
+    fn allows_folder(&self, folder_id: &str) -> bool {
+        self.folder_ids
+            .as_ref()
+            .is_none_or(|folder_ids| folder_ids.contains(folder_id))
+    }
+}
+
+async fn subsonic_access(state: &AppState, user: &User) -> Result<SubsonicAccess, ApiFailure> {
+    Ok(access_entity::Entity::find_by_id(&user.id)
+        .one(&state.db)
+        .await?
+        .map(SubsonicAccess::from_model)
+        .unwrap_or_else(|| SubsonicAccess::fallback(user)))
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -192,21 +289,54 @@ async fn shared_tracks(
     state: &AppState,
     share: &share_entity::Model,
 ) -> Result<Vec<Track>, sea_orm::DbErr> {
+    let owner = user_entity::Entity::find_by_id(&share.user_id)
+        .one(&state.db)
+        .await?;
+    let access = if let Some(owner) = owner {
+        access_entity::Entity::find_by_id(&owner.id)
+            .one(&state.db)
+            .await?
+            .map(SubsonicAccess::from_model)
+            .unwrap_or_else(|| SubsonicAccess::fallback(&owner))
+    } else {
+        return Ok(Vec::new());
+    };
     let ids: Vec<String> = serde_json::from_str(&share.item_ids).unwrap_or_default();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let requested_ids = ids.iter().cloned().collect::<HashSet<_>>();
+    let candidates = accessible_tracks(&access)
+        .filter(
+            Condition::any()
+                .add(track_entity::Column::Id.is_in(requested_ids.iter().cloned()))
+                .add(track_entity::Column::AlbumId.is_in(requested_ids.iter().cloned())),
+        )
+        .order_by_asc(track_entity::Column::DiscNumber)
+        .order_by_asc(track_entity::Column::TrackNumber)
+        .order_by_asc(track_entity::Column::Title)
+        .order_by_asc(track_entity::Column::Id)
+        .all(&state.db)
+        .await?;
+    let by_id = candidates
+        .iter()
+        .map(|track| (track.id.clone(), track.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut by_album = HashMap::<String, Vec<Track>>::new();
+    for track in candidates {
+        if let Some(album_id) = &track.album_id {
+            by_album.entry(album_id.clone()).or_default().push(track);
+        }
+    }
     let mut tracks = Vec::new();
     for id in ids {
-        if let Some(track) = track_entity::Entity::find_by_id(&id).one(&state.db).await? {
-            tracks.push(track);
+        if let Some(track) = by_id.get(&id) {
+            tracks.push(track.clone());
             continue;
         }
-        tracks.extend(
-            track_entity::Entity::find()
-                .filter(track_entity::Column::AlbumId.eq(&id))
-                .order_by_asc(track_entity::Column::DiscNumber)
-                .order_by_asc(track_entity::Column::TrackNumber)
-                .all(&state.db)
-                .await?,
-        );
+        if let Some(album_tracks) = by_album.get(&id) {
+            tracks.extend(album_tracks.iter().cloned());
+        }
     }
     Ok(tracks)
 }
@@ -269,16 +399,34 @@ async fn dispatch(
             }
         },
     };
+    let access = match subsonic_access(&state, &user).await {
+        Ok(access) => access,
+        Err(error) => return subsonic_error(&params, error.code, &error.message),
+    };
+    if method == "stream" && !access.stream_role {
+        return subsonic_error(&params, 50, "Streaming role required");
+    }
+    if method == "download" && !access.download_role {
+        return subsonic_error(&params, 50, "Download role required");
+    }
 
     if matches!(method, "stream" | "download" | "getCoverArt" | "getAvatar") {
-        return match binary_endpoint(&state, &user, method, &params, if_none_match.as_deref()).await
+        return match binary_endpoint(
+            &state,
+            &user,
+            &access,
+            method,
+            &params,
+            if_none_match.as_deref(),
+        )
+        .await
         {
             Ok(response) => response,
             Err(error) => subsonic_error(&params, 70, &error.to_string()),
         };
     }
 
-    match json_endpoint(&state, &user, method, &params).await {
+    match json_endpoint(&state, &user, &access, method, &params).await {
         Ok(value) => subsonic_response(&params, value),
         Err(ApiFailure { code, message }) => subsonic_error(&params, code, &message),
     }
@@ -437,7 +585,9 @@ async fn open_subsonic_extensions(state: &AppState) -> Value {
     let mut extensions = vec![
         json!({"name":"apiKeyAuthentication","versions":[1]}),
         json!({"name":"formPost","versions":[1]}),
+        json!({"name":"playbackReport","versions":[1]}),
         json!({"name":"songLyrics","versions":[1]}),
+        json!({"name":"topSongsByArtistId","versions":[1]}),
         json!({"name":"transcodeOffset","versions":[1]}),
         json!({"name":"indexBasedQueue","versions":[1]}),
     ];
@@ -450,6 +600,7 @@ async fn open_subsonic_extensions(state: &AppState) -> Value {
 async fn json_endpoint(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     method: &str,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
@@ -459,43 +610,69 @@ async fn json_endpoint(
             json!({"license":{"valid":true,"email":user.email,"licenseExpires":"2099-12-31T23:59:59.000Z"}}),
         ),
         "tokenInfo" => Ok(json!({"tokenInfo":{"username":user.username}})),
-        "getMusicFolders" => music_folders(state).await,
-        "getArtists" => artists(state, p).await,
-        "getIndexes" => indexes(state, p).await,
-        "getArtist" => get_artist(state, required(p, "id")?).await,
-        "getAlbum" => get_album(state, required(p, "id")?).await,
-        "getSong" => get_song(state, user, required(p, "id")?).await,
-        "getMusicDirectory" => music_directory(state, required(p, "id")?).await,
-        "getGenres" => genres(state).await,
-        "getArtistInfo" | "getArtistInfo2" => {
-            Ok(json!({if method.ends_with('2') {"artistInfo2"} else {"artistInfo"}: {}}))
-        }
-        "getAlbumInfo" | "getAlbumInfo2" => Ok(json!({"albumInfo": {}})),
+        "getMusicFolders" => music_folders(state, access).await,
+        "getArtists" => artists(state, access, p).await,
+        "getIndexes" => indexes(state, access, p).await,
+        "getArtist" => get_artist(state, access, required(p, "id")?).await,
+        "getAlbum" => get_album(state, access, required(p, "id")?).await,
+        "getSong" => get_song(state, user, access, required(p, "id")?).await,
+        "getMusicDirectory" => music_directory(state, access, required(p, "id")?).await,
+        "getGenres" => genres(state, access).await,
+        "getArtistInfo" | "getArtistInfo2" => artist_info(state, access, method, p).await,
+        "getAlbumInfo" | "getAlbumInfo2" => album_info(state, access, p).await,
         "getSimilarSongs" | "getSimilarSongs2" => {
-            similar_songs(state, method, required(p, "id")?, int(p, "count", 50)).await
+            similar_songs(
+                state,
+                access,
+                method,
+                required(p, "id")?,
+                int(p, "count", 50),
+            )
+            .await
         }
-        "getTopSongs" => top_songs(state, required(p, "id")?, int(p, "count", 50)).await,
-        "getAlbumList" | "getAlbumList2" => album_list(state, user, method, p).await,
-        "getRandomSongs" => random_songs(state, p).await,
-        "getSongsByGenre" => songs_by_genre(state, p).await,
-        "getNowPlaying" => Ok(json!({"nowPlaying":{"entry":[]}})),
-        "getStarred" | "getStarred2" => starred(state, user, method, p).await,
-        "search" => legacy_search(state, p).await,
-        "search2" | "search3" => search(state, method, p).await,
-        "getPlaylists" => playlists(state, user, p).await,
-        "getPlaylist" => playlist(state, user, required(p, "id")?).await,
-        "createPlaylist" => create_playlist(state, user, p).await,
-        "updatePlaylist" => update_playlist(state, user, p).await,
+        "getTopSongs" => {
+            let artist = if let Some(id) = p
+                .get("id")
+                .map(String::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                id
+            } else {
+                required(p, "artist")?
+            };
+            top_songs(state, access, artist, int(p, "count", 50)).await
+        }
+        "getAlbumList" | "getAlbumList2" => album_list(state, user, access, method, p).await,
+        "getRandomSongs" => random_songs(state, access, p).await,
+        "getSongsByGenre" => songs_by_genre(state, access, p).await,
+        "getNowPlaying" => now_playing(state, access).await,
+        "getStarred" | "getStarred2" => starred(state, user, access, method, p).await,
+        "search" => legacy_search(state, access, p).await,
+        "search2" | "search3" => search(state, access, method, p).await,
+        "getPlaylists" => playlists(state, user, access, p).await,
+        "getPlaylist" => playlist(state, user, access, required(p, "id")?).await,
+        "createPlaylist" => create_playlist(state, user, access, p).await,
+        "updatePlaylist" => update_playlist(state, user, access, p).await,
         "deletePlaylist" => delete_playlist(state, user, required(p, "id")?).await,
-        "getLyrics" => get_lyrics_legacy(state, p).await,
-        "getLyricsBySongId" => get_lyrics_by_song(state, required(p, "id")?).await,
-        "star" => favorite(state, user, p, true).await,
-        "unstar" => favorite(state, user, p, false).await,
-        "setRating" => set_rating(state, user, p).await,
-        "scrobble" => scrobble(state, user, p).await,
+        "getLyrics" => get_lyrics_legacy(state, access, p).await,
+        "getLyricsBySongId" => get_lyrics_by_song(state, access, required(p, "id")?).await,
+        "star" => favorite(state, user, access, p, true).await,
+        "unstar" => favorite(state, user, access, p, false).await,
+        "setRating" => {
+            require_permission(access.comment_role, "Comment role required")?;
+            set_rating(state, user, access, p).await
+        }
+        "scrobble" => scrobble(state, user, access, p).await,
+        "reportPlayback" => report_playback(state, user, access, p).await,
         "getShares" => shares(state, user).await,
-        "createShare" => create_share(state, user, p).await,
-        "updateShare" => update_share(state, user, p).await,
+        "createShare" => {
+            require_permission(access.share_role, "Share role required")?;
+            create_share(state, user, access, p).await
+        }
+        "updateShare" => {
+            require_permission(access.share_role, "Share role required")?;
+            update_share(state, user, p).await
+        }
         "deleteShare" => delete_share(state, user, required(p, "id")?).await,
         "getInternetRadioStations" => radio_stations(state, p).await,
         "createInternetRadioStation" => create_radio(state, user, p).await,
@@ -509,14 +686,14 @@ async fn json_endpoint(
         "createUser" => create_user(state, user, p).await,
         "updateUser" => update_user(state, user, p).await,
         "deleteUser" => delete_user(state, user, required(p, "username")?).await,
-        "changePassword" => change_password(state, user, p).await,
-        "getBookmarks" => bookmarks(state, user).await,
-        "createBookmark" => create_bookmark(state, user, p).await,
+        "changePassword" => change_password(state, user, access, p).await,
+        "getBookmarks" => bookmarks(state, user, access).await,
+        "createBookmark" => create_bookmark(state, user, access, p).await,
         "deleteBookmark" => delete_bookmark(state, user, required(p, "id")?).await,
-        "getPlayQueue" => get_play_queue(state, user, false).await,
-        "getPlayQueueByIndex" => get_play_queue(state, user, true).await,
-        "savePlayQueue" => save_play_queue(state, user, p, false).await,
-        "savePlayQueueByIndex" => save_play_queue(state, user, p, true).await,
+        "getPlayQueue" => get_play_queue(state, user, access, false).await,
+        "getPlayQueueByIndex" => get_play_queue(state, user, access, true).await,
+        "savePlayQueue" => save_play_queue(state, user, access, p, false).await,
+        "savePlayQueueByIndex" => save_play_queue(state, user, access, p, true).await,
         "getScanStatus" => scan_status(state).await,
         "startScan" => start_scan(state, user).await,
         "getVideos"
@@ -616,24 +793,37 @@ fn set_track_json_play_counts(value: &mut Value, counts: &HashMap<String, i64>) 
 async fn binary_endpoint(
     state: &AppState,
     _user: &User,
+    access: &SubsonicAccess,
     method: &str,
     p: &HashMap<String, String>,
     if_none_match: Option<&str>,
 ) -> anyhow::Result<Response> {
     match method {
         "stream" | "download" => {
-            let track = track(state, required_anyhow(p, "id")?).await?;
+            let track_id = required_anyhow(p, "id")?;
+            let track = accessible_tracks(access)
+                .filter(track_entity::Column::Id.eq(track_id))
+                .one(&state.db)
+                .await?
+                .context("Track not found")?;
             let raw = p.get("format").is_some_and(|value| value == "raw");
             let requested_format = p.get("format").filter(|value| value.as_str() != "raw");
-            let max_bitrate = p
+            let requested_max_bitrate = p
                 .get("maxBitRate")
                 .and_then(|value| value.parse::<u32>().ok())
                 .filter(|value| *value > 0);
+            let user_max_bitrate = u32::try_from(access.max_bit_rate)
+                .ok()
+                .filter(|value| *value > 0);
+            let max_bitrate = match (requested_max_bitrate, user_max_bitrate) {
+                (Some(requested), Some(user)) => Some(requested.min(user)),
+                (requested, user) => requested.or(user),
+            };
             let time_offset = p
                 .get("timeOffset")
                 .filter(|value| value.parse::<f64>().is_ok_and(|value| value > 0.0));
             if method == "download"
-                || raw
+                || (raw && user_max_bitrate.is_none())
                 || (requested_format.is_none() && max_bitrate.is_none() && time_offset.is_none())
             {
                 serve_file(
@@ -662,23 +852,20 @@ async fn binary_endpoint(
                 .get("size")
                 .and_then(|value| value.parse::<u32>().ok())
                 .filter(|size| *size > 0);
-            let source = if album_entity::Entity::find_by_id(image_id)
+            let source = if let Some(source) = accessible_tracks(access)
+                .filter(track_entity::Column::AlbumId.eq(image_id))
+                .order_by_asc(track_entity::Column::DiscNumber)
+                .order_by_asc(track_entity::Column::TrackNumber)
                 .one(&state.db)
                 .await?
-                .is_some()
             {
-                track_entity::Entity::find()
-                    .filter(track_entity::Column::AlbumId.eq(image_id))
-                    .order_by_asc(track_entity::Column::DiscNumber)
-                    .order_by_asc(track_entity::Column::TrackNumber)
-                    .one(&state.db)
-                    .await?
-                    .context("album cover source not found")?
+                source
             } else {
-                track_entity::Entity::find_by_id(image_id)
+                accessible_tracks(access)
+                    .filter(track_entity::Column::Id.eq(image_id))
                     .one(&state.db)
                     .await?
-                    .context("track cover source not found")?
+                    .context("cover art source not found")?
             };
             let etag = cover_art_etag(&source.id, source.mtime, requested_size);
             if if_none_match.is_some_and(|value| if_none_match_matches(value, &etag)) {
@@ -693,12 +880,12 @@ async fn binary_endpoint(
                 return Ok(response);
             }
             let tags = state.tags.clone();
-            let artwork_id = id.to_owned();
+            let artwork_cache_id = cover_art_cache_id(id, &source.id);
             let artwork = tokio::task::spawn_blocking(move || {
                 tags.read_artwork_cached_with_size(
                     std::path::Path::new(&source.path),
                     &source.id,
-                    &artwork_id,
+                    &artwork_cache_id,
                     source.mtime,
                     requested_size,
                 )
@@ -753,6 +940,10 @@ fn cover_art_etag(source_id: &str, modified: i64, requested_size: Option<u32>) -
     format!("W/\"{}\"", hex::encode(digest))
 }
 
+fn cover_art_cache_id(image_id: &str, source_id: &str) -> String {
+    format!("{image_id}:{source_id}")
+}
+
 fn if_none_match_matches(value: &str, etag: &str) -> bool {
     let etag = etag.strip_prefix("W/").unwrap_or(etag);
     value.split(',').map(str::trim).any(|candidate| {
@@ -760,8 +951,12 @@ fn if_none_match_matches(value: &str, etag: &str) -> bool {
     })
 }
 
-async fn music_folders(state: &AppState) -> Result<Value, ApiFailure> {
-    let folders = enabled_music_folders(state).await?;
+async fn music_folders(state: &AppState, access: &SubsonicAccess) -> Result<Value, ApiFailure> {
+    let folders = enabled_music_folders(state)
+        .await?
+        .into_iter()
+        .filter(|folder| access.allows_folder(&folder.id))
+        .collect::<Vec<_>>();
     Ok(
         json!({"musicFolders":{"musicFolder":folders.into_iter().map(|folder| json!({"id":folder_api_id(&folder.id),"name":folder.name})).collect::<Vec<_>>()}}),
     )
@@ -773,6 +968,49 @@ async fn enabled_music_folders(state: &AppState) -> Result<Vec<MusicFolder>, Api
         .order_by_asc(music_folder_entity::Column::Name)
         .all(&state.db)
         .await?)
+}
+
+fn accessible_tracks(access: &SubsonicAccess) -> sea_orm::Select<track_entity::Entity> {
+    let enabled_folder_ids = music_folder_entity::Entity::find()
+        .select_only()
+        .column(music_folder_entity::Column::Id)
+        .filter(music_folder_entity::Column::Enabled.eq(1))
+        .into_query();
+    let mut request = track_entity::Entity::find()
+        .filter(track_entity::Column::FolderId.in_subquery(enabled_folder_ids));
+    if let Some(folder_ids) = &access.folder_ids {
+        request = request.filter(track_entity::Column::FolderId.is_in(folder_ids.iter().cloned()));
+    }
+    request
+}
+
+async fn accessible_track(
+    state: &AppState,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Track, ApiFailure> {
+    accessible_tracks(access)
+        .filter(track_entity::Column::Id.eq(id))
+        .one(&state.db)
+        .await?
+        .ok_or_else(not_found)
+}
+
+async fn accessible_artist_exists(
+    state: &AppState,
+    access: &SubsonicAccess,
+    artist_id: &str,
+) -> Result<bool, ApiFailure> {
+    let track_ids = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::Id)
+        .into_query();
+    Ok(track_artist_entity::Entity::find()
+        .filter(track_artist_entity::Column::ArtistId.eq(artist_id))
+        .filter(track_artist_entity::Column::TrackId.in_subquery(track_ids))
+        .one(&state.db)
+        .await?
+        .is_some())
 }
 
 fn folder_api_id(id: &str) -> i32 {
@@ -799,49 +1037,155 @@ async fn find_music_folder(
 
 async fn requested_music_folder(
     state: &AppState,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Option<String>, ApiFailure> {
     let Some(api_id) = p.get("musicFolderId") else {
         return Ok(None);
     };
-    find_music_folder(state, api_id)
+    let folder = find_music_folder(state, api_id)
         .await?
-        .map(|folder| Some(folder.id))
-        .ok_or_else(not_found)
+        .filter(|folder| access.allows_folder(&folder.id))
+        .ok_or_else(not_found)?;
+    Ok(Some(folder.id))
 }
 
 async fn library_artists(
     state: &AppState,
+    access: &SubsonicAccess,
     folder_id: Option<&str>,
 ) -> Result<Vec<Artist>, ApiFailure> {
-    let mut request = artist_entity::Entity::find();
+    let mut track_ids = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::Id);
     if let Some(folder_id) = folder_id {
-        let track_ids = track_entity::Entity::find()
-            .select_only()
-            .column(track_entity::Column::Id)
-            .filter(track_entity::Column::FolderId.eq(folder_id))
-            .into_query();
-        let artist_ids = track_artist_entity::Entity::find()
-            .select_only()
-            .column(track_artist_entity::Column::ArtistId)
-            .filter(track_artist_entity::Column::TrackId.in_subquery(track_ids))
-            .into_query();
-        request = request.filter(artist_entity::Column::Id.in_subquery(artist_ids));
-    } else {
-        request = request.filter(
-            Condition::any()
-                .add(artist_entity::Column::SongCount.gt(0))
-                .add(artist_entity::Column::AlbumCount.gt(0)),
-        );
+        track_ids = track_ids.filter(track_entity::Column::FolderId.eq(folder_id));
     }
-    Ok(request
+    let artist_ids = track_artist_entity::Entity::find()
+        .select_only()
+        .column(track_artist_entity::Column::ArtistId)
+        .filter(track_artist_entity::Column::TrackId.in_subquery(track_ids.into_query()))
+        .into_query();
+    let mut artists = artist_entity::Entity::find()
+        .filter(artist_entity::Column::Id.in_subquery(artist_ids))
         .order_by_asc(artist_entity::Column::SortName)
         .all(&state.db)
-        .await?)
+        .await?;
+    scope_artist_stats(state, access, &mut artists, folder_id).await?;
+    Ok(artists)
+}
+
+async fn scope_artist_stats(
+    state: &AppState,
+    access: &SubsonicAccess,
+    artists: &mut [Artist],
+    folder_id: Option<&str>,
+) -> Result<(), ApiFailure> {
+    let mut artist_ids = artists
+        .iter()
+        .map(|artist| artist.id.as_str())
+        .collect::<Vec<_>>();
+    artist_ids.sort_unstable();
+    artist_ids.dedup();
+    if artist_ids.is_empty() {
+        return Ok(());
+    }
+    let allowed_folders = if let Some(folder_id) = folder_id {
+        Some(vec![folder_id.to_owned()])
+    } else {
+        access
+            .folder_ids
+            .as_ref()
+            .map(|folder_ids| folder_ids.iter().cloned().collect::<Vec<_>>())
+    };
+    let mut stats = HashMap::new();
+    if !allowed_folders.as_ref().is_some_and(Vec::is_empty) {
+        for chunk in artist_ids.chunks(500) {
+            let artist_placeholders = (1..=chunk.len())
+                .map(|index| format!("${index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let folder_filter = allowed_folders.as_ref().map(|folder_ids| {
+                let first = chunk.len() + 1;
+                let folder_placeholders = (first..first + folder_ids.len())
+                    .map(|index| format!("${index}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(" AND t.folder_id IN ({folder_placeholders})")
+            });
+            let mut query = db::raw(
+                &state.db,
+                format!(
+                    "SELECT ta.artist_id,COUNT(DISTINCT t.album_id) AS album_count,\
+                     COUNT(DISTINCT t.id) AS song_count FROM track_artists ta \
+                     JOIN tracks t ON t.id=ta.track_id \
+                     JOIN music_folders mf ON mf.id=t.folder_id AND mf.enabled=1 \
+                     WHERE ta.artist_id IN ({artist_placeholders}){} GROUP BY ta.artist_id",
+                    folder_filter.unwrap_or_default()
+                ),
+            );
+            for artist_id in chunk {
+                query = query.bind(*artist_id);
+            }
+            if let Some(folder_ids) = &allowed_folders {
+                for folder_id in folder_ids {
+                    query = query.bind(folder_id.clone());
+                }
+            }
+            for row in query.all::<ArtistStatsRow>().await? {
+                stats.insert(row.artist_id, (row.album_count, row.song_count));
+            }
+        }
+    }
+    for artist in artists {
+        let (album_count, song_count) = stats.get(&artist.id).copied().unwrap_or((0, 0));
+        artist.album_count = album_count;
+        artist.song_count = song_count;
+    }
+    Ok(())
+}
+
+async fn scope_album_stats(
+    state: &AppState,
+    access: &SubsonicAccess,
+    albums: &mut [Album],
+    folder_id: Option<&str>,
+) -> Result<(), ApiFailure> {
+    let album_ids = albums
+        .iter()
+        .map(|album| album.id.clone())
+        .collect::<HashSet<_>>();
+    if album_ids.is_empty() {
+        return Ok(());
+    }
+    let mut request = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::AlbumId)
+        .column_as(track_entity::Column::Id.count(), "song_count")
+        .column_as(track_entity::Column::Duration.sum(), "duration")
+        .filter(track_entity::Column::AlbumId.is_in(album_ids))
+        .group_by(track_entity::Column::AlbumId);
+    if let Some(folder_id) = folder_id {
+        request = request.filter(track_entity::Column::FolderId.eq(folder_id));
+    }
+    let stats = request
+        .into_model::<AlbumStatsRow>()
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|row| (row.album_id, (row.song_count, row.duration)))
+        .collect::<HashMap<_, _>>();
+    for album in albums {
+        let (song_count, duration) = stats.get(&album.id).copied().unwrap_or((0, 0.0));
+        album.song_count = song_count;
+        album.duration = duration;
+    }
+    Ok(())
 }
 
 async fn artist_cover_art_map(
     state: &AppState,
+    access: &SubsonicAccess,
     artist_ids: &[String],
     folder_id: Option<&str>,
 ) -> Result<HashMap<String, String>, ApiFailure> {
@@ -851,7 +1195,7 @@ async fn artist_cover_art_map(
     if artist_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    const SELECT: &str = "SELECT ta.artist_id,t.id AS track_id,t.album_id FROM track_artists ta JOIN tracks t ON t.id=ta.track_id";
+    const SELECT: &str = "SELECT ta.artist_id,t.id AS track_id,t.album_id FROM track_artists ta JOIN tracks t ON t.id=ta.track_id JOIN music_folders mf ON mf.id=t.folder_id AND mf.enabled=1";
     const ORDER: &str = " ORDER BY ta.artist_id,CASE WHEN t.album_id IS NULL THEN 1 ELSE 0 END,ta.position,t.album_id,t.disc_number,t.track_number,t.title,t.id";
     let mut covers = HashMap::new();
     for chunk in artist_ids.chunks(500) {
@@ -859,18 +1203,39 @@ async fn artist_cover_art_map(
             .map(|index| format!("${index}"))
             .collect::<Vec<_>>()
             .join(",");
-        let folder_filter = folder_id
-            .map(|_| format!(" AND t.folder_id=${}", chunk.len() + 1))
-            .unwrap_or_default();
+        let allowed_folders = if let Some(folder_id) = folder_id {
+            Some(vec![folder_id.to_owned()])
+        } else {
+            access
+                .folder_ids
+                .as_ref()
+                .map(|folder_ids| folder_ids.iter().cloned().collect::<Vec<_>>())
+        };
+        if allowed_folders.as_ref().is_some_and(Vec::is_empty) {
+            continue;
+        }
+        let folder_filter = allowed_folders.as_ref().map(|folder_ids| {
+            let first = chunk.len() + 1;
+            let placeholders = (first..first + folder_ids.len())
+                .map(|index| format!("${index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(" AND t.folder_id IN ({placeholders})")
+        });
         let mut query = db::raw(
             &state.db,
-            format!("{SELECT} WHERE ta.artist_id IN ({placeholders}){folder_filter}{ORDER}"),
+            format!(
+                "{SELECT} WHERE ta.artist_id IN ({placeholders}){}{ORDER}",
+                folder_filter.unwrap_or_default()
+            ),
         );
         for artist_id in chunk {
             query = query.bind(*artist_id);
         }
-        if let Some(folder_id) = folder_id {
-            query = query.bind(folder_id);
+        if let Some(folder_ids) = allowed_folders {
+            for folder_id in folder_ids {
+                query = query.bind(folder_id);
+            }
         }
         for row in query.all::<ArtistCoverRow>().await? {
             covers.entry(row.artist_id).or_insert_with(|| {
@@ -883,9 +1248,10 @@ async fn artist_cover_art_map(
 
 async fn library_last_modified(
     state: &AppState,
+    access: &SubsonicAccess,
     folder_id: Option<&str>,
 ) -> Result<i64, ApiFailure> {
-    let mut request = track_entity::Entity::find()
+    let mut request = accessible_tracks(access)
         .select_only()
         .column_as(track_entity::Column::Mtime.max(), "value");
     if let Some(folder_id) = folder_id {
@@ -898,14 +1264,18 @@ async fn library_last_modified(
         .saturating_mul(1000))
 }
 
-async fn artists(state: &AppState, p: &HashMap<String, String>) -> Result<Value, ApiFailure> {
-    let folder_id = requested_music_folder(state, p).await?;
-    let artists = library_artists(state, folder_id.as_deref()).await?;
+async fn artists(
+    state: &AppState,
+    access: &SubsonicAccess,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
+    let folder_id = requested_music_folder(state, access, p).await?;
+    let artists = library_artists(state, access, folder_id.as_deref()).await?;
     let artist_ids = artists
         .iter()
         .map(|artist| artist.id.clone())
         .collect::<Vec<_>>();
-    let cover_art = artist_cover_art_map(state, &artist_ids, folder_id.as_deref()).await?;
+    let cover_art = artist_cover_art_map(state, access, &artist_ids, folder_id.as_deref()).await?;
     let mut groups: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
     for artist in artists {
         let artist_cover_art = cover_art.get(&artist.id).map(String::as_str);
@@ -918,9 +1288,13 @@ async fn artists(state: &AppState, p: &HashMap<String, String>) -> Result<Value,
         json!({"artists":{"ignoredArticles":"","index":groups.into_iter().map(|(name,artist)|json!({"name":name,"artist":artist})).collect::<Vec<_>>()}}),
     )
 }
-async fn indexes(state: &AppState, p: &HashMap<String, String>) -> Result<Value, ApiFailure> {
-    let folder_id = requested_music_folder(state, p).await?;
-    let artists = library_artists(state, folder_id.as_deref()).await?;
+async fn indexes(
+    state: &AppState,
+    access: &SubsonicAccess,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
+    let folder_id = requested_music_folder(state, access, p).await?;
+    let artists = library_artists(state, access, folder_id.as_deref()).await?;
     let mut groups: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
     for artist in artists {
         groups
@@ -928,7 +1302,7 @@ async fn indexes(state: &AppState, p: &HashMap<String, String>) -> Result<Value,
             .or_default()
             .push(json!({"id":artist.id,"name":artist.name}));
     }
-    let last_modified = library_last_modified(state, folder_id.as_deref()).await?;
+    let last_modified = library_last_modified(state, access, folder_id.as_deref()).await?;
     let modified_since = p
         .get("ifModifiedSince")
         .and_then(|value| value.parse::<i64>().ok())
@@ -943,47 +1317,75 @@ async fn indexes(state: &AppState, p: &HashMap<String, String>) -> Result<Value,
     };
     Ok(json!({"indexes":{"ignoredArticles":"","lastModified":last_modified,"index":indexes}}))
 }
-async fn get_artist(state: &AppState, id: &str) -> Result<Value, ApiFailure> {
-    let artist = artist_entity::Entity::find_by_id(id)
+async fn get_artist(
+    state: &AppState,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Value, ApiFailure> {
+    let mut artist = artist_entity::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(not_found)?;
+    let accessible_track_ids = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::Id)
+        .into_query();
     let track_ids = track_artist_entity::Entity::find()
         .select_only()
         .column(track_artist_entity::Column::TrackId)
         .filter(track_artist_entity::Column::ArtistId.eq(id))
+        .filter(track_artist_entity::Column::TrackId.in_subquery(accessible_track_ids))
         .into_query();
     let album_ids = track_entity::Entity::find()
         .select_only()
         .column(track_entity::Column::AlbumId)
         .filter(track_entity::Column::Id.in_subquery(track_ids))
         .into_query();
-    let albums = album_entity::Entity::find()
+    let mut albums = album_entity::Entity::find()
         .filter(album_entity::Column::Id.in_subquery(album_ids))
         .order_by_asc(album_entity::Column::Year)
         .order_by_asc(album_entity::Column::Name)
         .all(&state.db)
         .await?;
-    let cover_art = artist_cover_art_map(state, std::slice::from_ref(&artist.id), None).await?;
+    if albums.is_empty() {
+        return Err(not_found());
+    }
+    scope_artist_stats(state, access, std::slice::from_mut(&mut artist), None).await?;
+    scope_album_stats(state, access, &mut albums, None).await?;
+    let cover_art =
+        artist_cover_art_map(state, access, std::slice::from_ref(&artist.id), None).await?;
     let mut data = artist_json(&artist, cover_art.get(id).map(String::as_str));
     data["album"] = Value::Array(albums.iter().map(album_json).collect());
     Ok(json!({"artist":data}))
 }
-async fn get_album(state: &AppState, id: &str) -> Result<Value, ApiFailure> {
-    let album = album(state, id).await?;
-    let tracks = track_entity::Entity::find()
+async fn get_album(
+    state: &AppState,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Value, ApiFailure> {
+    let mut album = album(state, id).await?;
+    let tracks = accessible_tracks(access)
         .filter(track_entity::Column::AlbumId.eq(id))
         .order_by_asc(track_entity::Column::DiscNumber)
         .order_by_asc(track_entity::Column::TrackNumber)
         .order_by_asc(track_entity::Column::Title)
         .all(&state.db)
         .await?;
+    if tracks.is_empty() {
+        return Err(not_found());
+    }
+    scope_album_stats(state, access, std::slice::from_mut(&mut album), None).await?;
     let mut data = album_json(&album);
     data["song"] = Value::Array(tracks.iter().map(|t| track_json(t, None)).collect());
     Ok(json!({"album":data}))
 }
-async fn get_song(state: &AppState, user: &User, id: &str) -> Result<Value, ApiFailure> {
-    let track = track(state, id).await.map_err(ApiFailure::from)?;
+async fn get_song(
+    state: &AppState,
+    user: &User,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Value, ApiFailure> {
+    let track = accessible_track(state, access, id).await?;
     let starred = favorite_entity::Entity::find()
         .filter(favorite_entity::Column::UserId.eq(&user.id))
         .filter(favorite_entity::Column::ItemType.eq("track"))
@@ -992,25 +1394,37 @@ async fn get_song(state: &AppState, user: &User, id: &str) -> Result<Value, ApiF
         .await?;
     Ok(json!({"song":track_json(&track, starred.map(|favorite|favorite.created_at))}))
 }
-async fn music_directory(state: &AppState, id: &str) -> Result<Value, ApiFailure> {
-    if let Some(folder) = find_music_folder(state, id).await? {
+async fn music_directory(
+    state: &AppState,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Value, ApiFailure> {
+    if let Some(folder) = find_music_folder(state, id)
+        .await?
+        .filter(|folder| access.allows_folder(&folder.id))
+    {
         let folder_id = folder.id.clone();
         let parent_id = folder_api_id(&folder.id).to_string();
-        let artists = library_artists(state, Some(&folder_id)).await?;
+        let artists = library_artists(state, access, Some(&folder_id)).await?;
         let artist_ids = artists
             .iter()
             .map(|artist| artist.id.clone())
             .collect::<Vec<_>>();
-        let cover_art = artist_cover_art_map(state, &artist_ids, Some(&folder_id)).await?;
+        let cover_art = artist_cover_art_map(state, access, &artist_ids, Some(&folder_id)).await?;
         return Ok(
             json!({"directory":{"id":parent_id,"name":folder.name,"child":artists.iter().map(|artist|artist_child_json(artist,Some(&parent_id),cover_art.get(&artist.id).map(String::as_str))).collect::<Vec<_>>()}}),
         );
     }
     if let Some(artist) = artist_entity::Entity::find_by_id(id).one(&state.db).await? {
+        let accessible_track_ids = accessible_tracks(access)
+            .select_only()
+            .column(track_entity::Column::Id)
+            .into_query();
         let track_ids = track_artist_entity::Entity::find()
             .select_only()
             .column(track_artist_entity::Column::TrackId)
             .filter(track_artist_entity::Column::ArtistId.eq(id))
+            .filter(track_artist_entity::Column::TrackId.in_subquery(accessible_track_ids))
             .into_query();
         let album_ids = track_entity::Entity::find()
             .select_only()
@@ -1023,30 +1437,36 @@ async fn music_directory(state: &AppState, id: &str) -> Result<Value, ApiFailure
             .order_by_asc(album_entity::Column::Name)
             .all(&state.db)
             .await?;
+        if albums.is_empty() {
+            return Err(not_found());
+        }
         return Ok(
             json!({"directory":{"id":artist.id,"name":artist.name,"child":albums.into_iter().map(|a|json!({"id":a.id,"parent":artist.id,"title":a.name,"album":a.name,"artist":a.artist_name,"isDir":true,"coverArt":format!("img-{}",a.id)})).collect::<Vec<_>>()}}),
         );
     }
     let album = album(state, id).await?;
-    let tracks = track_entity::Entity::find()
+    let tracks = accessible_tracks(access)
         .filter(track_entity::Column::AlbumId.eq(id))
         .order_by_asc(track_entity::Column::DiscNumber)
         .order_by_asc(track_entity::Column::TrackNumber)
         .order_by_asc(track_entity::Column::Title)
         .all(&state.db)
         .await?;
+    if tracks.is_empty() {
+        return Err(not_found());
+    }
     Ok(
         json!({"directory":{"id":album.id,"name":album.name,"child":tracks.iter().map(|t|track_json(t,None)).collect::<Vec<_>>()}}),
     )
 }
-async fn genres(state: &AppState) -> Result<Value, ApiFailure> {
+async fn genres(state: &AppState, access: &SubsonicAccess) -> Result<Value, ApiFailure> {
     #[derive(FromQueryResult)]
     struct GenreRow {
         genre: String,
         song_count: i64,
         album_count: i64,
     }
-    let values = track_entity::Entity::find()
+    let values = accessible_tracks(access)
         .select_only()
         .column(track_entity::Column::Genre)
         .column_as(track_entity::Column::Id.count(), "song_count")
@@ -1064,22 +1484,149 @@ async fn genres(state: &AppState) -> Result<Value, ApiFailure> {
         json!({"genres":{"genre":values.into_iter().map(|v|json!({"value":v.genre,"songCount":v.song_count,"albumCount":v.album_count})).collect::<Vec<_>>()}}),
     )
 }
+
+async fn artist_info(
+    state: &AppState,
+    access: &SubsonicAccess,
+    method: &str,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
+    let id = required(p, "id")?;
+    let artist_id = if accessible_artist_exists(state, access, id).await? {
+        id.to_owned()
+    } else if let Some(track) = accessible_tracks(access)
+        .filter(track_entity::Column::AlbumId.eq(id))
+        .one(&state.db)
+        .await?
+    {
+        track.artist_id
+    } else {
+        accessible_track(state, access, id).await?.artist_id
+    };
+    let mut artist = artist_entity::Entity::find_by_id(&artist_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(not_found)?;
+    let own_track_ids = track_artist_entity::Entity::find()
+        .select_only()
+        .column(track_artist_entity::Column::TrackId)
+        .filter(track_artist_entity::Column::ArtistId.eq(&artist_id))
+        .into_query();
+    let genres = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::Genre)
+        .filter(track_entity::Column::Id.in_subquery(own_track_ids))
+        .filter(track_entity::Column::Genre.ne(""))
+        .into_tuple::<String>()
+        .all(&state.db)
+        .await?;
+    let related_track_ids = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::Id)
+        .filter(track_entity::Column::Genre.is_in(genres))
+        .into_query();
+    let related_artist_ids = track_artist_entity::Entity::find()
+        .select_only()
+        .column(track_artist_entity::Column::ArtistId)
+        .filter(track_artist_entity::Column::TrackId.in_subquery(related_track_ids))
+        .filter(track_artist_entity::Column::ArtistId.ne(&artist_id))
+        .into_query();
+    let mut similar = artist_entity::Entity::find()
+        .filter(artist_entity::Column::Id.in_subquery(related_artist_ids))
+        .order_by_asc(artist_entity::Column::Name)
+        .limit(int(p, "count", 20).clamp(0, 100) as u64)
+        .all(&state.db)
+        .await?;
+    scope_artist_stats(state, access, std::slice::from_mut(&mut artist), None).await?;
+    scope_artist_stats(state, access, &mut similar, None).await?;
+    let ids = similar
+        .iter()
+        .map(|artist| artist.id.clone())
+        .collect::<Vec<_>>();
+    let covers = artist_cover_art_map(state, access, &ids, None).await?;
+    let key = if method.ends_with('2') {
+        "artistInfo2"
+    } else {
+        "artistInfo"
+    };
+    Ok(json!({key:{
+        "biography":format!("{} · {} albums · {} songs",artist.name,artist.album_count,artist.song_count),
+        "similarArtist":similar.iter().map(|artist|artist_json(artist,covers.get(&artist.id).map(String::as_str))).collect::<Vec<_>>()
+    }}))
+}
+
+async fn album_info(
+    state: &AppState,
+    access: &SubsonicAccess,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
+    let id = required(p, "id")?;
+    let album_id = if accessible_tracks(access)
+        .filter(track_entity::Column::AlbumId.eq(id))
+        .one(&state.db)
+        .await?
+        .is_some()
+    {
+        id.to_owned()
+    } else {
+        accessible_track(state, access, id)
+            .await?
+            .album_id
+            .ok_or_else(not_found)?
+    };
+    let album = album(state, &album_id).await?;
+    let comments = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::Comment)
+        .filter(track_entity::Column::AlbumId.eq(&album_id))
+        .filter(track_entity::Column::Comment.ne(""))
+        .into_tuple::<String>()
+        .all(&state.db)
+        .await?;
+    let mut notes = comments
+        .into_iter()
+        .map(|comment| comment.trim().to_owned())
+        .filter(|comment| !comment.is_empty())
+        .collect::<Vec<_>>();
+    notes.sort();
+    notes.dedup();
+    let notes = if notes.is_empty() {
+        format!("{} — {}", album.name, album.artist_name)
+    } else {
+        notes.join("\n\n")
+    };
+    Ok(json!({"albumInfo":{"notes":notes}}))
+}
+
 async fn similar_songs(
     state: &AppState,
+    access: &SubsonicAccess,
     method: &str,
     id: &str,
     count: i64,
 ) -> Result<Value, ApiFailure> {
-    let base = track(state, id).await.map_err(ApiFailure::from)?;
-    let tracks = db::raw(
-        &state.db,
-        track_select("WHERE id<>$1 AND (genre=$2 OR id IN (SELECT other.track_id FROM track_artists mine JOIN track_artists other ON other.artist_id=mine.artist_id WHERE mine.track_id=$1)) ORDER BY play_count DESC LIMIT $3"),
-    )
-    .bind(id)
-    .bind(base.genre)
-    .bind(count.clamp(0, 500))
-    .all::<Track>()
-    .await?;
+    let base = accessible_track(state, access, id).await?;
+    let artist_ids = track_artist_entity::Entity::find()
+        .select_only()
+        .column(track_artist_entity::Column::ArtistId)
+        .filter(track_artist_entity::Column::TrackId.eq(id))
+        .into_query();
+    let related_track_ids = track_artist_entity::Entity::find()
+        .select_only()
+        .column(track_artist_entity::Column::TrackId)
+        .filter(track_artist_entity::Column::ArtistId.in_subquery(artist_ids))
+        .into_query();
+    let tracks = accessible_tracks(access)
+        .filter(track_entity::Column::Id.ne(id))
+        .filter(
+            Condition::any()
+                .add(track_entity::Column::Genre.eq(base.genre))
+                .add(track_entity::Column::Id.in_subquery(related_track_ids)),
+        )
+        .order_by_desc(track_entity::Column::PlayCount)
+        .limit(count.clamp(0, 500) as u64)
+        .all(&state.db)
+        .await?;
     let key = if method.ends_with('2') {
         "similarSongs2"
     } else {
@@ -1087,7 +1634,12 @@ async fn similar_songs(
     };
     Ok(json!({key:{"song":tracks.iter().map(|v|track_json(v,None)).collect::<Vec<_>>()}}))
 }
-async fn top_songs(state: &AppState, artist: &str, count: i64) -> Result<Value, ApiFailure> {
+async fn top_songs(
+    state: &AppState,
+    access: &SubsonicAccess,
+    artist: &str,
+    count: i64,
+) -> Result<Value, ApiFailure> {
     let artist = artist_entity::Entity::find()
         .filter(
             Condition::any()
@@ -1097,12 +1649,15 @@ async fn top_songs(state: &AppState, artist: &str, count: i64) -> Result<Value, 
         .one(&state.db)
         .await?
         .ok_or_else(not_found)?;
+    if !accessible_artist_exists(state, access, &artist.id).await? {
+        return Err(not_found());
+    }
     let track_ids = track_artist_entity::Entity::find()
         .select_only()
         .column(track_artist_entity::Column::TrackId)
         .filter(track_artist_entity::Column::ArtistId.eq(artist.id))
         .into_query();
-    let tracks = track_entity::Entity::find()
+    let tracks = accessible_tracks(access)
         .filter(track_entity::Column::Id.in_subquery(track_ids))
         .order_by_desc(track_entity::Column::PlayCount)
         .limit(count.clamp(0, 500) as u64)
@@ -1113,6 +1668,7 @@ async fn top_songs(state: &AppState, artist: &str, count: i64) -> Result<Value, 
 async fn album_list(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     method: &str,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
@@ -1133,16 +1689,15 @@ async fn album_list(
         return Err(ApiFailure::new(10, "Invalid album list type"));
     }
 
-    let folder_id = requested_music_folder(state, p).await?;
+    let folder_id = requested_music_folder(state, access, p).await?;
     let mut request = album_entity::Entity::find();
-    if let Some(folder_id) = folder_id {
-        let album_ids = track_entity::Entity::find()
-            .select_only()
-            .column(track_entity::Column::AlbumId)
-            .filter(track_entity::Column::FolderId.eq(folder_id))
-            .into_query();
-        request = request.filter(album_entity::Column::Id.in_subquery(album_ids));
+    let mut album_ids = accessible_tracks(access)
+        .select_only()
+        .column(track_entity::Column::AlbumId);
+    if let Some(folder_id) = folder_id.as_deref() {
+        album_ids = album_ids.filter(track_entity::Column::FolderId.eq(folder_id))
     }
+    request = request.filter(album_entity::Column::Id.in_subquery(album_ids.into_query()));
     request = match kind {
         "random" => request.order_by(Expr::cust("RANDOM()"), Order::Asc),
         "newest" => request.order_by_desc(album_entity::Column::CreatedAt),
@@ -1200,12 +1755,13 @@ async fn album_list(
             .order_by_asc(album_entity::Column::ArtistName)
             .order_by_asc(album_entity::Column::Name),
     };
-    let albums = request
+    let mut albums = request
         .order_by_asc(album_entity::Column::Id)
         .limit(int(p, "size", 10).clamp(1, 500) as u64)
         .offset(int(p, "offset", 0).max(0) as u64)
         .all(&state.db)
         .await?;
+    scope_album_stats(state, access, &mut albums, folder_id.as_deref()).await?;
     let key = if method.ends_with('2') {
         "albumList2"
     } else {
@@ -1218,9 +1774,13 @@ async fn album_list(
     };
     Ok(json!({key:{"album":albums}}))
 }
-async fn random_songs(state: &AppState, p: &HashMap<String, String>) -> Result<Value, ApiFailure> {
-    let folder_id = requested_music_folder(state, p).await?;
-    let mut request = track_entity::Entity::find();
+async fn random_songs(
+    state: &AppState,
+    access: &SubsonicAccess,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
+    let folder_id = requested_music_folder(state, access, p).await?;
+    let mut request = accessible_tracks(access);
     if let Some(folder_id) = folder_id {
         request = request.filter(track_entity::Column::FolderId.eq(folder_id));
     }
@@ -1254,11 +1814,12 @@ async fn random_songs(state: &AppState, p: &HashMap<String, String>) -> Result<V
 }
 async fn songs_by_genre(
     state: &AppState,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let genre = required(p, "genre")?;
-    let folder_id = requested_music_folder(state, p).await?;
-    let mut request = track_entity::Entity::find().filter(track_entity::Column::Genre.eq(genre));
+    let folder_id = requested_music_folder(state, access, p).await?;
+    let mut request = accessible_tracks(access).filter(track_entity::Column::Genre.eq(genre));
     if let Some(folder_id) = folder_id {
         request = request.filter(track_entity::Column::FolderId.eq(folder_id));
     }
@@ -1277,10 +1838,11 @@ async fn songs_by_genre(
 async fn starred(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     method: &str,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
-    let folder_id = requested_music_folder(state, p).await?;
+    let folder_id = requested_music_folder(state, access, p).await?;
     let stars = favorite_entity::Entity::find()
         .filter(favorite_entity::Column::UserId.eq(&user.id))
         .order_by_desc(favorite_entity::Column::CreatedAt)
@@ -1292,7 +1854,7 @@ async fn starred(
         .map(|star| star.item_id.clone())
         .collect::<Vec<_>>();
     let artist_cover_art = if method.ends_with('2') {
-        artist_cover_art_map(state, &starred_artist_ids, folder_id.as_deref()).await?
+        artist_cover_art_map(state, access, &starred_artist_ids, folder_id.as_deref()).await?
     } else {
         HashMap::new()
     };
@@ -1302,7 +1864,8 @@ async fn starred(
     for star in stars {
         match star.item_type.as_str() {
             "track" => {
-                if let Some(track) = track_entity::Entity::find_by_id(&star.item_id)
+                if let Some(track) = accessible_tracks(access)
+                    .filter(track_entity::Column::Id.eq(&star.item_id))
                     .one(&state.db)
                     .await?
                     .filter(|track| {
@@ -1315,21 +1878,25 @@ async fn starred(
                 }
             }
             "album" => {
-                let in_folder = if let Some(folder_id) = folder_id.as_ref() {
-                    track_entity::Entity::find()
-                        .filter(track_entity::Column::AlbumId.eq(&star.item_id))
-                        .filter(track_entity::Column::FolderId.eq(folder_id))
-                        .one(&state.db)
-                        .await?
-                        .is_some()
-                } else {
-                    true
-                };
+                let mut album_tracks = accessible_tracks(access)
+                    .filter(track_entity::Column::AlbumId.eq(&star.item_id));
+                if let Some(folder_id) = folder_id.as_ref() {
+                    album_tracks =
+                        album_tracks.filter(track_entity::Column::FolderId.eq(folder_id));
+                }
+                let in_folder = album_tracks.one(&state.db).await?.is_some();
                 if in_folder
-                    && let Some(album) = album_entity::Entity::find_by_id(&star.item_id)
+                    && let Some(mut album) = album_entity::Entity::find_by_id(&star.item_id)
                         .one(&state.db)
                         .await?
                 {
+                    scope_album_stats(
+                        state,
+                        access,
+                        std::slice::from_mut(&mut album),
+                        folder_id.as_deref(),
+                    )
+                    .await?;
                     let mut value = if method.ends_with('2') {
                         album_json(&album)
                     } else {
@@ -1340,26 +1907,32 @@ async fn starred(
                 }
             }
             "artist" => {
-                let in_folder = if let Some(folder_id) = folder_id.as_ref() {
-                    let track_ids = track_entity::Entity::find()
-                        .select_only()
-                        .column(track_entity::Column::Id)
-                        .filter(track_entity::Column::FolderId.eq(folder_id))
-                        .into_query();
-                    track_artist_entity::Entity::find()
-                        .filter(track_artist_entity::Column::ArtistId.eq(&star.item_id))
-                        .filter(track_artist_entity::Column::TrackId.in_subquery(track_ids))
-                        .one(&state.db)
-                        .await?
-                        .is_some()
-                } else {
-                    true
-                };
+                let mut track_ids = accessible_tracks(access)
+                    .select_only()
+                    .column(track_entity::Column::Id);
+                if let Some(folder_id) = folder_id.as_ref() {
+                    track_ids = track_ids.filter(track_entity::Column::FolderId.eq(folder_id));
+                }
+                let in_folder = track_artist_entity::Entity::find()
+                    .filter(track_artist_entity::Column::ArtistId.eq(&star.item_id))
+                    .filter(
+                        track_artist_entity::Column::TrackId.in_subquery(track_ids.into_query()),
+                    )
+                    .one(&state.db)
+                    .await?
+                    .is_some();
                 if in_folder
-                    && let Some(artist) = artist_entity::Entity::find_by_id(&star.item_id)
+                    && let Some(mut artist) = artist_entity::Entity::find_by_id(&star.item_id)
                         .one(&state.db)
                         .await?
                 {
+                    scope_artist_stats(
+                        state,
+                        access,
+                        std::slice::from_mut(&mut artist),
+                        folder_id.as_deref(),
+                    )
+                    .await?;
                     let mut value = if method.ends_with('2') {
                         artist_json(
                             &artist,
@@ -1383,7 +1956,11 @@ async fn starred(
     Ok(json!({key:{"song":songs,"album":albums,"artist":artists}}))
 }
 
-async fn legacy_search(state: &AppState, p: &HashMap<String, String>) -> Result<Value, ApiFailure> {
+async fn legacy_search(
+    state: &AppState,
+    access: &SubsonicAccess,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
     let any = p
         .get("any")
         .map(String::as_str)
@@ -1405,8 +1982,14 @@ async fn legacy_search(state: &AppState, p: &HashMap<String, String>) -> Result<
         .or(any);
     let mut matches = Vec::new();
     if let Some(query) = artist_query {
+        let allowed_artist_ids = library_artists(state, access, None)
+            .await?
+            .into_iter()
+            .map(|artist| artist.id)
+            .collect::<Vec<_>>();
         let artists = artist_entity::Entity::find()
             .filter(artist_entity::Column::Name.contains(query))
+            .filter(artist_entity::Column::Id.is_in(allowed_artist_ids))
             .order_by_asc(artist_entity::Column::Name)
             .all(&state.db)
             .await?;
@@ -1414,21 +1997,27 @@ async fn legacy_search(state: &AppState, p: &HashMap<String, String>) -> Result<
             .iter()
             .map(|artist| artist.id.clone())
             .collect::<Vec<_>>();
-        let cover_art = artist_cover_art_map(state, &artist_ids, None).await?;
+        let cover_art = artist_cover_art_map(state, access, &artist_ids, None).await?;
         matches.extend(artists.iter().map(|artist| {
             artist_child_json(artist, None, cover_art.get(&artist.id).map(String::as_str))
         }));
     }
     if let Some(query) = album_query {
-        let albums = album_entity::Entity::find()
+        let allowed_album_ids = accessible_tracks(access)
+            .select_only()
+            .column(track_entity::Column::AlbumId)
+            .into_query();
+        let mut albums = album_entity::Entity::find()
             .filter(album_entity::Column::Name.contains(query))
+            .filter(album_entity::Column::Id.in_subquery(allowed_album_ids))
             .order_by_asc(album_entity::Column::Name)
             .all(&state.db)
             .await?;
+        scope_album_stats(state, access, &mut albums, None).await?;
         matches.extend(albums.iter().map(album_child_json));
     }
     if let Some(query) = title_query {
-        let tracks = track_entity::Entity::find()
+        let tracks = accessible_tracks(access)
             .filter(track_entity::Column::Title.contains(query))
             .order_by_asc(track_entity::Column::Title)
             .all(&state.db)
@@ -1448,11 +2037,12 @@ async fn legacy_search(state: &AppState, p: &HashMap<String, String>) -> Result<
 
 async fn search(
     state: &AppState,
+    access: &SubsonicAccess,
     method: &str,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let query = normalize_search_query(present(p, "query")?);
-    let folder_id = requested_music_folder(state, p).await?;
+    let folder_id = requested_music_folder(state, access, p).await?;
     let artist_count = int(p, "artistCount", 20).clamp(0, MAX_COLLECTION_ITEMS as i64);
     let artist_offset = int(p, "artistOffset", 0).max(0);
     let album_count = int(p, "albumCount", 20).clamp(0, MAX_COLLECTION_ITEMS as i64);
@@ -1475,7 +2065,7 @@ async fn search(
         .order_by_asc(album_entity::Column::Id)
         .limit(album_count as u64)
         .offset(album_offset as u64);
-    let mut track_request = track_entity::Entity::find()
+    let mut track_request = accessible_tracks(access)
         .filter(
             Condition::any()
                 .add(track_entity::Column::Title.contains(&query))
@@ -1486,32 +2076,40 @@ async fn search(
         .order_by_asc(track_entity::Column::Id)
         .limit(song_count as u64)
         .offset(song_offset as u64);
-    if let Some(folder_id) = folder_id.as_deref() {
-        let folder_tracks = track_entity::Entity::find()
+    {
+        let mut folder_tracks = accessible_tracks(access)
             .select_only()
-            .column(track_entity::Column::Id)
-            .filter(track_entity::Column::FolderId.eq(folder_id))
-            .into_query();
+            .column(track_entity::Column::Id);
+        if let Some(folder_id) = folder_id.as_deref() {
+            folder_tracks = folder_tracks.filter(track_entity::Column::FolderId.eq(folder_id))
+        }
         let folder_artists = track_artist_entity::Entity::find()
             .select_only()
             .column(track_artist_entity::Column::ArtistId)
-            .filter(track_artist_entity::Column::TrackId.in_subquery(folder_tracks))
+            .filter(
+                track_artist_entity::Column::TrackId
+                    .in_subquery(folder_tracks.clone().into_query()),
+            )
             .into_query();
-        let folder_albums = track_entity::Entity::find()
+        let mut folder_albums = accessible_tracks(access)
             .select_only()
-            .column(track_entity::Column::AlbumId)
-            .filter(track_entity::Column::FolderId.eq(folder_id))
-            .into_query();
+            .column(track_entity::Column::AlbumId);
+        if let Some(folder_id) = folder_id.as_deref() {
+            folder_albums = folder_albums.filter(track_entity::Column::FolderId.eq(folder_id));
+            track_request = track_request.filter(track_entity::Column::FolderId.eq(folder_id));
+        }
         artist_request =
             artist_request.filter(artist_entity::Column::Id.in_subquery(folder_artists));
-        album_request = album_request.filter(album_entity::Column::Id.in_subquery(folder_albums));
-        track_request = track_request.filter(track_entity::Column::FolderId.eq(folder_id));
+        album_request =
+            album_request.filter(album_entity::Column::Id.in_subquery(folder_albums.into_query()));
     }
-    let (artists, albums, tracks) = tokio::try_join!(
+    let (mut artists, mut albums, tracks) = tokio::try_join!(
         artist_request.all(&state.db),
         album_request.all(&state.db),
         track_request.all(&state.db),
     )?;
+    scope_artist_stats(state, access, &mut artists, folder_id.as_deref()).await?;
+    scope_album_stats(state, access, &mut albums, folder_id.as_deref()).await?;
     let key = if method == "search3" {
         "searchResult3"
     } else {
@@ -1527,7 +2125,8 @@ async fn search(
             .iter()
             .map(|artist| artist.id.clone())
             .collect::<Vec<_>>();
-        let cover_art = artist_cover_art_map(state, &artist_ids, folder_id.as_deref()).await?;
+        let cover_art =
+            artist_cover_art_map(state, access, &artist_ids, folder_id.as_deref()).await?;
         artists
             .iter()
             .map(|artist| artist_json(artist, cover_art.get(&artist.id).map(String::as_str)))
@@ -1543,6 +2142,7 @@ async fn search(
 async fn playlists(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let owner_id = if let Some(username) = p.get("username") {
@@ -1567,14 +2167,19 @@ async fn playlists(
         .await?;
     let mut values = Vec::with_capacity(rows.len());
     for row in rows {
-        let tracks = playlist_tracks(state, &row.id).await?;
+        let tracks = playlist_tracks(state, access, &row.id).await?;
         values.push(playlist_json(state, &row, &tracks).await?);
     }
     Ok(json!({"playlists":{"playlist":values}}))
 }
-async fn playlist(state: &AppState, user: &User, id: &str) -> Result<Value, ApiFailure> {
+async fn playlist(
+    state: &AppState,
+    user: &User,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Value, ApiFailure> {
     let row = accessible_playlist(state, user, id).await?;
-    let tracks = playlist_tracks(state, id).await?;
+    let tracks = playlist_tracks(state, access, id).await?;
     let mut value = playlist_json(state, &row, &tracks).await?;
     value["entry"] = Value::Array(tracks.iter().map(|v| track_json(v, None)).collect());
     Ok(json!({"playlist":value}))
@@ -1582,6 +2187,7 @@ async fn playlist(state: &AppState, user: &User, id: &str) -> Result<Value, ApiF
 async fn create_playlist(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let id = if let Some(id) = p.get("playlistId") {
@@ -1609,12 +2215,13 @@ async fn create_playlist(
         .await?;
         id
     };
-    replace_playlist_tracks(state, &id, p).await?;
-    playlist(state, user, &id).await
+    replace_playlist_tracks(state, access, &id, p).await?;
+    playlist(state, user, access, &id).await
 }
 async fn update_playlist(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let id = required(p, "playlistId")?;
@@ -1649,7 +2256,7 @@ async fn update_playlist(
     }
     ids.extend(multi(p, "songIdToAdd"));
     if p.contains_key("songIndexToRemove") || p.contains_key("songIdToAdd") {
-        set_playlist_tracks(state, id, &ids).await?;
+        set_playlist_tracks(state, access, id, &ids).await?;
     }
     Ok(json!({}))
 }
@@ -1693,11 +2300,12 @@ async fn accessible_playlist(
 }
 async fn replace_playlist_tracks(
     state: &AppState,
+    access: &SubsonicAccess,
     id: &str,
     p: &HashMap<String, String>,
 ) -> Result<(), ApiFailure> {
     if p.contains_key("songId") {
-        set_playlist_tracks(state, id, &multi(p, "songId")).await?;
+        set_playlist_tracks(state, access, id, &multi(p, "songId")).await?;
     }
     Ok(())
 }
@@ -1713,12 +2321,16 @@ async fn playlist_track_ids(state: &AppState, id: &str) -> Result<Vec<String>, A
         .collect())
 }
 
-async fn playlist_tracks(state: &AppState, id: &str) -> Result<Vec<Track>, ApiFailure> {
+async fn playlist_tracks(
+    state: &AppState,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Vec<Track>, ApiFailure> {
     let ids = playlist_track_ids(state, id).await?;
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let tracks = track_entity::Entity::find()
+    let tracks = accessible_tracks(access)
         .filter(track_entity::Column::Id.is_in(ids.clone()))
         .all(&state.db)
         .await?
@@ -1733,10 +2345,11 @@ async fn playlist_tracks(state: &AppState, id: &str) -> Result<Vec<Track>, ApiFa
 
 async fn set_playlist_tracks(
     state: &AppState,
+    access: &SubsonicAccess,
     id: &str,
     track_ids: &[String],
 ) -> Result<(), ApiFailure> {
-    validate_track_ids(state, track_ids, MAX_COLLECTION_ITEMS).await?;
+    validate_track_ids(state, access, track_ids, MAX_COLLECTION_ITEMS).await?;
 
     let transaction = state.db.begin().await?;
     playlist_track_entity::Entity::delete_many()
@@ -1760,11 +2373,12 @@ async fn set_playlist_tracks(
 
 async fn get_lyrics_legacy(
     state: &AppState,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let artist = p.get("artist").map(String::as_str).unwrap_or("");
     let title = p.get("title").map(String::as_str).unwrap_or("");
-    let mut request = track_entity::Entity::find();
+    let mut request = accessible_tracks(access);
     if !title.is_empty() {
         request = request.filter(track_entity::Column::Title.eq(title));
     }
@@ -1786,8 +2400,12 @@ async fn get_lyrics_legacy(
         json!({"lyrics":{"artist":artist,"title":title,"value":row.map(|track|track.lyrics).unwrap_or_default()}}),
     )
 }
-async fn get_lyrics_by_song(state: &AppState, id: &str) -> Result<Value, ApiFailure> {
-    let track = track(state, id).await.map_err(ApiFailure::from)?;
+async fn get_lyrics_by_song(
+    state: &AppState,
+    access: &SubsonicAccess,
+    id: &str,
+) -> Result<Value, ApiFailure> {
+    let track = accessible_track(state, access, id).await?;
     if track.lyrics.trim().is_empty() {
         return Ok(json!({"lyricsList":{"structuredLyrics":[]}}));
     }
@@ -1856,108 +2474,137 @@ fn parse_lrc_timestamp(value: &str) -> Option<i64> {
 async fn favorite(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
     add: bool,
 ) -> Result<Value, ApiFailure> {
-    let groups = [
-        ("track", multi(p, "id")),
-        ("album", multi(p, "albumId")),
-        ("artist", multi(p, "artistId")),
-    ];
-    if add {
-        for (kind, ids) in &groups {
-            validate_catalog_ids(state, kind, ids).await?;
-        }
-    } else if groups
-        .iter()
-        .any(|(_, ids)| ids.len() > MAX_COLLECTION_ITEMS)
-    {
+    let legacy_ids = multi(p, "id");
+    let album_ids = multi(p, "albumId");
+    let artist_ids = multi(p, "artistId");
+    if legacy_ids.len() + album_ids.len() + artist_ids.len() > MAX_CATALOG_MUTATION_ITEMS {
         return Err(ApiFailure::new(10, "Too many IDs in one request"));
     }
-    let transaction = state.db.begin().await?;
-    for (kind, ids) in groups {
-        for id in ids {
-            if add {
-                favorite_entity::Entity::delete_many()
-                    .filter(favorite_entity::Column::UserId.eq(&user.id))
-                    .filter(favorite_entity::Column::ItemType.eq(kind))
-                    .filter(favorite_entity::Column::ItemId.eq(&id))
-                    .exec(&transaction)
-                    .await?;
-                favorite_entity::ActiveModel {
-                    user_id: Set(user.id.clone()),
-                    item_type: Set(kind.to_owned()),
-                    item_id: Set(id),
-                    created_at: Set(Utc::now().to_rfc3339()),
-                }
-                .insert(&transaction)
-                .await?;
+    let mut items = HashSet::<(&'static str, String)>::new();
+    if add {
+        let all_ids = legacy_ids
+            .iter()
+            .chain(&album_ids)
+            .chain(&artist_ids)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let track_matches = existing_catalog_ids(state, access, "track", &all_ids).await?;
+        let album_matches = existing_catalog_ids(state, access, "album", &all_ids).await?;
+        let artist_matches = existing_catalog_ids(state, access, "artist", &all_ids).await?;
+        for id in legacy_ids {
+            let kind = if track_matches.contains(&id) {
+                "track"
+            } else if album_matches.contains(&id) {
+                "album"
+            } else if artist_matches.contains(&id) {
+                "artist"
             } else {
-                favorite_entity::Entity::delete_many()
-                    .filter(favorite_entity::Column::UserId.eq(&user.id))
-                    .filter(favorite_entity::Column::ItemType.eq(kind))
-                    .filter(favorite_entity::Column::ItemId.eq(id))
-                    .exec(&transaction)
-                    .await?;
+                return Err(not_found());
+            };
+            items.insert((kind, id));
+        }
+        for id in album_ids {
+            if !album_matches.contains(&id) {
+                return Err(not_found());
             }
+            items.insert(("album", id));
+        }
+        for id in artist_ids {
+            if !artist_matches.contains(&id) {
+                return Err(not_found());
+            }
+            items.insert(("artist", id));
+        }
+    } else {
+        for id in legacy_ids {
+            for kind in ["track", "album", "artist"] {
+                items.insert((kind, id.clone()));
+            }
+        }
+        items.extend(album_ids.into_iter().map(|id| ("album", id)));
+        items.extend(artist_ids.into_iter().map(|id| ("artist", id)));
+    }
+    let transaction = state.db.begin().await?;
+    for (kind, id) in items {
+        favorite_entity::Entity::delete_many()
+            .filter(favorite_entity::Column::UserId.eq(&user.id))
+            .filter(favorite_entity::Column::ItemType.eq(kind))
+            .filter(favorite_entity::Column::ItemId.eq(&id))
+            .exec(&transaction)
+            .await?;
+        if add {
+            favorite_entity::ActiveModel {
+                user_id: Set(user.id.clone()),
+                item_type: Set(kind.to_owned()),
+                item_id: Set(id),
+                created_at: Set(Utc::now().to_rfc3339()),
+            }
+            .insert(&transaction)
+            .await?;
         }
     }
     transaction.commit().await?;
     Ok(json!({}))
 }
 
-async fn validate_catalog_ids(
+async fn existing_catalog_ids(
     state: &AppState,
+    access: &SubsonicAccess,
     kind: &str,
-    ids: &[String],
-) -> Result<(), ApiFailure> {
-    if ids.len() > MAX_COLLECTION_ITEMS {
-        return Err(ApiFailure::new(10, "Too many IDs in one request"));
+    ids: &HashSet<String>,
+) -> Result<HashSet<String>, ApiFailure> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
     }
-    let requested = ids.iter().cloned().collect::<HashSet<_>>();
-    if requested.is_empty() {
-        return Ok(());
-    }
-    let existing = match kind {
-        "track" => {
-            track_entity::Entity::find()
+    match kind {
+        "track" => Ok(accessible_tracks(access)
+            .select_only()
+            .column(track_entity::Column::Id)
+            .filter(track_entity::Column::Id.is_in(ids.iter().cloned()))
+            .into_tuple::<String>()
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .collect()),
+        "album" => Ok(accessible_tracks(access)
+            .select_only()
+            .column(track_entity::Column::AlbumId)
+            .filter(track_entity::Column::AlbumId.is_in(ids.iter().cloned()))
+            .distinct()
+            .into_tuple::<Option<String>>()
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect()),
+        "artist" => {
+            let track_ids = accessible_tracks(access)
                 .select_only()
                 .column(track_entity::Column::Id)
-                .filter(track_entity::Column::Id.is_in(requested.iter().cloned()))
-                .into_tuple::<String>()
-                .all(&state.db)
-                .await?
-        }
-        "album" => {
-            album_entity::Entity::find()
+                .into_query();
+            Ok(track_artist_entity::Entity::find()
                 .select_only()
-                .column(album_entity::Column::Id)
-                .filter(album_entity::Column::Id.is_in(requested.iter().cloned()))
+                .column(track_artist_entity::Column::ArtistId)
+                .filter(track_artist_entity::Column::ArtistId.is_in(ids.iter().cloned()))
+                .filter(track_artist_entity::Column::TrackId.in_subquery(track_ids))
+                .distinct()
                 .into_tuple::<String>()
                 .all(&state.db)
                 .await?
+                .into_iter()
+                .collect())
         }
-        "artist" => {
-            artist_entity::Entity::find()
-                .select_only()
-                .column(artist_entity::Column::Id)
-                .filter(artist_entity::Column::Id.is_in(requested.iter().cloned()))
-                .into_tuple::<String>()
-                .all(&state.db)
-                .await?
-        }
-        _ => return Err(ApiFailure::new(10, "Invalid catalog item type")),
+        _ => Err(ApiFailure::new(10, "Invalid catalog item type")),
     }
-    .into_iter()
-    .collect::<HashSet<_>>();
-    if existing != requested {
-        return Err(not_found());
-    }
-    Ok(())
 }
 async fn set_rating(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let id = required(p, "id")?;
@@ -1965,23 +2612,21 @@ async fn set_rating(
     if !(0..=5).contains(&rating) {
         return Err(ApiFailure::new(10, "Rating must be between 0 and 5"));
     }
-    let item_type = if track_entity::Entity::find_by_id(id)
+    let item_type = if accessible_tracks(access)
+        .filter(track_entity::Column::Id.eq(id))
         .one(&state.db)
         .await?
         .is_some()
     {
         "track"
-    } else if album_entity::Entity::find_by_id(id)
+    } else if accessible_tracks(access)
+        .filter(track_entity::Column::AlbumId.eq(id))
         .one(&state.db)
         .await?
         .is_some()
     {
         "album"
-    } else if artist_entity::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .is_some()
-    {
+    } else if accessible_artist_exists(state, access, id).await? {
         "artist"
     } else {
         return Err(not_found());
@@ -2006,16 +2651,208 @@ async fn set_rating(
     transaction.commit().await?;
     Ok(json!({}))
 }
+
+async fn report_playback(
+    state: &AppState,
+    user: &User,
+    access: &SubsonicAccess,
+    p: &HashMap<String, String>,
+) -> Result<Value, ApiFailure> {
+    let media_id = required(p, "mediaId")?;
+    if required(p, "mediaType")? != "song" {
+        return Err(ApiFailure::new(
+            10,
+            "Only song playback reports are supported",
+        ));
+    }
+    let track = accessible_track(state, access, media_id).await?;
+    let position_ms = required_i64(p, "positionMs")?;
+    if position_ms < 0 {
+        return Err(ApiFailure::new(10, "positionMs must not be negative"));
+    }
+    let playback_state = required(p, "state")?;
+    if !matches!(
+        playback_state,
+        "starting" | "playing" | "paused" | "stopped"
+    ) {
+        return Err(ApiFailure::new(10, "Invalid playback state"));
+    }
+    let playback_rate = p
+        .get("playbackRate")
+        .map(|value| value.parse::<f64>())
+        .transpose()
+        .map_err(|_| ApiFailure::new(10, "Invalid playbackRate"))?
+        .unwrap_or(1.0);
+    if !playback_rate.is_finite() || playback_rate <= 0.0 || playback_rate > 16.0 {
+        return Err(ApiFailure::new(10, "Invalid playbackRate"));
+    }
+    let ignore_scrobble = bool_param(p, "ignoreScrobble");
+    let now = Utc::now();
+    let updated_at = now.to_rfc3339();
+    let threshold_ms = ((track.duration * 500.0).min(240_000.0)).round() as i64;
+    let should_scrobble = !ignore_scrobble
+        && track.duration > 30.0
+        && playback_state != "starting"
+        && position_ms >= threshold_ms;
+    let transaction = state.db.begin().await?;
+    playback_state_entity::Entity::insert(playback_state_entity::ActiveModel {
+        user_id: Set(user.id.clone()),
+        media_id: Set(media_id.to_owned()),
+        media_type: Set("song".into()),
+        position_ms: Set(position_ms),
+        state: Set(playback_state.to_owned()),
+        playback_rate: Set(playback_rate),
+        ignore_scrobble: Set(ignore_scrobble as i64),
+        scrobbled: Set(0),
+        updated_at: Set(updated_at.clone()),
+        client: Set(p.get("c").cloned().unwrap_or_default()),
+    })
+    .on_conflict(
+        OnConflict::columns([playback_state_entity::Column::UserId])
+            .update_columns([
+                playback_state_entity::Column::MediaId,
+                playback_state_entity::Column::MediaType,
+                playback_state_entity::Column::PositionMs,
+                playback_state_entity::Column::State,
+                playback_state_entity::Column::PlaybackRate,
+                playback_state_entity::Column::IgnoreScrobble,
+                playback_state_entity::Column::UpdatedAt,
+                playback_state_entity::Column::Client,
+            ])
+            .value(
+                playback_state_entity::Column::Scrobbled,
+                Expr::cust(
+                    "CASE WHEN playback_states.media_id = excluded.media_id \
+                     AND excluded.state <> 'starting' THEN playback_states.scrobbled ELSE 0 END",
+                ),
+            )
+            .to_owned(),
+    )
+    .exec_without_returning(&transaction)
+    .await?;
+    let claimed_scrobble = if should_scrobble {
+        playback_state_entity::Entity::update_many()
+            .col_expr(playback_state_entity::Column::Scrobbled, Expr::value(1))
+            .filter(playback_state_entity::Column::UserId.eq(&user.id))
+            .filter(playback_state_entity::Column::MediaId.eq(media_id))
+            .filter(playback_state_entity::Column::Scrobbled.eq(0))
+            .exec(&transaction)
+            .await?
+            .rows_affected
+            == 1
+    } else {
+        false
+    };
+    if claimed_scrobble {
+        scrobble_entity::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user.id.clone()),
+            track_id: Set(media_id.to_owned()),
+            played_at: Set(updated_at.clone()),
+            submission: Set(1),
+        }
+        .insert(&transaction)
+        .await?;
+        track_entity::Entity::update_many()
+            .col_expr(
+                track_entity::Column::PlayCount,
+                Expr::col(track_entity::Column::PlayCount).add(1),
+            )
+            .filter(track_entity::Column::Id.eq(media_id))
+            .exec(&transaction)
+            .await?;
+        increment_user_track_stats(&transaction, &user.id, media_id, 1, &updated_at).await?;
+    }
+    transaction.commit().await?;
+    if claimed_scrobble {
+        let state = state.clone();
+        let user_id = user.id.clone();
+        let reports = vec![(track, now.timestamp())];
+        tokio::spawn(async move {
+            if let Err(error) = lastfm::report(&state, &user_id, reports, true).await {
+                tracing::warn!(%error, %user_id, "failed to report playback to Last.fm");
+            }
+        });
+    }
+    Ok(json!({}))
+}
+
+async fn now_playing(state: &AppState, access: &SubsonicAccess) -> Result<Value, ApiFailure> {
+    let now = Utc::now();
+    let states = playback_state_entity::Entity::find()
+        .filter(playback_state_entity::Column::State.ne("stopped"))
+        .order_by_desc(playback_state_entity::Column::UpdatedAt)
+        .all(&state.db)
+        .await?;
+    let mut entries = Vec::new();
+    for playback in states {
+        let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&playback.updated_at) else {
+            continue;
+        };
+        let updated_at = updated_at.with_timezone(&Utc);
+        let elapsed_ms = now
+            .signed_duration_since(updated_at)
+            .num_milliseconds()
+            .max(0);
+        let Ok(track) = accessible_track(state, access, &playback.media_id).await else {
+            continue;
+        };
+        let duration_ms = (track.duration.max(0.0) * 1_000.0).round() as i64;
+        let position_ms = if playback.state == "playing" {
+            playback
+                .position_ms
+                .saturating_add(((elapsed_ms as f64) * playback.playback_rate).round() as i64)
+        } else {
+            playback.position_ms
+        }
+        .clamp(
+            0,
+            if duration_ms > 0 {
+                duration_ms
+            } else {
+                playback.position_ms.max(0)
+            },
+        );
+        let expires_after_ms = if playback.state == "playing" && duration_ms > 0 {
+            let remaining_ms = (duration_ms - playback.position_ms).max(0) as f64;
+            ((remaining_ms / playback.playback_rate).round() as i64).saturating_add(30 * 60_000)
+        } else {
+            30 * 60_000
+        };
+        if elapsed_ms > expires_after_ms {
+            continue;
+        }
+        let Some(username) = user_entity::Entity::find_by_id(&playback.user_id)
+            .one(&state.db)
+            .await?
+            .map(|user| user.username)
+        else {
+            continue;
+        };
+        let mut entry = track_json(&track, None);
+        entry["username"] = json!(username);
+        entry["minutesAgo"] = json!(elapsed_ms / 60_000);
+        entry["playerId"] = json!(0);
+        entry["playerName"] = json!(playback.client);
+        entry["state"] = json!(playback.state);
+        entry["positionMs"] = json!(position_ms);
+        entry["playbackRate"] = json!(playback.playback_rate);
+        entries.push(entry);
+    }
+    Ok(json!({"nowPlaying":{"entry":entries}}))
+}
+
 async fn scrobble(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let ids = multi(p, "id");
     if ids.is_empty() {
         return Err(ApiFailure::new(10, "Missing required parameter: id"));
     }
-    validate_track_ids(state, &ids, MAX_SCROBBLE_BATCH).await?;
+    validate_track_ids(state, access, &ids, MAX_SCROBBLE_BATCH).await?;
     let times = multi(p, "time");
     let submission = p
         .get("submission")
@@ -2086,6 +2923,37 @@ async fn scrobble(
             .exec(&transaction)
             .await?;
         increment_user_track_stats(&transaction, &user.id, &id, count, &last_played_at).await?;
+    }
+    if !submission && let Some(media_id) = ids.last() {
+        playback_state_entity::Entity::insert(playback_state_entity::ActiveModel {
+            user_id: Set(user.id.clone()),
+            media_id: Set(media_id.clone()),
+            media_type: Set("song".into()),
+            position_ms: Set(0),
+            state: Set("playing".into()),
+            playback_rate: Set(1.0),
+            ignore_scrobble: Set(0),
+            scrobbled: Set(0),
+            updated_at: Set(Utc::now().to_rfc3339()),
+            client: Set(p.get("c").cloned().unwrap_or_default()),
+        })
+        .on_conflict(
+            OnConflict::columns([playback_state_entity::Column::UserId])
+                .update_columns([
+                    playback_state_entity::Column::MediaId,
+                    playback_state_entity::Column::MediaType,
+                    playback_state_entity::Column::PositionMs,
+                    playback_state_entity::Column::State,
+                    playback_state_entity::Column::PlaybackRate,
+                    playback_state_entity::Column::IgnoreScrobble,
+                    playback_state_entity::Column::Scrobbled,
+                    playback_state_entity::Column::UpdatedAt,
+                    playback_state_entity::Column::Client,
+                ])
+                .to_owned(),
+        )
+        .exec_without_returning(&transaction)
+        .await?;
     }
     transaction.commit().await?;
     let reports = ids
@@ -2161,6 +3029,7 @@ async fn shares(state: &AppState, user: &User) -> Result<Value, ApiFailure> {
 async fn create_share(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let id = Uuid::new_v4().to_string();
@@ -2168,7 +3037,7 @@ async fn create_share(
     if ids.is_empty() {
         return Err(ApiFailure::new(10, "Missing required parameter: id"));
     }
-    validate_track_ids(state, &ids, MAX_COLLECTION_ITEMS).await?;
+    validate_share_ids(state, access, &ids).await?;
     let share = share_entity::ActiveModel {
         id: Set(id),
         user_id: Set(user.id.clone()),
@@ -2345,8 +3214,9 @@ async fn get_user(state: &AppState, requester: &User, username: &str) -> Result<
     let user = user_by_name(&state.db, username)
         .await?
         .ok_or_else(not_found)?;
-    let folder_ids = user_folder_ids(state).await?;
-    Ok(json!({"user":user_json(&user, &folder_ids)}))
+    let access = subsonic_access(state, &user).await?;
+    let folder_ids = user_folder_ids(state, &access).await?;
+    Ok(json!({"user":user_json(&user, &access, &folder_ids)}))
 }
 async fn get_users(state: &AppState, requester: &User) -> Result<Value, ApiFailure> {
     require_admin(requester)?;
@@ -2354,11 +3224,137 @@ async fn get_users(state: &AppState, requester: &User) -> Result<Value, ApiFailu
         .order_by_asc(user_entity::Column::Username)
         .all(&state.db)
         .await?;
-    let folder_ids = user_folder_ids(state).await?;
-    Ok(
-        json!({"users":{"user":users.iter().map(|user|user_json(user, &folder_ids)).collect::<Vec<_>>()}}),
-    )
+    let mut values = Vec::with_capacity(users.len());
+    for user in users {
+        let access = subsonic_access(state, &user).await?;
+        let folder_ids = user_folder_ids(state, &access).await?;
+        values.push(user_json(&user, &access, &folder_ids));
+    }
+    Ok(json!({"users":{"user":values}}))
 }
+
+async fn access_from_params(
+    state: &AppState,
+    existing: Option<SubsonicAccess>,
+    p: &HashMap<String, String>,
+) -> Result<SubsonicAccess, ApiFailure> {
+    let mut access = existing.unwrap_or(SubsonicAccess {
+        ldap_authenticated: false,
+        settings_role: true,
+        stream_role: true,
+        jukebox_role: false,
+        download_role: false,
+        upload_role: false,
+        playlist_role: false,
+        cover_art_role: false,
+        comment_role: false,
+        podcast_role: false,
+        share_role: false,
+        video_conversion_role: false,
+        max_bit_rate: 0,
+        folder_ids: None,
+    });
+    if bool_param(p, "ldapAuthenticated") {
+        return Err(ApiFailure::new(
+            10,
+            "LDAP authentication is not enabled on this server",
+        ));
+    }
+    access.ldap_authenticated = false;
+    for (key, field) in [
+        ("settingsRole", &mut access.settings_role),
+        ("streamRole", &mut access.stream_role),
+        ("jukeboxRole", &mut access.jukebox_role),
+        ("downloadRole", &mut access.download_role),
+        ("uploadRole", &mut access.upload_role),
+        ("playlistRole", &mut access.playlist_role),
+        ("coverArtRole", &mut access.cover_art_role),
+        ("commentRole", &mut access.comment_role),
+        ("podcastRole", &mut access.podcast_role),
+        ("shareRole", &mut access.share_role),
+        ("videoConversionRole", &mut access.video_conversion_role),
+    ] {
+        if p.contains_key(key) {
+            *field = bool_param(p, key);
+        }
+    }
+    if p.contains_key("maxBitRate") {
+        let max_bit_rate = required_i64(p, "maxBitRate")?;
+        if !matches!(
+            max_bit_rate,
+            0 | 32 | 40 | 48 | 56 | 64 | 80 | 96 | 112 | 128 | 160 | 192 | 224 | 256 | 320
+        ) {
+            return Err(ApiFailure::new(10, "Invalid maxBitRate"));
+        }
+        access.max_bit_rate = max_bit_rate;
+    }
+    if p.contains_key("musicFolderId") {
+        let mut folder_ids = HashSet::new();
+        for folder_id in multi(p, "musicFolderId") {
+            let folder = find_music_folder(state, &folder_id)
+                .await?
+                .ok_or_else(not_found)?;
+            folder_ids.insert(folder.id);
+        }
+        access.folder_ids = Some(folder_ids);
+    }
+    Ok(access)
+}
+
+async fn save_access(
+    db: &DatabaseTransaction,
+    user_id: &str,
+    access: &SubsonicAccess,
+) -> Result<(), ApiFailure> {
+    let folder_ids = if let Some(folder_ids) = &access.folder_ids {
+        let mut folder_ids = folder_ids.iter().cloned().collect::<Vec<_>>();
+        folder_ids.sort();
+        serde_json::to_string(&folder_ids).unwrap_or_else(|_| "[]".into())
+    } else {
+        "*".into()
+    };
+    access_entity::Entity::insert(access_entity::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        ldap_authenticated: Set(access.ldap_authenticated as i64),
+        settings_role: Set(access.settings_role as i64),
+        stream_role: Set(access.stream_role as i64),
+        jukebox_role: Set(access.jukebox_role as i64),
+        download_role: Set(access.download_role as i64),
+        upload_role: Set(access.upload_role as i64),
+        playlist_role: Set(access.playlist_role as i64),
+        cover_art_role: Set(access.cover_art_role as i64),
+        comment_role: Set(access.comment_role as i64),
+        podcast_role: Set(access.podcast_role as i64),
+        share_role: Set(access.share_role as i64),
+        video_conversion_role: Set(access.video_conversion_role as i64),
+        max_bit_rate: Set(access.max_bit_rate),
+        folder_ids: Set(folder_ids),
+    })
+    .on_conflict(
+        OnConflict::columns([access_entity::Column::UserId])
+            .update_columns([
+                access_entity::Column::LdapAuthenticated,
+                access_entity::Column::SettingsRole,
+                access_entity::Column::StreamRole,
+                access_entity::Column::JukeboxRole,
+                access_entity::Column::DownloadRole,
+                access_entity::Column::UploadRole,
+                access_entity::Column::PlaylistRole,
+                access_entity::Column::CoverArtRole,
+                access_entity::Column::CommentRole,
+                access_entity::Column::PodcastRole,
+                access_entity::Column::ShareRole,
+                access_entity::Column::VideoConversionRole,
+                access_entity::Column::MaxBitRate,
+                access_entity::Column::FolderIds,
+            ])
+            .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await?;
+    Ok(())
+}
+
 async fn create_user(
     state: &AppState,
     requester: &User,
@@ -2370,8 +3366,14 @@ async fn create_user(
     validate_username(username)?;
     validate_new_password(&password)?;
     let hash = hash_password(&password)?;
+    let user_id = Uuid::new_v4().to_string();
+    let api_key = Uuid::new_v4().simple().to_string();
+    let protected_api_key =
+        protect_subsonic_api_key(&api_key, &state.settings.auth.jwt_secret, &user_id)?;
+    let access = access_from_params(state, None, p).await?;
+    let transaction = state.db.begin().await?;
     user_entity::ActiveModel {
-        id: Set(Uuid::new_v4().to_string()),
+        id: Set(user_id.clone()),
         username: Set(username.to_owned()),
         password_hash: Set(hash),
         email: Set(required(p, "email")?.to_owned()),
@@ -2380,7 +3382,7 @@ async fn create_user(
         } else {
             "user".into()
         }),
-        subsonic_token: Set(Uuid::new_v4().simple().to_string()),
+        subsonic_token: Set(protected_api_key),
         subsonic_password: Set(encrypt_subsonic_password(
             &password,
             &state.settings.auth.jwt_secret,
@@ -2388,8 +3390,10 @@ async fn create_user(
         )?),
         created_at: Set(Utc::now().to_rfc3339()),
     }
-    .insert(&state.db)
+    .insert(&transaction)
     .await?;
+    save_access(&transaction, &user_id, &access).await?;
+    transaction.commit().await?;
     Ok(json!({}))
 }
 async fn update_user(
@@ -2399,11 +3403,11 @@ async fn update_user(
 ) -> Result<Value, ApiFailure> {
     require_admin(requester)?;
     let username = required(p, "username")?;
-    let password = decode_subsonic_password(required(p, "password")?)?;
-    validate_new_password(&password)?;
     let user = user_by_name(&state.db, username)
         .await?
         .ok_or_else(not_found)?;
+    let user_id = user.id.clone();
+    let access = access_from_params(state, Some(subsonic_access(state, &user).await?), p).await?;
     let mut active = user.into_active_model();
     if let Some(email) = p.get("email") {
         active.email = Set(email.clone());
@@ -2421,13 +3425,20 @@ async fn update_user(
             "user".into()
         });
     }
-    active.password_hash = Set(hash_password(&password)?);
-    active.subsonic_password = Set(encrypt_subsonic_password(
-        &password,
-        &state.settings.auth.jwt_secret,
-        username,
-    )?);
-    active.update(&state.db).await?;
+    if let Some(password) = p.get("password") {
+        let password = decode_subsonic_password(password)?;
+        validate_new_password(&password)?;
+        active.password_hash = Set(hash_password(&password)?);
+        active.subsonic_password = Set(encrypt_subsonic_password(
+            &password,
+            &state.settings.auth.jwt_secret,
+            username,
+        )?);
+    }
+    let transaction = state.db.begin().await?;
+    active.update(&transaction).await?;
+    save_access(&transaction, &user_id, &access).await?;
+    transaction.commit().await?;
     Ok(json!({}))
 }
 async fn delete_user(
@@ -2480,6 +3491,12 @@ async fn delete_user(
         .filter(share_entity::Column::UserId.eq(&user.id))
         .exec(&transaction)
         .await?;
+    access_entity::Entity::delete_by_id(&user.id)
+        .exec(&transaction)
+        .await?;
+    playback_state_entity::Entity::delete_by_id(&user.id)
+        .exec(&transaction)
+        .await?;
     play_queue_entity::Entity::delete_by_id(&user.id)
         .exec(&transaction)
         .await?;
@@ -2494,11 +3511,15 @@ async fn delete_user(
 async fn change_password(
     state: &AppState,
     requester: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let username = required(p, "username")?;
     if requester.role != "admin" && requester.username != username {
         return Err(ApiFailure::new(50, "Not authorized"));
+    }
+    if requester.role != "admin" && !access.settings_role {
+        return Err(ApiFailure::new(50, "Settings role required"));
     }
     let password = decode_subsonic_password(required(p, "password")?)?;
     validate_new_password(&password)?;
@@ -2516,7 +3537,11 @@ async fn change_password(
     Ok(json!({}))
 }
 
-async fn bookmarks(state: &AppState, user: &User) -> Result<Value, ApiFailure> {
+async fn bookmarks(
+    state: &AppState,
+    user: &User,
+    access: &SubsonicAccess,
+) -> Result<Value, ApiFailure> {
     let rows = bookmark_entity::Entity::find()
         .filter(bookmark_entity::Column::UserId.eq(&user.id))
         .order_by_desc(bookmark_entity::Column::ChangedAt)
@@ -2524,7 +3549,7 @@ async fn bookmarks(state: &AppState, user: &User) -> Result<Value, ApiFailure> {
         .await?;
     let mut values = Vec::new();
     for row in rows {
-        if let Ok(track) = track(state, &row.track_id).await {
+        if let Ok(track) = accessible_track(state, access, &row.track_id).await {
             values.push(json!({"position":row.position,"username":user.username,"comment":row.comment,"created":row.changed_at,"changed":row.changed_at,"entry":track_json(&track,None)}));
         }
     }
@@ -2533,10 +3558,11 @@ async fn bookmarks(state: &AppState, user: &User) -> Result<Value, ApiFailure> {
 async fn create_bookmark(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     let id = required(p, "id")?;
-    track(state, id).await.map_err(ApiFailure::from)?;
+    accessible_track(state, access, id).await?;
     bookmark_entity::Entity::delete_many()
         .filter(bookmark_entity::Column::UserId.eq(&user.id))
         .filter(bookmark_entity::Column::TrackId.eq(id))
@@ -2564,6 +3590,7 @@ async fn delete_bookmark(state: &AppState, user: &User, id: &str) -> Result<Valu
 async fn get_play_queue(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     by_index: bool,
 ) -> Result<Value, ApiFailure> {
     let row = play_queue_entity::Entity::find_by_id(&user.id)
@@ -2578,23 +3605,48 @@ async fn get_play_queue(
         });
     };
     let ids: Vec<String> = serde_json::from_str(&row.track_ids).unwrap_or_default();
-    let mut entries = Vec::new();
-    for id in &ids {
-        if let Ok(t) = track(state, id).await {
-            entries.push(track_json(&t, None));
+    let requested_ids = ids.iter().cloned().collect::<HashSet<_>>();
+    let tracks = if requested_ids.is_empty() {
+        HashMap::new()
+    } else {
+        accessible_tracks(access)
+            .filter(track_entity::Column::Id.is_in(requested_ids))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|track| (track.id.clone(), track))
+            .collect::<HashMap<_, _>>()
+    };
+    let mut visible_entries = Vec::new();
+    for (original_index, id) in ids.iter().enumerate() {
+        if let Some(track) = tracks.get(id) {
+            visible_entries.push((original_index, track.clone()));
         }
     }
+    let entries = visible_entries
+        .iter()
+        .map(|(_, track)| track_json(track, None))
+        .collect::<Vec<_>>();
     let mut queue = json!({"position":row.position,"username":user.username,"changed":row.changed_at,"changedBy":row.changed_by,"entry":entries});
-    if !ids.is_empty() {
-        if by_index {
-            queue["currentIndex"] = json!(
+    if !visible_entries.is_empty() {
+        let original_current_index = row
+            .current_index
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < ids.len())
+            .or_else(|| {
                 row.current_id
                     .as_ref()
                     .and_then(|current| ids.iter().position(|id| id == current))
-                    .unwrap_or(0)
-            );
+            })
+            .unwrap_or(visible_entries[0].0);
+        let visible_current_index = visible_entries
+            .iter()
+            .position(|(original_index, _)| *original_index == original_current_index)
+            .unwrap_or(0);
+        if by_index {
+            queue["currentIndex"] = json!(visible_current_index);
         } else {
-            queue["current"] = json!(row.current_id.unwrap_or_else(|| ids[0].clone()));
+            queue["current"] = json!(&visible_entries[visible_current_index].1.id);
         }
     }
     Ok(if by_index {
@@ -2606,19 +3658,31 @@ async fn get_play_queue(
 async fn save_play_queue(
     state: &AppState,
     user: &User,
+    access: &SubsonicAccess,
     p: &HashMap<String, String>,
     by_index: bool,
 ) -> Result<Value, ApiFailure> {
     let ids = multi(p, "id");
-    validate_track_ids(state, &ids, MAX_COLLECTION_ITEMS).await?;
-    let current_id = if ids.is_empty() {
-        None
+    validate_track_ids(state, access, &ids, MAX_COLLECTION_ITEMS).await?;
+    let (current_id, current_index) = if ids.is_empty() {
+        if by_index && p.contains_key("currentIndex") {
+            return Err(ApiFailure::new(
+                10,
+                "currentIndex must not be set for an empty play queue",
+            ));
+        }
+        (None, None)
     } else if by_index {
         let index = required_i64(p, "currentIndex")?;
-        ids.get(index.max(0) as usize)
+        let index = usize::try_from(index)
+            .ok()
+            .filter(|index| *index < ids.len())
+            .ok_or_else(|| ApiFailure::new(10, "currentIndex is outside the play queue"))?;
+        let current = ids
+            .get(index)
             .cloned()
-            .ok_or_else(|| ApiFailure::new(10, "currentIndex is outside the play queue"))?
-            .into()
+            .ok_or_else(|| ApiFailure::new(10, "currentIndex is outside the play queue"))?;
+        (Some(current), Some(index as i64))
     } else {
         let current = required(p, "current")?.to_owned();
         if !ids.contains(&current) {
@@ -2627,28 +3691,41 @@ async fn save_play_queue(
                 "current is not present in the play queue",
             ));
         }
-        Some(current)
+        let index = ids
+            .iter()
+            .position(|id| id == &current)
+            .map(|index| index as i64);
+        (Some(current), index)
     };
-    let transaction = state.db.begin().await?;
-    play_queue_entity::Entity::delete_by_id(&user.id)
-        .exec(&transaction)
-        .await?;
-    play_queue_entity::ActiveModel {
+    play_queue_entity::Entity::insert(play_queue_entity::ActiveModel {
         user_id: Set(user.id.clone()),
         track_ids: Set(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())),
         current_id: Set(current_id),
+        current_index: Set(current_index),
         position: Set(int(p, "position", 0).max(0)),
         changed_at: Set(Utc::now().to_rfc3339()),
         changed_by: Set(p.get("c").cloned().unwrap_or_default()),
-    }
-    .insert(&transaction)
+    })
+    .on_conflict(
+        OnConflict::columns([play_queue_entity::Column::UserId])
+            .update_columns([
+                play_queue_entity::Column::TrackIds,
+                play_queue_entity::Column::CurrentId,
+                play_queue_entity::Column::CurrentIndex,
+                play_queue_entity::Column::Position,
+                play_queue_entity::Column::ChangedAt,
+                play_queue_entity::Column::ChangedBy,
+            ])
+            .to_owned(),
+    )
+    .exec_without_returning(&state.db)
     .await?;
-    transaction.commit().await?;
     Ok(json!({}))
 }
 
 async fn validate_track_ids(
     state: &AppState,
+    access: &SubsonicAccess,
     track_ids: &[String],
     max_items: usize,
 ) -> Result<(), ApiFailure> {
@@ -2659,7 +3736,7 @@ async fn validate_track_ids(
     if requested_ids.is_empty() {
         return Ok(());
     }
-    let existing_ids = track_entity::Entity::find()
+    let existing_ids = accessible_tracks(access)
         .select_only()
         .column(track_entity::Column::Id)
         .filter(track_entity::Column::Id.is_in(requested_ids.iter().cloned()))
@@ -2673,6 +3750,23 @@ async fn validate_track_ids(
             70,
             "Collection contains an unknown song ID",
         ));
+    }
+    Ok(())
+}
+
+async fn validate_share_ids(
+    state: &AppState,
+    access: &SubsonicAccess,
+    ids: &[String],
+) -> Result<(), ApiFailure> {
+    if ids.len() > MAX_CATALOG_MUTATION_ITEMS {
+        return Err(ApiFailure::new(10, "Too many IDs in one request"));
+    }
+    let requested = ids.iter().cloned().collect::<HashSet<_>>();
+    let mut existing = existing_catalog_ids(state, access, "track", &requested).await?;
+    existing.extend(existing_catalog_ids(state, access, "album", &requested).await?);
+    if existing != requested {
+        return Err(not_found());
     }
     Ok(())
 }
@@ -3045,22 +4139,11 @@ async fn transcode_cache_is_fresh(source: &FsPath, cache: &FsPath) -> io::Result
     Ok(cache_metadata.modified()? >= source_metadata.modified()?)
 }
 
-async fn track(state: &AppState, id: &str) -> anyhow::Result<Track> {
-    track_entity::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .context("Track not found")
-}
 async fn album(state: &AppState, id: &str) -> Result<Album, ApiFailure> {
     album_entity::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(not_found)
-}
-fn track_select(tail: &str) -> String {
-    format!(
-        "SELECT id,folder_id,path,relative_path,title,artist_id,artist_name,artists_json,album_id,album_name,album_artist,genre,year,track_number,disc_number,duration,bit_rate,size,suffix,mimetype,lyrics,comment,cover_path,mtime,fingerprint,play_count,needs_scrape,created_at,updated_at FROM tracks {tail}"
-    )
 }
 fn artist_json(a: &Artist, cover_art: Option<&str>) -> Value {
     let mut value =
@@ -3158,15 +4241,19 @@ async fn share_json(
         json!({"id":share.id,"url":format!("{base}/share/{}",share.id),"description":share.description,"username":user.username,"created":share.created_at,"expires":share.expires_at,"lastVisited":share.last_visited_at,"visitCount":share.play_count,"entry":entries}),
     )
 }
-async fn user_folder_ids(state: &AppState) -> Result<Vec<i32>, ApiFailure> {
+async fn user_folder_ids(
+    state: &AppState,
+    access: &SubsonicAccess,
+) -> Result<Vec<i32>, ApiFailure> {
     Ok(enabled_music_folders(state)
         .await?
         .iter()
+        .filter(|folder| access.allows_folder(&folder.id))
         .map(|folder| folder_api_id(&folder.id))
         .collect())
 }
-fn user_json(v: &User, folder_ids: &[i32]) -> Value {
-    json!({"username":v.username,"email":v.email,"scrobblingEnabled":true,"adminRole":v.role=="admin","settingsRole":v.role=="admin","downloadRole":true,"uploadRole":v.role=="admin","playlistRole":true,"coverArtRole":true,"commentRole":true,"podcastRole":false,"streamRole":true,"jukeboxRole":false,"shareRole":true,"videoConversionRole":false,"folder":folder_ids})
+fn user_json(v: &User, access: &SubsonicAccess, folder_ids: &[i32]) -> Value {
+    json!({"username":v.username,"email":v.email,"scrobblingEnabled":true,"adminRole":v.role=="admin","ldapAuthenticated":access.ldap_authenticated,"settingsRole":access.settings_role,"downloadRole":access.download_role,"uploadRole":access.upload_role,"playlistRole":access.playlist_role,"coverArtRole":access.cover_art_role,"commentRole":access.comment_role,"podcastRole":access.podcast_role,"streamRole":access.stream_role,"jukeboxRole":access.jukebox_role,"shareRole":access.share_role,"videoConversionRole":access.video_conversion_role,"maxBitRate":access.max_bit_rate,"folder":folder_ids})
 }
 
 fn required<'a>(p: &'a HashMap<String, String>, key: &str) -> Result<&'a str, ApiFailure> {
@@ -3252,6 +4339,14 @@ fn require_admin(user: &User) -> Result<(), ApiFailure> {
         Ok(())
     } else {
         Err(ApiFailure::new(50, "Administrator role required"))
+    }
+}
+
+fn require_permission(allowed: bool, message: &str) -> Result<(), ApiFailure> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiFailure::new(50, message))
     }
 }
 
@@ -3601,6 +4696,61 @@ mod tests {
         }
     }
 
+    async fn insert_test_music_folder(state: &AppState) {
+        music_folder_entity::ActiveModel {
+            id: Set("folder-1".into()),
+            name: Set("Music".into()),
+            path: Set("/music".into()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_test_catalog(state: &AppState) {
+        insert_test_music_folder(state).await;
+        artist_entity::ActiveModel {
+            id: Set("artist-1".into()),
+            name: Set("Artist A".into()),
+            sort_name: Set("artist a".into()),
+            cover_path: Set(None),
+            album_count: Set(1),
+            song_count: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        album_entity::ActiveModel {
+            id: Set("album-1".into()),
+            name: Set("Album".into()),
+            artist_id: Set("artist-1".into()),
+            artist_name: Set("Artist A".into()),
+            year: Set(2026),
+            genre: Set("Rock".into()),
+            cover_path: Set(None),
+            song_count: Set(1),
+            duration: Set(180.0),
+            created_at: Set("2026-01-01T00:00:00Z".into()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let mut track = test_track();
+        track.album_id = Some("album-1".into());
+        track.genre = "Rock".into();
+        track.comment = "Liner notes".into();
+        track.into_active_model().insert(&state.db).await.unwrap();
+        track_artist_entity::ActiveModel {
+            track_id: Set("track-1".into()),
+            artist_id: Set("artist-1".into()),
+            position: Set(0),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn joins_multiple_cache_artists_with_hyphens() {
         assert_eq!(
@@ -3828,6 +4978,7 @@ mod tests {
         let error = json_endpoint(
             &state,
             &admin,
+            &subsonic_access(&state, &admin).await.unwrap(),
             "deleteInternetRadioStation",
             &HashMap::from([("id".into(), created.id.clone())]),
         )
@@ -3967,6 +5118,18 @@ mod tests {
     }
 
     #[test]
+    fn album_thumbnail_cache_keys_are_isolated_by_source_track() {
+        assert_ne!(
+            cover_art_cache_id("img-album-1", "track-private"),
+            cover_art_cache_id("img-album-1", "track-visible")
+        );
+        assert_eq!(
+            cover_art_cache_id("img-album-1", "track-visible"),
+            cover_art_cache_id("img-album-1", "track-visible")
+        );
+    }
+
+    #[test]
     fn matches_weak_and_strong_if_none_match_values() {
         let etag = cover_art_etag("track-1", 123, Some(300));
         let strong_etag = etag.strip_prefix("W/").unwrap();
@@ -3984,6 +5147,7 @@ mod tests {
     #[tokio::test]
     async fn matching_cover_art_etag_returns_not_modified_without_reading_the_file() {
         let state = test_state().await;
+        insert_test_music_folder(&state).await;
         let mut track = test_track();
         track.mtime = 123;
         track.into_active_model().insert(&state.db).await.unwrap();
@@ -3998,9 +5162,16 @@ mod tests {
         ]);
         let etag = cover_art_etag("track-1", 123, Some(300));
 
-        let response = binary_endpoint(&state, &user, "getCoverArt", &params, Some(&etag))
-            .await
-            .unwrap();
+        let response = binary_endpoint(
+            &state,
+            &user,
+            &subsonic_access(&state, &user).await.unwrap(),
+            "getCoverArt",
+            &params,
+            Some(&etag),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers().get(header::ETAG).unwrap(), &etag);
@@ -4014,6 +5185,129 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn album_cover_uses_a_source_from_an_accessible_music_folder() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        music_folder_entity::ActiveModel {
+            id: Set("folder-private".into()),
+            name: Set("Private".into()),
+            path: Set("/private".into()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        track_entity::Entity::update_many()
+            .col_expr(
+                track_entity::Column::FolderId,
+                Expr::value("folder-private"),
+            )
+            .col_expr(track_entity::Column::Mtime, Expr::value(123))
+            .filter(track_entity::Column::Id.eq("track-1"))
+            .exec(&state.db)
+            .await
+            .unwrap();
+        let mut visible = test_track();
+        visible.id = "track-visible".into();
+        visible.path = "/music/visible.flac".into();
+        visible.relative_path = "visible.flac".into();
+        visible.album_id = Some("album-1".into());
+        visible.track_number = 1;
+        visible.mtime = 456;
+        visible.into_active_model().insert(&state.db).await.unwrap();
+
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut access = subsonic_access(&state, &user).await.unwrap();
+        access.folder_ids = Some(HashSet::from(["folder-1".to_owned()]));
+        let params = HashMap::from([("id".to_owned(), "img-album-1".to_owned())]);
+        let etag = cover_art_etag("track-visible", 456, None);
+
+        let response = binary_endpoint(&state, &user, &access, "getCoverArt", &params, Some(&etag))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), &etag);
+    }
+
+    #[tokio::test]
+    async fn an_empty_music_folder_acl_exposes_no_tracks() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut access = subsonic_access(&state, &user).await.unwrap();
+        access.folder_ids = Some(HashSet::new());
+
+        assert!(
+            accessible_tracks(&access)
+                .one(&state.db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(accessible_track(&state, &access, "track-1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_music_folders_are_hidden_and_use_the_same_error_as_missing_tracks() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let folder = music_folder_entity::Entity::find_by_id("folder-1")
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = folder.into_active_model();
+        active.enabled = Set(0);
+        active.update(&state.db).await.unwrap();
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+
+        assert!(accessible_track(&state, &access, "track-1").await.is_err());
+        assert!(
+            library_artists(&state, &access, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let hidden_error = binary_endpoint(
+            &state,
+            &user,
+            &access,
+            "stream",
+            &HashMap::from([("id".into(), "track-1".into())]),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        let missing_error = binary_endpoint(
+            &state,
+            &user,
+            &access,
+            "stream",
+            &HashMap::from([("id".into(), "missing".into())]),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(hidden_error, missing_error);
     }
 
     #[test]
@@ -4136,7 +5430,17 @@ mod tests {
             ("albumCount".into(), "0".into()),
             ("songCount".into(), "1000".into()),
         ]);
-        let result = search(&state, "search3", &params).await.unwrap();
+        let access = subsonic_access(
+            &state,
+            &user_entity::Entity::find()
+                .one(&state.db)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let result = search(&state, &access, "search3", &params).await.unwrap();
         assert_eq!(result["searchResult3"]["song"].as_array().unwrap().len(), 1);
 
         let user = user_entity::Entity::find()
@@ -4202,13 +5506,24 @@ mod tests {
             .unwrap();
         }
 
-        let covers = artist_cover_art_map(&state, &["artist-1".into(), "artist-2".into()], None)
+        let user = user_entity::Entity::find()
+            .one(&state.db)
             .await
+            .unwrap()
             .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        let covers = artist_cover_art_map(
+            &state,
+            &access,
+            &["artist-1".into(), "artist-2".into()],
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(covers["artist-1"], "img-album-1");
         assert_eq!(covers["artist-2"], "img-album-1");
 
-        let response = artists(&state, &HashMap::new()).await.unwrap();
+        let response = artists(&state, &access, &HashMap::new()).await.unwrap();
         let returned = response["artists"]["index"]
             .as_array()
             .unwrap()
@@ -4226,11 +5541,13 @@ mod tests {
     #[tokio::test]
     async fn formal_scrobbles_update_and_return_the_authenticated_users_play_count() {
         let state = test_state().await;
+        insert_test_music_folder(&state).await;
         let user = user_entity::Entity::find()
             .one(&state.db)
             .await
             .unwrap()
             .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
         test_track()
             .into_active_model()
             .insert(&state.db)
@@ -4240,6 +5557,7 @@ mod tests {
         scrobble(
             &state,
             &user,
+            &access,
             &HashMap::from([
                 ("id".into(), "track-1".into()),
                 ("submission".into(), "false".into()),
@@ -4258,6 +5576,7 @@ mod tests {
         scrobble(
             &state,
             &user,
+            &access,
             &HashMap::from([("id".into(), "track-1,track-1".into())]),
         )
         .await
@@ -4281,6 +5600,7 @@ mod tests {
         let response = json_endpoint(
             &state,
             &user,
+            &access,
             "getSong",
             &HashMap::from([("id".into(), "track-1".into())]),
         )
@@ -4346,6 +5666,581 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_songs_supports_artist_name_and_advertised_artist_id() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        for params in [
+            HashMap::from([("artist".into(), "Artist A".into())]),
+            HashMap::from([("id".into(), "artist-1".into())]),
+        ] {
+            let response = json_endpoint(&state, &user, &access, "getTopSongs", &params)
+                .await
+                .unwrap();
+            assert_eq!(response["topSongs"]["song"][0]["id"], "track-1");
+        }
+    }
+
+    #[tokio::test]
+    async fn index_based_queue_round_trips_a_duplicate_current_item() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        save_play_queue(
+            &state,
+            &user,
+            &access,
+            &HashMap::from([
+                ("id".into(), "track-1,track-1,track-1".into()),
+                ("currentIndex".into(), "2".into()),
+                ("position".into(), "1234".into()),
+            ]),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let response = get_play_queue(&state, &user, &access, true).await.unwrap();
+        assert_eq!(response["playQueueByIndex"]["currentIndex"], 2);
+        assert_eq!(
+            response["playQueueByIndex"]["entry"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let stored = play_queue_entity::Entity::find_by_id(&user.id)
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.current_index, Some(2));
+
+        let error = save_play_queue(
+            &state,
+            &user,
+            &access,
+            &HashMap::from([("currentIndex".into(), "0".into())]),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, 10);
+        save_play_queue(&state, &user, &access, &HashMap::new(), true)
+            .await
+            .unwrap();
+        let response = get_play_queue(&state, &user, &access, true).await.unwrap();
+        assert!(response["playQueueByIndex"].get("currentIndex").is_none());
+        assert!(
+            response["playQueueByIndex"]["entry"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn play_queue_remaps_or_replaces_a_current_item_hidden_by_folder_acl() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        music_folder_entity::ActiveModel {
+            id: Set("folder-private".into()),
+            name: Set("Private".into()),
+            path: Set("/private".into()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let mut private = test_track();
+        private.id = "track-private".into();
+        private.folder_id = "folder-private".into();
+        private.path = "/private/song.flac".into();
+        private.relative_path = "private-song.flac".into();
+        private.into_active_model().insert(&state.db).await.unwrap();
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let unrestricted = subsonic_access(&state, &user).await.unwrap();
+        let mut restricted = unrestricted.clone();
+        restricted.folder_ids = Some(HashSet::from(["folder-1".to_owned()]));
+
+        save_play_queue(
+            &state,
+            &user,
+            &unrestricted,
+            &HashMap::from([
+                ("id".into(), "track-private,track-1".into()),
+                ("currentIndex".into(), "1".into()),
+            ]),
+            true,
+        )
+        .await
+        .unwrap();
+        let response = get_play_queue(&state, &user, &restricted, true)
+            .await
+            .unwrap();
+        assert_eq!(response["playQueueByIndex"]["currentIndex"], 0);
+        assert_eq!(response["playQueueByIndex"]["entry"][0]["id"], "track-1");
+        assert_eq!(
+            response["playQueueByIndex"]["entry"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        save_play_queue(
+            &state,
+            &user,
+            &unrestricted,
+            &HashMap::from([
+                ("id".into(), "track-private,track-1".into()),
+                ("currentIndex".into(), "0".into()),
+            ]),
+            true,
+        )
+        .await
+        .unwrap();
+        let response = get_play_queue(&state, &user, &restricted, false)
+            .await
+            .unwrap();
+        assert_eq!(response["playQueue"]["current"], "track-1");
+    }
+
+    #[tokio::test]
+    async fn users_keep_passwords_optional_and_expose_configured_roles_and_folders() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        music_folder_entity::ActiveModel {
+            id: Set("folder-2".into()),
+            name: Set("Private".into()),
+            path: Set("/private".into()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let admin = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        create_user(
+            &state,
+            &admin,
+            &HashMap::from([
+                ("username".into(), "listener".into()),
+                ("password".into(), "listener-password".into()),
+                ("email".into(), "listener@example.test".into()),
+                ("streamRole".into(), "false".into()),
+                ("downloadRole".into(), "true".into()),
+                (
+                    "musicFolderId".into(),
+                    folder_api_id("folder-1").to_string(),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        let before = user_by_name(&state.db, "listener").await.unwrap().unwrap();
+        update_user(
+            &state,
+            &admin,
+            &HashMap::from([
+                ("username".into(), "listener".into()),
+                ("commentRole".into(), "true".into()),
+            ]),
+        )
+        .await
+        .unwrap();
+        let after = user_by_name(&state.db, "listener").await.unwrap().unwrap();
+        assert_eq!(after.password_hash, before.password_hash);
+        let response = get_user(&state, &admin, "listener").await.unwrap();
+        assert_eq!(response["user"]["streamRole"], false);
+        assert_eq!(response["user"]["downloadRole"], true);
+        assert_eq!(response["user"]["commentRole"], true);
+        assert_eq!(
+            response["user"]["folder"].as_array().unwrap(),
+            &[json!(folder_api_id("folder-1"))]
+        );
+        let access = subsonic_access(&state, &after).await.unwrap();
+        assert!(accessible_track(&state, &access, "track-1").await.is_ok());
+        assert!(!access.allows_folder("folder-2"));
+        assert!(
+            access_from_params(
+                &state,
+                Some(access),
+                &HashMap::from([("ldapAuthenticated".into(), "true".into())]),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_acl_scopes_artist_and_album_aggregate_metadata() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        music_folder_entity::ActiveModel {
+            id: Set("folder-private".into()),
+            name: Set("Private".into()),
+            path: Set("/private".into()),
+            enabled: Set(1),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        album_entity::ActiveModel {
+            id: Set("album-private".into()),
+            name: Set("Private Album".into()),
+            artist_id: Set("artist-1".into()),
+            artist_name: Set("Artist A".into()),
+            year: Set(2026),
+            genre: Set("Rock".into()),
+            cover_path: Set(None),
+            song_count: Set(1),
+            duration: Set(120.0),
+            created_at: Set("2026-01-02T00:00:00Z".into()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        for (id, album_id, relative_path, duration) in [
+            ("track-private-shared", "album-1", "shared.flac", 120.0),
+            (
+                "track-private-album",
+                "album-private",
+                "private.flac",
+                120.0,
+            ),
+        ] {
+            let mut track = test_track();
+            track.id = id.into();
+            track.folder_id = "folder-private".into();
+            track.path = format!("/private/{relative_path}");
+            track.relative_path = relative_path.into();
+            track.album_id = Some(album_id.into());
+            track.album_name = if album_id == "album-1" {
+                "Album".into()
+            } else {
+                "Private Album".into()
+            };
+            track.duration = duration;
+            track.into_active_model().insert(&state.db).await.unwrap();
+            track_artist_entity::ActiveModel {
+                track_id: Set(id.into()),
+                artist_id: Set("artist-1".into()),
+                position: Set(0),
+            }
+            .insert(&state.db)
+            .await
+            .unwrap();
+        }
+        artist_entity::Entity::update_many()
+            .col_expr(artist_entity::Column::AlbumCount, Expr::value(2))
+            .col_expr(artist_entity::Column::SongCount, Expr::value(3))
+            .filter(artist_entity::Column::Id.eq("artist-1"))
+            .exec(&state.db)
+            .await
+            .unwrap();
+        album_entity::Entity::update_many()
+            .col_expr(album_entity::Column::SongCount, Expr::value(2))
+            .col_expr(album_entity::Column::Duration, Expr::value(300.0))
+            .filter(album_entity::Column::Id.eq("album-1"))
+            .exec(&state.db)
+            .await
+            .unwrap();
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut access = subsonic_access(&state, &user).await.unwrap();
+        access.folder_ids = Some(HashSet::from(["folder-1".to_owned()]));
+
+        let response = get_artist(&state, &access, "artist-1").await.unwrap();
+        assert_eq!(response["artist"]["albumCount"], 1);
+        assert_eq!(response["artist"]["album"].as_array().unwrap().len(), 1);
+        assert_eq!(response["artist"]["album"][0]["songCount"], 1);
+        assert_eq!(response["artist"]["album"][0]["duration"], 180);
+        let info = artist_info(
+            &state,
+            &access,
+            "getArtistInfo2",
+            &HashMap::from([("id".into(), "artist-1".into())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            info["artistInfo2"]["biography"],
+            "Artist A · 1 albums · 1 songs"
+        );
+    }
+
+    #[tokio::test]
+    async fn album_shares_and_legacy_directory_stars_use_catalog_item_types() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        favorite(
+            &state,
+            &user,
+            &access,
+            &HashMap::from([("id".into(), "album-1,artist-1".into())]),
+            true,
+        )
+        .await
+        .unwrap();
+        let favorites = favorite_entity::Entity::find()
+            .filter(favorite_entity::Column::UserId.eq(&user.id))
+            .all(&state.db)
+            .await
+            .unwrap();
+        assert!(
+            favorites
+                .iter()
+                .any(|favorite| favorite.item_type == "album")
+        );
+        assert!(
+            favorites
+                .iter()
+                .any(|favorite| favorite.item_type == "artist")
+        );
+
+        let response = create_share(
+            &state,
+            &user,
+            &access,
+            &HashMap::from([("id".into(), "album-1".into())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["shares"]["share"][0]["entry"][0]["id"], "track-1");
+        let share_id = response["shares"]["share"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut revoked_access = access.clone();
+        revoked_access.share_role = false;
+        json_endpoint(
+            &state,
+            &user,
+            &revoked_access,
+            "deleteShare",
+            &HashMap::from([("id".into(), share_id)]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            share_entity::Entity::find()
+                .one(&state.db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_batch_limit_is_bounded_and_sqlite_safe() {
+        let state = test_state().await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        let at_limit = (0..MAX_CATALOG_MUTATION_ITEMS)
+            .map(|index| format!("missing-{index}"))
+            .collect::<Vec<_>>();
+        let error = validate_share_ids(&state, &access, &at_limit)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, 70);
+
+        let over_limit = (0..=MAX_CATALOG_MUTATION_ITEMS)
+            .map(|index| format!("missing-{index}"))
+            .collect::<Vec<_>>();
+        let error = validate_share_ids(&state, &access, &over_limit)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, 10);
+    }
+
+    #[tokio::test]
+    async fn playback_reports_drive_now_playing_and_scrobble_once() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        report_playback(
+            &state,
+            &user,
+            &access,
+            &HashMap::from([
+                ("mediaId".into(), "track-1".into()),
+                ("mediaType".into(), "song".into()),
+                ("positionMs".into(), "100000".into()),
+                ("state".into(), "playing".into()),
+                ("ignoreScrobble".into(), "true".into()),
+                ("c".into(), "test-player".into()),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            user_track_stat_entity::Entity::find()
+                .one(&state.db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let current = now_playing(&state, &access).await.unwrap();
+        assert_eq!(current["nowPlaying"]["entry"][0]["id"], "track-1");
+        assert_eq!(current["nowPlaying"]["entry"][0]["state"], "playing");
+
+        for (state_name, position) in [
+            ("starting", "0"),
+            ("playing", "100000"),
+            ("paused", "110000"),
+        ] {
+            report_playback(
+                &state,
+                &user,
+                &access,
+                &HashMap::from([
+                    ("mediaId".into(), "track-1".into()),
+                    ("mediaType".into(), "song".into()),
+                    ("positionMs".into(), position.into()),
+                    ("state".into(), state_name.into()),
+                ]),
+            )
+            .await
+            .unwrap();
+        }
+        let stats = user_track_stat_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.play_count, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_playback_reports_claim_a_single_scrobble() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        let params = HashMap::from([
+            ("mediaId".into(), "track-1".into()),
+            ("mediaType".into(), "song".into()),
+            ("positionMs".into(), "100000".into()),
+            ("state".into(), "playing".into()),
+        ]);
+
+        let (first, second) = tokio::join!(
+            report_playback(&state, &user, &access, &params),
+            report_playback(&state, &user, &access, &params),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let stats = user_track_stat_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.play_count, 1);
+        assert_eq!(
+            scrobble_entity::Entity::find()
+                .filter(scrobble_entity::Column::Submission.eq(1))
+                .all(&state.db)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            track_entity::Entity::find_by_id("track-1")
+                .one(&state.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .play_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_artist_and_album_info_validate_ids_and_return_metadata() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        let album = album_info(
+            &state,
+            &access,
+            &HashMap::from([("id".into(), "track-1".into())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(album["albumInfo"]["notes"], "Liner notes");
+        let artist = artist_info(
+            &state,
+            &access,
+            "getArtistInfo2",
+            &HashMap::from([("id".into(), "track-1".into())]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            artist["artistInfo2"]["biography"]
+                .as_str()
+                .unwrap()
+                .contains("Artist A")
+        );
+        assert!(
+            album_info(
+                &state,
+                &access,
+                &HashMap::from([("id".into(), "missing".into())]),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn exposes_extensions_without_authentication() {
         let state = test_state().await;
         let response = request_json(
@@ -4363,7 +6258,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"apiKeyAuthentication"));
         assert!(names.contains(&"indexBasedQueue"));
-        assert!(!names.contains(&"playbackReport"));
+        assert!(names.contains(&"playbackReport"));
+        assert!(names.contains(&"topSongsByArtistId"));
         assert!(!names.contains(&"mnestRadioRecognition"));
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -4405,10 +6301,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let uri = format!(
-            "/rest/ping?apiKey={}&v=1.16.1&c=test&f=json",
-            user.subsonic_token
-        );
+        let api_key = crate::auth::reveal_subsonic_api_key(
+            &user.subsonic_token,
+            &state.settings.auth.jwt_secret,
+            &user.id,
+        )
+        .unwrap();
+        let uri = format!("/rest/ping?apiKey={}&v=1.16.1&c=test&f=json", api_key);
         let response = request_json(router().with_state(state), &uri).await;
         assert_eq!(response["subsonic-response"]["status"], "ok");
     }
@@ -4416,14 +6315,40 @@ mod tests {
     #[tokio::test]
     async fn uses_the_standard_album_info_response_key_for_both_endpoints() {
         let state = test_state().await;
+        insert_test_music_folder(&state).await;
         let user = user_entity::Entity::find()
             .one(&state.db)
             .await
             .unwrap()
             .unwrap();
-        let value = json_endpoint(&state, &user, "getAlbumInfo2", &HashMap::new())
-            .await
-            .unwrap();
+        album_entity::ActiveModel {
+            id: Set("album-1".into()),
+            name: Set("Album".into()),
+            artist_id: Set("artist-1".into()),
+            artist_name: Set("Artist A".into()),
+            year: Set(2026),
+            genre: Set("Rock".into()),
+            cover_path: Set(None),
+            song_count: Set(1),
+            duration: Set(180.0),
+            created_at: Set(Utc::now().to_rfc3339()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        let mut track = test_track();
+        track.album_id = Some("album-1".into());
+        track.into_active_model().insert(&state.db).await.unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        let value = json_endpoint(
+            &state,
+            &user,
+            &access,
+            "getAlbumInfo2",
+            &HashMap::from([("id".into(), "album-1".into())]),
+        )
+        .await
+        .unwrap();
         assert!(value.get("albumInfo").is_some());
         assert!(value.get("albumInfo2").is_none());
     }

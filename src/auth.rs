@@ -15,12 +15,12 @@ use md5::{Digest, Md5};
 use rand_core::OsRng;
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
-    digest,
+    digest, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
+    QueryFilter, Set,
 };
 use serde::{Deserialize, Serialize};
 
@@ -201,10 +201,30 @@ pub async fn authenticate_subsonic(
     secret: &str,
 ) -> anyhow::Result<Option<User>> {
     if let Some(api_key) = params.get("apiKey") {
-        return Ok(user::Entity::find()
-            .filter(user::Column::SubsonicToken.eq(api_key))
-            .one(db)
-            .await?);
+        if api_key.is_empty() {
+            return Ok(None);
+        }
+        let lookup = subsonic_api_key_lookup(api_key, secret);
+        let protected_prefix = format!("k1:{lookup}:");
+        let candidates = user::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(user::Column::SubsonicToken.eq(api_key))
+                    .add(user::Column::SubsonicToken.starts_with(&protected_prefix)),
+            )
+            .all(db)
+            .await?;
+        for candidate in candidates {
+            let Ok(stored_key) =
+                reveal_subsonic_api_key(&candidate.subsonic_token, secret, &candidate.id)
+            else {
+                continue;
+            };
+            if constant_time_eq(stored_key.as_bytes(), api_key.as_bytes()) {
+                return Ok(Some(candidate));
+            }
+        }
+        return Ok(None);
     }
     let Some(username) = params.get("u") else {
         return Ok(None);
@@ -236,6 +256,49 @@ pub async fn authenticate_subsonic(
         return Ok(password_matches.then_some(user));
     }
     Ok(None)
+}
+
+pub fn protect_subsonic_api_key(
+    api_key: &str,
+    secret: &str,
+    user_id: &str,
+) -> anyhow::Result<String> {
+    if api_key.is_empty() {
+        return Ok(String::new());
+    }
+    let lookup = subsonic_api_key_lookup(api_key, secret);
+    let encrypted = encrypt_server_secret(api_key, secret, &format!("subsonic-api-key:{user_id}"))?;
+    Ok(format!("k1:{lookup}:{encrypted}"))
+}
+
+pub fn reveal_subsonic_api_key(
+    stored: &str,
+    secret: &str,
+    user_id: &str,
+) -> anyhow::Result<String> {
+    if stored.is_empty() {
+        return Ok(String::new());
+    }
+    let Some(protected) = stored.strip_prefix("k1:") else {
+        return Ok(stored.to_owned());
+    };
+    let (lookup, encrypted) = protected
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid protected Subsonic API key"))?;
+    let api_key = decrypt_server_secret(encrypted, secret, &format!("subsonic-api-key:{user_id}"))?;
+    let expected = subsonic_api_key_lookup(&api_key, secret);
+    anyhow::ensure!(
+        constant_time_eq(lookup.as_bytes(), expected.as_bytes()),
+        "invalid protected Subsonic API key lookup"
+    );
+    Ok(api_key)
+}
+
+fn subsonic_api_key_lookup(api_key: &str, secret: &str) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let mut message = b"mnest-subsonic-api-key\0".to_vec();
+    message.extend_from_slice(api_key.as_bytes());
+    hex::encode(hmac::sign(&key, &message).as_ref())
 }
 
 fn subsonic_token(password: &str, salt: &str) -> String {

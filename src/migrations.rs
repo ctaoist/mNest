@@ -7,7 +7,7 @@ use sea_orm::{
 
 use crate::entities::schema_migration;
 
-pub(crate) const BASELINE: &str = "baseline-3";
+pub(crate) const BASELINE: &str = "baseline-4";
 
 pub async fn run(db: &DatabaseConnection) -> anyhow::Result<()> {
     create_schema_migrations(db).await?;
@@ -15,7 +15,9 @@ pub async fn run(db: &DatabaseConnection) -> anyhow::Result<()> {
     if !applied(db, BASELINE).await? {
         let transaction = db.begin().await?;
         create_baseline(&transaction).await?;
+        ensure_compatibility_columns(&transaction).await?;
         backfill_user_track_stats(&transaction).await?;
+        backfill_user_subsonic_access(&transaction).await?;
         record(&transaction, BASELINE).await?;
         remove_non_baseline_versions(&transaction).await?;
         transaction.commit().await?;
@@ -55,6 +57,25 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         .col(required_text("created_at"));
     execute(db, users).await?;
     create_index(db, "uq_users_username", "users", &["username"], true).await?;
+
+    let mut user_access = create_table("user_subsonic_access");
+    user_access
+        .col(text_primary_key("user_id"))
+        .col(bigint_default("ldap_authenticated", 0))
+        .col(bigint_default("settings_role", 1))
+        .col(bigint_default("stream_role", 1))
+        .col(bigint_default("jukebox_role", 0))
+        .col(bigint_default("download_role", 0))
+        .col(bigint_default("upload_role", 0))
+        .col(bigint_default("playlist_role", 0))
+        .col(bigint_default("cover_art_role", 0))
+        .col(bigint_default("comment_role", 0))
+        .col(bigint_default("podcast_role", 0))
+        .col(bigint_default("share_role", 0))
+        .col(bigint_default("video_conversion_role", 0))
+        .col(bigint_default("max_bit_rate", 0))
+        .col(text_default("folder_ids", "*"));
+    execute(db, user_access).await?;
 
     let mut folders = create_table("music_folders");
     folders
@@ -226,6 +247,7 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         .col(text_primary_key("user_id"))
         .col(text_default("track_ids", "[]"))
         .col(text("current_id"))
+        .col(bigint("current_index"))
         .col(bigint_default("position", 0))
         .col(required_text("changed_at"))
         .col(text_default("changed_by", ""));
@@ -259,6 +281,20 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         .col(required_text("played_at"))
         .col(bigint_default("submission", 0));
     execute(db, scrobbles).await?;
+
+    let mut playback_states = create_table("playback_states");
+    playback_states
+        .col(text_primary_key("user_id"))
+        .col(required_text("media_id"))
+        .col(required_text("media_type"))
+        .col(bigint_default("position_ms", 0))
+        .col(required_text("state"))
+        .col(double_default("playback_rate", 1.0))
+        .col(bigint_default("ignore_scrobble", 0))
+        .col(bigint_default("scrobbled", 0))
+        .col(required_text("updated_at"))
+        .col(text_default("client", ""));
+    execute(db, playback_states).await?;
 
     let mut user_track_stats = create_table("user_track_stats");
     user_track_stats
@@ -368,7 +404,40 @@ async fn backfill_user_track_stats<C: ConnectionTrait>(db: &C) -> anyhow::Result
     Ok(())
 }
 
-async fn has_column(db: &DatabaseConnection, table: &str, column: &str) -> anyhow::Result<bool> {
+async fn ensure_compatibility_columns<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    if !has_column(db, "play_queues", "current_index").await? {
+        db.execute_unprepared("ALTER TABLE play_queues ADD COLUMN current_index BIGINT")
+            .await?;
+    }
+    Ok(())
+}
+
+async fn backfill_user_subsonic_access<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    let sql = match db.get_database_backend() {
+        DbBackend::Sqlite => {
+            "INSERT OR IGNORE INTO user_subsonic_access(\
+             user_id,ldap_authenticated,settings_role,stream_role,jukebox_role,download_role,\
+             upload_role,playlist_role,cover_art_role,comment_role,podcast_role,share_role,\
+             video_conversion_role,max_bit_rate,folder_ids) \
+             SELECT id,0,CASE WHEN role='admin' THEN 1 ELSE 0 END,1,0,1,\
+             CASE WHEN role='admin' THEN 1 ELSE 0 END,1,1,1,0,1,0,0,'*' FROM users"
+        }
+        DbBackend::Postgres => {
+            "INSERT INTO user_subsonic_access(\
+             user_id,ldap_authenticated,settings_role,stream_role,jukebox_role,download_role,\
+             upload_role,playlist_role,cover_art_role,comment_role,podcast_role,share_role,\
+             video_conversion_role,max_bit_rate,folder_ids) \
+             SELECT id,0,CASE WHEN role='admin' THEN 1 ELSE 0 END,1,0,1,\
+             CASE WHEN role='admin' THEN 1 ELSE 0 END,1,1,1,0,1,0,0,'*' FROM users \
+             ON CONFLICT(user_id) DO NOTHING"
+        }
+        other => anyhow::bail!("unsupported database backend: {other:?}"),
+    };
+    db.execute_unprepared(sql).await?;
+    Ok(())
+}
+
+async fn has_column<C: ConnectionTrait>(db: &C, table: &str, column: &str) -> anyhow::Result<bool> {
     let backend = db.get_database_backend();
     let sql = match backend {
         DbBackend::Sqlite => format!(
@@ -476,6 +545,12 @@ fn text_default(name: &str, value: &str) -> ColumnDef {
 fn required_bigint(name: &str) -> ColumnDef {
     let mut column = ColumnDef::new(alias(name));
     column.big_integer().not_null();
+    column
+}
+
+fn bigint(name: &str) -> ColumnDef {
+    let mut column = ColumnDef::new(alias(name));
+    column.big_integer();
     column
 }
 

@@ -12,7 +12,10 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::{
-    auth::{decrypt_server_secret, encrypt_server_secret, encrypt_subsonic_password},
+    auth::{
+        decrypt_server_secret, encrypt_server_secret, encrypt_subsonic_password,
+        protect_subsonic_api_key,
+    },
     config::{AdminSettings, DatabaseSettings},
     entities::{download_source, user},
     migrations,
@@ -118,29 +121,48 @@ pub async fn bootstrap_admin(
         .hash_password(admin.password.as_bytes(), &SaltString::generate(&mut OsRng))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
         .to_string();
-    let subsonic_token = Uuid::new_v4().simple().to_string();
+    let subsonic_api_key = Uuid::new_v4().simple().to_string();
     let subsonic_password = encrypt_subsonic_password(&admin.password, secret, &admin.username)?;
     if let Some(existing) = existing {
+        let protected_api_key = protect_subsonic_api_key(&subsonic_api_key, secret, &existing.id)?;
         let mut active = existing.into_active_model();
         active.password_hash = Set(hash);
         active.email = Set(admin.email.clone());
         active.role = Set("admin".into());
-        active.subsonic_token = Set(subsonic_token);
+        active.subsonic_token = Set(protected_api_key);
         active.subsonic_password = Set(subsonic_password);
         active.update(db).await?;
     } else {
+        let user_id = Uuid::new_v4().to_string();
+        let protected_api_key = protect_subsonic_api_key(&subsonic_api_key, secret, &user_id)?;
         user::ActiveModel {
-            id: Set(Uuid::new_v4().to_string()),
+            id: Set(user_id),
             username: Set(admin.username.clone()),
             password_hash: Set(hash),
             email: Set(admin.email.clone()),
             role: Set("admin".into()),
-            subsonic_token: Set(subsonic_token),
+            subsonic_token: Set(protected_api_key),
             subsonic_password: Set(subsonic_password),
             created_at: Set(Utc::now().to_rfc3339()),
         }
         .insert(db)
         .await?;
+    }
+    Ok(())
+}
+
+pub async fn protect_subsonic_api_keys(
+    db: &DatabaseConnection,
+    secret: &str,
+) -> anyhow::Result<()> {
+    for account in user::Entity::find().all(db).await? {
+        if account.subsonic_token.is_empty() || account.subsonic_token.starts_with("k1:") {
+            continue;
+        }
+        let protected = protect_subsonic_api_key(&account.subsonic_token, secret, &account.id)?;
+        let mut active = account.into_active_model();
+        active.subsonic_token = Set(protected);
+        active.update(db).await?;
     }
     Ok(())
 }
@@ -183,7 +205,8 @@ mod tests {
     use super::*;
     use crate::config::{AdminSettings, DatabaseSettings};
     use crate::entities::{
-        app_setting, download_source, schema_migration, scrobble, user_track_stat,
+        app_setting, download_source, play_queue, playback_state, schema_migration, scrobble,
+        user_subsonic_access, user_track_stat,
     };
 
     #[tokio::test]
@@ -233,6 +256,44 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let account = user::Entity::find().one(&db).await.unwrap().unwrap();
+        assert!(account.subsonic_token.starts_with("k1:"));
+        let api_key = crate::auth::reveal_subsonic_api_key(
+            &account.subsonic_token,
+            "test-secret-with-at-least-32-characters",
+            &account.id,
+        )
+        .unwrap();
+        assert!(!api_key.is_empty());
+        assert!(
+            crate::auth::authenticate_subsonic(
+                &db,
+                &std::collections::HashMap::from([("apiKey".into(), api_key)]),
+                "test-secret-with-at-least-32-characters",
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        let mut active = account.into_active_model();
+        active.subsonic_token = Set("legacy-plain-api-key".into());
+        active.update(&db).await.unwrap();
+        protect_subsonic_api_keys(&db, "test-secret-with-at-least-32-characters")
+            .await
+            .unwrap();
+        let protected = user::Entity::find().one(&db).await.unwrap().unwrap();
+        assert!(protected.subsonic_token.starts_with("k1:"));
+        assert!(!protected.subsonic_token.contains("legacy-plain-api-key"));
+        assert_eq!(
+            crate::auth::reveal_subsonic_api_key(
+                &protected.subsonic_token,
+                "test-secret-with-at-least-32-characters",
+                &protected.id,
+            )
+            .unwrap(),
+            "legacy-plain-api-key"
+        );
     }
 
     #[tokio::test]
@@ -279,6 +340,74 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrades_baseline_three_with_open_subsonic_compatibility_state() {
+        let db = connect(&DatabaseSettings {
+            driver: "sqlite".into(),
+            url: "sqlite::memory:".into(),
+            max_connections: 1,
+        })
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        db.execute_unprepared("DROP TABLE user_subsonic_access")
+            .await
+            .unwrap();
+        db.execute_unprepared("DROP TABLE playback_states")
+            .await
+            .unwrap();
+        db.execute_unprepared("ALTER TABLE play_queues DROP COLUMN current_index")
+            .await
+            .unwrap();
+        schema_migration::Entity::delete_by_id(migrations::BASELINE)
+            .exec(&db)
+            .await
+            .unwrap();
+        schema_migration::ActiveModel {
+            version: Set("baseline-3".into()),
+            applied_at: Set(Utc::now().to_rfc3339()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            schema_migration::Entity::find().count(&db).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            user_subsonic_access::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(playback_state::Entity::find().count(&db).await.unwrap(), 0);
+        play_queue::ActiveModel {
+            user_id: Set("user".into()),
+            track_ids: Set("[]".into()),
+            current_id: Set(None),
+            current_index: Set(Some(2)),
+            position: Set(0),
+            changed_at: Set(Utc::now().to_rfc3339()),
+            changed_by: Set("test".into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            play_queue::Entity::find_by_id("user")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_index,
+            Some(2)
         );
     }
 

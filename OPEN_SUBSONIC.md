@@ -5,7 +5,7 @@
 ## 审计基线
 
 - 审计日期：2026-08-25
-- 代码版本：`194df30`
+- 实现基线：`194df30` 及本文同批兼容性修复
 - 服务端声明的 Subsonic REST 协议版本：`1.16.1`
 - 规范来源：
   - [OpenSubsonic API Reference](https://opensubsonic.netlify.app/docs/api-reference/)
@@ -28,7 +28,7 @@
 
 | 已实现 | 部分实现 | 未实现 | 合计 |
 | ---: | ---: | ---: | ---: |
-| 50 | 16 | 21 | 87 |
+| 66 | 1 | 20 | 87 |
 
 该统计是源码级兼容性审计，不等同于通过了完整的 OpenSubsonic 一致性测试。可选响应字段、不同媒体编码和第三方客户端行为仍需通过集成测试验证。
 
@@ -52,13 +52,14 @@
 | `u` + `p` | ✅ | 支持明文密码。 |
 | `u` + `p=enc:<hex>` | ✅ | 支持标准十六进制密码编码。 |
 | `u` + `t` + `s` | ✅ | `t = MD5(password + salt)`。 |
-| `apiKey` | 🟡 | 可不带用户名认证，并实现 `tokenInfo`、错误 `43/44`；但仓库内未发现供用户查看、轮换或吊销 API Key 的接口，每个用户只有一个固定 `subsonic_token`。 |
+| `apiKey` | ✅ | 可不带用户名认证，并实现 `tokenInfo`、错误 `43/44`；每位用户可在个人设置中查看、复制、轮换和吊销自己的 Key。Key 以带密钥查找指纹和加密密文保存，旧明文会在启动时原地升级。 |
 | 冲突认证参数 | ✅ | API Key 与用户名/密码/盐值令牌混用，或密码与令牌混用时返回错误 `43`。 |
 
 ### 数据与权限模型限制
 
-- 所有启用的音乐文件夹都对所有用户可见；尚未实现规范中的用户级 `musicFolderId` 授权。
-- 用户权限只有 mNest 的 `admin` / `user` 两级。OpenSubsonic 的 `streamRole`、`downloadRole`、`shareRole` 等细粒度角色大多是固定返回值，并非独立可配置权限。
+- 用户可通过 `musicFolderId` 授权一个或多个音乐文件夹；浏览、搜索、媒体读取、播放列表、队列、书签、分享和标注都会应用该访问边界。
+- 支持并执行 `settingsRole`、`streamRole`、`downloadRole`、`commentRole`、`shareRole` 和用户最大码率；其余角色会被持久化并准确返回。按规范，`playlistRole` 自 1.8.0 起不再限制播放列表操作；其他角色对应的能力域尚不存在。
+- 服务端没有 LDAP 认证后端，因此 `createUser` / `updateUser` 会拒绝 `ldapAuthenticated=true`，避免创建实际无法通过 LDAP 登录的账号。
 - 项目当前只管理音频；视频、字幕、Podcast、聊天和 jukebox 域没有对应数据模型。
 - `stream` 支持原始音频、Range、`mp3` / `opus` / `aac` / `flac` / `ogg` 转码、最大码率和转码起始偏移；不支持视频参数和 HLS。
 - `scrobble` 的正式提交会更新全局及用户级播放次数；Now Playing 和正式 Scrobble 也会异步转发到用户已绑定的 Last.fm，但 Last.fm 失败不影响 OpenSubsonic 请求结果。
@@ -69,16 +70,16 @@
 
 | 扩展 | 版本 | 已广告 | 状态 | 说明 |
 | --- | --- | --- | --- | --- |
-| `apiKeyAuthentication` | 1 | 是 | 🟡 | API Key 认证、`tokenInfo` 和新错误码已实现；缺少规范要求的 Key 查看/吊销机制。 |
+| `apiKeyAuthentication` | 1 | 是 | ✅ | API Key 认证、`tokenInfo`、新错误码及个人 Key 查看、轮换、吊销均已实现。 |
 | `getPodcastEpisode` | 1 | 否 | ❌ | `getPodcastEpisode` 未实现。 |
 | `formPost` | 1 | 是 | ✅ | REST 方法接受 URL-encoded POST 参数。 |
-| `indexBasedQueue` | 1 | 是 | 🟡 | 已实现两个端点且队列可保留重复歌曲，但持久化的仍是当前歌曲 ID；当前项重复时，`currentIndex` 会回落到第一次出现的位置，不能准确往返。 |
-| `playbackReport` | 1 | 否 | ❌ | `reportPlayback` 未实现，`getNowPlaying` 也没有时间线状态。 |
+| `indexBasedQueue` | 1 | 是 | ✅ | `currentIndex` 独立持久化，重复歌曲及其准确当前位置可以往返。 |
+| `playbackReport` | 1 | 是 | ✅ | `reportPlayback`、位置估算、一次性 Scrobble、`ignoreScrobble` 和带时间线字段的 `getNowPlaying` 已实现。 |
 | `songLyrics` | 1 | 是 | ✅ | `getLyricsBySongId` 返回内嵌歌词，并将 LRC 时间标签转换为结构化行。 |
 | `songLyrics` | 2 | 否 | ❌ | 不处理 `enhanced=true`，没有 `kind`、`agents`、`cueLine` 和字/音节级时间信息。 |
 | `sonicSimilarity` | 1 | 否 | ❌ | `findSonicPath`、`getSonicSimilarTracks` 均未实现。 |
 | `template` | 1、2 | 否 | — | 官方文档中的扩展示例模板，不是 mNest 功能目标。 |
-| `topSongsByArtistId` | 1 | 否 | 🟡 | 代码能按艺术家 ID 查询，但没有广告该扩展；同时基础 `artist` 参数未实现，详见 `getTopSongs`。 |
+| `topSongsByArtistId` | 1 | 是 | ✅ | `getTopSongs` 同时支持基础 `artist` 参数和优先级更高的艺术家 `id`。 |
 | `transcodeOffset` | 1 | 是 | ✅ | 音乐 `stream` 接受 `timeOffset`，并从指定秒数开始转码。 |
 | `transcoding` | 1 | 否 | ❌ | `getTranscodeDecision`、`getTranscodeStream` 均未实现。 |
 
@@ -96,8 +97,8 @@
 | `createInternetRadioStation` | ✅ | 管理员可创建网络电台；另支持私有的 `proxy` 参数。 |
 | `createPlaylist` | ✅ | 支持新建、按 `playlistId` 覆盖，以及重复 `songId`。 |
 | `createPodcastChannel` | ❌ | Podcast 域未启用。 |
-| `createShare` | 🟡 | 可分享一首或多首歌曲并设置描述/过期时间；规范允许的专辑 ID 会被校验拒绝，视频也不支持。 |
-| `createUser` | 🟡 | 可创建用户并设置邮箱、密码、`adminRole`；忽略 LDAP、其他角色和 `musicFolderId`。 |
+| `createShare` | ✅ | 可分享一首、多首歌曲或整个专辑并设置描述/过期时间；视频随视频域一起不支持。 |
+| `createUser` | ✅ | 可创建用户，并设置邮箱、密码、全部标准角色、最大码率和一个或多个 `musicFolderId`。 |
 | `deleteBookmark` | ✅ | 只删除当前用户对指定歌曲的书签。 |
 | `deleteInternetRadioStation` | ❌ | OpenSubsonic 路由被明确禁用并返回错误 `50`；mNest 管理接口另有删除能力。 |
 | `deletePlaylist` | ✅ | 仅允许所有者删除，同时清理播放列表条目。 |
@@ -109,13 +110,13 @@
 | `downloadPodcastEpisode` | ❌ | Podcast 域未启用。 |
 | `findSonicPath` | ❌ | `sonicSimilarity` 扩展未实现。 |
 | `getAlbum` | ✅ | 返回 ID3 专辑及按碟号、曲序排列的歌曲。 |
-| `getAlbumInfo` | 🟡 | 只返回空 `albumInfo`，不校验 `id`，没有说明、MusicBrainz/Last.fm 信息或图片 URL。 |
-| `getAlbumInfo2` | 🟡 | 与 `getAlbumInfo` 相同，只返回空 `albumInfo`。 |
+| `getAlbumInfo` | ✅ | 校验歌曲/专辑 ID，返回本地标签备注；没有本地备注时返回专辑与艺术家的事实性摘要。 |
+| `getAlbumInfo2` | ✅ | 与 `getAlbumInfo` 相同，使用规范要求的 `albumInfo` 响应键。 |
 | `getAlbumList` | ✅ | 支持规范的 10 种列表类型、分页和音乐文件夹过滤，返回目录式专辑。 |
 | `getAlbumList2` | ✅ | 与 `getAlbumList` 相同，返回 ID3 专辑结构。 |
 | `getArtist` | ✅ | 返回艺术家及其专辑。 |
-| `getArtistInfo` | 🟡 | 只返回空 `artistInfo`，不校验 `id`，不处理 `count` / `includeNotPresent`。 |
-| `getArtistInfo2` | 🟡 | 与 `getArtistInfo` 相同，只返回空 `artistInfo2`。 |
+| `getArtistInfo` | ✅ | 支持歌曲、专辑或艺术家 ID，返回本地统计摘要及按共同流派计算的相似艺术家，并处理 `count`。 |
+| `getArtistInfo2` | ✅ | 与 `getArtistInfo` 相同，返回 `artistInfo2`。 |
 | `getArtists` | ✅ | 按首字母分组返回 ID3 艺术家，支持音乐文件夹过滤。 |
 | `getAvatar` | ✅ | 按用户名返回服务端生成的首字母 SVG 头像。 |
 | `getBookmarks` | ✅ | 返回当前用户仍可解析到歌曲的全部书签。 |
@@ -129,14 +130,14 @@
 | `getLyrics` | ✅ | 按艺术家/标题从内嵌标签歌词中查找并返回旧版歌词。 |
 | `getLyricsBySongId` | ✅ | 实现 `songLyrics` v1；支持普通文本和 LRC 行级同步歌词。 |
 | `getMusicDirectory` | ✅ | 可浏览音乐文件夹、艺术家、专辑和歌曲层级。 |
-| `getMusicFolders` | ✅ | 返回全部启用的音乐文件夹及稳定的整型 API ID。 |
+| `getMusicFolders` | ✅ | 返回当前用户有权访问的全部启用音乐文件夹及稳定的整型 API ID。 |
 | `getNewestPodcasts` | ❌ | Podcast 域未启用。 |
-| `getNowPlaying` | 🟡 | 始终返回空 `entry`，没有保存或展示用户当前播放状态。 |
+| `getNowPlaying` | ✅ | 返回未停止且未过期的播放状态，并包含估算后的 `positionMs`、`state`、`playbackRate` 和客户端信息。 |
 | `getOpenSubsonicExtensions` | ✅ | 无需认证即可返回扩展和版本列表。 |
 | `getPlaylist` | ✅ | 所有者或任何用户可读取公开播放列表，歌曲顺序和重复项可保留。 |
 | `getPlaylists` | ✅ | 返回自己的和公开播放列表；管理员可通过 `username` 查询其他用户。 |
 | `getPlayQueue` | ✅ | 按用户读取传统 current-song 播放队列。 |
-| `getPlayQueueByIndex` | 🟡 | 能以 `currentIndex` 返回位置；但当前歌曲在队列中重复时总是返回第一次出现的索引。 |
+| `getPlayQueueByIndex` | ✅ | 以独立持久化的 `currentIndex` 返回位置，重复歌曲不会造成索引歧义。 |
 | `getPodcastEpisode` | ❌ | 同名 OpenSubsonic 扩展未实现。 |
 | `getPodcasts` | ❌ | Podcast 域未启用。 |
 | `getRandomSongs` | ✅ | 支持数量、流派、年份范围和音乐文件夹过滤。 |
@@ -149,34 +150,34 @@
 | `getSonicSimilarTracks` | ❌ | `sonicSimilarity` 扩展未实现。 |
 | `getStarred` | ✅ | 返回当前用户收藏的目录式歌曲、专辑和艺术家。 |
 | `getStarred2` | ✅ | 返回当前用户收藏的 ID3 歌曲、专辑和艺术家。 |
-| `getTopSongs` | 🟡 | 本地按播放次数排序，代码强制要求 `id` 参数；规范基础用法要求 `artist`，而 ID 用法所属扩展又未被广告。 |
+| `getTopSongs` | ✅ | 支持基础 `artist` 名称和 `topSongsByArtistId` 的 `id`，按本地播放次数排序，`id` 优先。 |
 | `getTranscodeDecision` | ❌ | `transcoding` 扩展未实现。 |
 | `getTranscodeStream` | ❌ | `transcoding` 扩展未实现。 |
-| `getUser` | 🟡 | 可读取自己，管理员可读取任意用户；细粒度角色和文件夹权限是固定合成值。 |
-| `getUsers` | 🟡 | 管理员可列出用户；每个用户返回固定角色集合和全部启用文件夹。 |
+| `getUser` | ✅ | 可读取自己，管理员可读取任意用户；返回实际角色、最大码率和音乐文件夹授权。 |
+| `getUsers` | ✅ | 管理员可列出用户，并返回每个用户实际保存的角色和文件夹授权。 |
 | `getVideoInfo` | ❌ | 视频域未启用。 |
 | `getVideos` | ❌ | 视频域未启用。 |
 | `hls` | ❌ | HLS 未实现；`hls.m3u8` 会被归一化为该方法后返回未实现错误。 |
 | `jukeboxControl` | ❌ | Jukebox 域未启用。 |
 | `ping` | ✅ | 返回标准成功包装。 |
 | `refreshPodcasts` | ❌ | Podcast 域未启用。 |
-| `reportPlayback` | ❌ | `playbackReport` 扩展未实现；客户端应继续使用 `scrobble`。 |
+| `reportPlayback` | ✅ | 保存 starting/playing/paused/stopped 时间线，估算播放位置，支持 `ignoreScrobble`，达到播放阈值后只提交一次 Scrobble。 |
 | `savePlayQueue` | ✅ | 保存传统 current-song 队列、位置和客户端名。 |
-| `savePlayQueueByIndex` | 🟡 | 接受 `currentIndex` 并保留重复歌曲，但只持久化该位置的歌曲 ID，无法准确恢复重复项中的原索引。 |
+| `savePlayQueueByIndex` | ✅ | 独立持久化 `currentIndex`，可准确保存重复歌曲中的当前项。 |
 | `scrobble` | ✅ | 支持批量 ID/时间和 `submission`；正式提交更新播放次数，并异步转发 Last.fm。 |
 | `search` | ✅ | 实现旧版 artist/album/title/any 搜索和统一分页。 |
 | `search2` | ✅ | 分别分页搜索艺术家、专辑和歌曲，支持音乐文件夹过滤。 |
 | `search3` | ✅ | 与 `search2` 相同，返回 ID3 艺术家/专辑结构。 |
 | `setRating` | ✅ | 支持歌曲、专辑、艺术家 0–5 分用户评分；0 表示删除评分。 |
-| `star` | 🟡 | 支持批量 `id`、`albumId`、`artistId`；但规范也允许 `id` 指向目录式专辑/艺术家，当前会把所有 `id` 都当作歌曲校验。 |
+| `star` | ✅ | 支持批量 `id`、`albumId`、`artistId`，并能识别通过目录式 `id` 传入的歌曲、专辑或艺术家。 |
 | `startScan` | ✅ | 仅管理员可启动扫描，返回扫描状态和 mNest 私有 `jobId`。 |
 | `stream` | ✅ | 支持原始音频、Range、音频转码、最大码率和 `timeOffset`；不支持视频参数。 |
 | `tokenInfo` | ✅ | 使用有效 `apiKey` 时返回对应用户名。 |
-| `unstar` | 🟡 | 支持批量 `id`、`albumId`、`artistId`；目录式专辑/艺术家若通过 `id` 传入，会被当作歌曲处理而无法取消收藏。 |
+| `unstar` | ✅ | 支持批量参数，并能取消通过目录式 `id` 收藏的歌曲、专辑或艺术家。 |
 | `updateInternetRadioStation` | ✅ | 管理员可更新网络电台及私有代理配置。 |
 | `updatePlaylist` | ✅ | 支持名称、备注、公开状态、按索引删除和追加歌曲。 |
 | `updateShare` | ✅ | 分享所有者可更新描述和过期时间。 |
-| `updateUser` | 🟡 | 强制要求 `password`，而规范中密码可选；只更新密码、邮箱和 `adminRole`，忽略其余角色、文件夹和最大码率。 |
+| `updateUser` | ✅ | 密码为可选参数；支持更新邮箱、管理员状态、全部标准角色、文件夹授权和最大码率。 |
 
 ## 明确未实现的能力域
 
@@ -186,15 +187,15 @@
 - Jukebox：`jukeboxControl`。
 - 声学相似度：`findSonicPath`、`getSonicSimilarTracks`。
 - 新转码协商：`getTranscodeDecision`、`getTranscodeStream`。
-- 播放时间线：`reportPlayback` 和可用的 `getNowPlaying` 状态。
 - `songLyrics` v2 的增强歌词结构。
 
-## 建议修复顺序
+## 本轮兼容性修复
 
-1. 修正 `getTopSongs`：恢复基础 `artist` 参数；如果保留 `id` 参数，则同时广告 `topSongsByArtistId`。
-2. 为播放队列持久化真实 `currentIndex`，修复 `indexBasedQueue` 在重复歌曲上的往返语义；修复前不应广告该扩展为完整可用。
-3. 修正 `updateUser` 的可选密码语义，并决定是实现细粒度角色/文件夹授权，还是在响应和文档中明确只支持两级权限。
-4. 为 `apiKeyAuthentication` 增加 Key 查看、轮换和吊销入口，或在此之前停止广告该扩展。
-5. 让 `createShare` 接受专辑 ID，补齐当前分享读取代码已经具备的专辑展开能力；同时让 `star` / `unstar` 正确识别通过 `id` 传入的目录式专辑和艺术家。
-6. 用真实元数据补齐 `getArtistInfo*`、`getAlbumInfo*`，并结合 `reportPlayback` 实现 `getNowPlaying`。
-7. 视频、Podcast、聊天、Jukebox、声学相似度和转码协商属于独立产品范围，只有在产品需要时再实现并广告对应扩展。
+1. `getTopSongs` 恢复 `artist` 参数并广告 `topSongsByArtistId`。
+2. 播放队列持久化真实 `currentIndex`，完整支持重复歌曲。
+3. 用户更新支持可选密码、细粒度角色、最大码率和文件夹授权。
+4. 个人设置提供 API Key 查看、复制、轮换和吊销。
+5. 分享接受专辑 ID，`star` / `unstar` 正确识别目录式 ID。
+6. Artist/Album Info 返回本地元数据；`reportPlayback`、Now Playing 和一次性 Scrobble 已接通，并广告 `playbackReport`。
+
+剩余视频、Podcast、聊天、Jukebox、声学相似度和新转码协商属于独立产品范围，只有在产品需要时再实现并广告对应扩展。

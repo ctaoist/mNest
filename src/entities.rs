@@ -49,6 +49,33 @@ pub mod music_folder {
     empty_relation!();
 }
 
+pub mod user_subsonic_access {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "user_subsonic_access")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub user_id: String,
+        pub ldap_authenticated: i64,
+        pub settings_role: i64,
+        pub stream_role: i64,
+        pub jukebox_role: i64,
+        pub download_role: i64,
+        pub upload_role: i64,
+        pub playlist_role: i64,
+        pub cover_art_role: i64,
+        pub comment_role: i64,
+        pub podcast_role: i64,
+        pub share_role: i64,
+        pub video_conversion_role: i64,
+        pub max_bit_rate: i64,
+        pub folder_ids: String,
+    }
+
+    empty_relation!();
+}
+
 pub mod artist {
     use super::*;
 
@@ -309,9 +336,32 @@ pub mod play_queue {
         pub user_id: String,
         pub track_ids: String,
         pub current_id: Option<String>,
+        pub current_index: Option<i64>,
         pub position: i64,
         pub changed_at: String,
         pub changed_by: String,
+    }
+
+    empty_relation!();
+}
+
+pub mod playback_state {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "playback_states")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub user_id: String,
+        pub media_id: String,
+        pub media_type: String,
+        pub position_ms: i64,
+        pub state: String,
+        pub playback_rate: f64,
+        pub ignore_scrobble: i64,
+        pub scrobbled: i64,
+        pub updated_at: String,
+        pub client: String,
     }
 
     empty_relation!();

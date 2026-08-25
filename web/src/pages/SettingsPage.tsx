@@ -4,8 +4,11 @@ import {
   Check,
   CircleAlert,
   CloudDownload,
+  Copy,
   Database,
   Edit3,
+  Eye,
+  EyeOff,
   ExternalLink,
   FolderPlus,
   Gauge,
@@ -22,6 +25,7 @@ import {
   RadioTower,
   RefreshCw,
   ServerCog,
+  ShieldCheck,
   SunMedium,
   Trash2,
   Unlink,
@@ -33,9 +37,9 @@ import { useAuth } from '../context/auth'
 import { ThemeName, useTheme } from '../context/theme'
 import { useToast } from '../context/toast'
 import { usePreferences, WEB_PLAYBACK_BITRATES } from '../context/preferences'
-import { get, post, request, subscribeJobs, subsonic } from '../lib/api'
+import { del, get, post, request, subscribeJobs, subsonic } from '../lib/api'
 import { safeHttpUrl, safeRadioStreamUrl } from '../lib/utils'
-import type { ConfigStatus, DownloadFilenameFormat, DownloadSource, DownloadSourceKind, JobRecord, LastFmStatus, LibraryRoot, RadioStation, WebPlaybackBitrate } from '../types'
+import type { ConfigStatus, DownloadFilenameFormat, DownloadSource, DownloadSourceKind, JobRecord, LastFmStatus, LibraryRoot, RadioStation, SubsonicApiKey, WebPlaybackBitrate } from '../types'
 
 const themes: Array<{ id: ThemeName; name: string; description: string; icon: typeof SunMedium }> = [
   { id: 'archive', name: '唱片档案馆', description: '深墨蓝、暖金与纸张质感', icon: HardDrive },
@@ -100,6 +104,8 @@ export function SettingsPage() {
   const [downloadSources, setDownloadSources] = createSignal<DownloadSource[]>([])
   const [radioStations, setRadioStations] = createSignal<RadioStation[]>([])
   const [lastFmStatus, setLastFmStatus] = createSignal<LastFmStatus | null>(null)
+  const [subsonicApiKey, setSubsonicApiKey] = createSignal<SubsonicApiKey | null>(null)
+  const [revealSubsonicApiKey, setRevealSubsonicApiKey] = createSignal(false)
   const [jobFilter, setJobFilter] = createSignal('all')
   const [rootDialog, setRootDialog] = createSignal(false)
   const [editingRootId, setEditingRootId] = createSignal('')
@@ -126,26 +132,32 @@ export function SettingsPage() {
   const load = async () => {
     try {
       if (isAdmin()) {
-        const [config, healthData, sources, stations, lastfm] = await Promise.all([
+        const [config, healthData, sources, stations, lastfm, apiKey] = await Promise.all([
           get<ConfigStatus>('/api/config/status/'),
           request<{ status: string; version: string }>('/health'),
           get<DownloadSource[]>('/api/download_sources/'),
           get<RadioStation[]>('/api/internet_radio_stations/'),
           get<LastFmStatus>('/api/lastfm/status/'),
+          get<SubsonicApiKey>('/api/user/subsonic-api-key/'),
         ])
         setStatus(config)
         setHealth(healthData)
         setDownloadSources(sources)
         setRadioStations(stations)
         setLastFmStatus(lastfm)
+        setSubsonicApiKey(apiKey)
+        setRevealSubsonicApiKey(false)
         setLastFmApiKey(lastfm.api_key)
       } else {
-        const [healthData, lastfm] = await Promise.all([
+        const [healthData, lastfm, apiKey] = await Promise.all([
           request<{ status: string; version: string }>('/health'),
           get<LastFmStatus>('/api/lastfm/status/'),
+          get<SubsonicApiKey>('/api/user/subsonic-api-key/'),
         ])
         setHealth(healthData)
         setLastFmStatus(lastfm)
+        setSubsonicApiKey(apiKey)
+        setRevealSubsonicApiKey(false)
         setLastFmApiKey(lastfm.api_key)
       }
     } catch (error) {
@@ -500,6 +512,62 @@ export function SettingsPage() {
     )
   }
 
+  const copySubsonicApiKey = async () => {
+    const value = subsonicApiKey()?.api_key
+    if (!value) return
+    try {
+      await navigator.clipboard.writeText(value)
+      toast.notify('OpenSubsonic API Key 已复制', 'success')
+    } catch {
+      toast.notify('浏览器拒绝访问剪贴板，请手动复制', 'error')
+    }
+  }
+
+  const rotateSubsonicApiKey = async () => {
+    if (subsonicApiKey()?.enabled && !window.confirm('轮换后，正在使用旧 API Key 的客户端会立即失效。确认继续？')) return
+    setBusy('subsonic-key-rotate')
+    try {
+      const value = await post<SubsonicApiKey>('/api/user/subsonic-api-key/', {})
+      setSubsonicApiKey(value)
+      setRevealSubsonicApiKey(true)
+      toast.notify('OpenSubsonic API Key 已生成，请更新客户端配置', 'success')
+    } catch (error) {
+      toast.notify(error instanceof Error ? error.message : 'API Key 生成失败', 'error')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const revokeSubsonicApiKey = async () => {
+    if (!window.confirm('吊销后，所有使用此 API Key 的客户端会立即退出。确认吊销？')) return
+    setBusy('subsonic-key-revoke')
+    try {
+      const value = await del<SubsonicApiKey>('/api/user/subsonic-api-key/')
+      setSubsonicApiKey(value)
+      setRevealSubsonicApiKey(false)
+      toast.notify('OpenSubsonic API Key 已吊销', 'success')
+    } catch (error) {
+      toast.notify(error instanceof Error ? error.message : 'API Key 吊销失败', 'error')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const renderSubsonicApiKey = () => {
+    const key = subsonicApiKey()
+    if (!key) return null
+    return (
+      <section class="panel subsonic-key-settings">
+        <div class="section-heading"><div><span class="eyebrow">CLIENT ACCESS</span><div class="settings-section-title">OpenSubsonic API Key</div></div><span class={`subsonic-key-status ${key.enabled ? 'is-active' : ''}`}><span />{key.enabled ? 'ACTIVE' : 'REVOKED'}</span></div>
+        <div class="subsonic-key-console">
+          <span class="subsonic-key-mark"><ShieldCheck /></span>
+          <div class="subsonic-key-copy"><strong>当前用户的长期客户端凭据</strong><small>可替代用户名和密码登录。轮换或吊销会立即使旧 Key 失效。</small><code class={key.enabled ? '' : 'is-empty'}>{key.enabled ? revealSubsonicApiKey() ? key.api_key : '••••••••••••••••••••••••••••••••' : '尚未启用 API Key'}</code></div>
+          <div class="subsonic-key-actions"><Show when={key.enabled}><button class="icon-button" disabled={busy().startsWith('subsonic-key')} onClick={() => setRevealSubsonicApiKey((visible) => !visible)} aria-label={revealSubsonicApiKey() ? '隐藏 OpenSubsonic API Key' : '显示 OpenSubsonic API Key'}>{revealSubsonicApiKey() ? <EyeOff /> : <Eye />}</button></Show><button class="secondary-button small" disabled={!key.enabled || busy().startsWith('subsonic-key')} onClick={() => void copySubsonicApiKey()}><Copy size={15} />复制</button><button class="primary-button small" disabled={busy().startsWith('subsonic-key')} onClick={() => void rotateSubsonicApiKey()}>{busy() === 'subsonic-key-rotate' ? <LoaderCircle class="spin" /> : <RefreshCw size={15} />}{key.enabled ? '轮换' : '生成'}</button><Show when={key.enabled}><button class="icon-button danger" disabled={busy().startsWith('subsonic-key')} onClick={() => void revokeSubsonicApiKey()} aria-label="吊销 OpenSubsonic API Key">{busy() === 'subsonic-key-revoke' ? <LoaderCircle class="spin" /> : <Trash2 />}</button></Show></div>
+        </div>
+      </section>
+    )
+  }
+
   const renderLastFmSettings = (admin: boolean) => {
     const lastfm = lastFmStatus()
     if (!lastfm) return null
@@ -534,7 +602,7 @@ export function SettingsPage() {
       </header>
 
       <Show when={lastFmStatus()} fallback={<div class="loading-panel"><LoaderCircle class="spin" /><span>正在读取设置…</span></div>}>
-        <Show when={isAdmin()} fallback={<>{renderPlaybackSettings()}{renderThemeSettings()}{renderLastFmSettings(false)}</>}>
+        <Show when={isAdmin()} fallback={<>{renderPlaybackSettings()}{renderSubsonicApiKey()}{renderThemeSettings()}{renderLastFmSettings(false)}</>}>
           <Show when={status()} fallback={<div class="loading-panel"><LoaderCircle class="spin" /><span>正在读取管理员设置…</span></div>}>
             {(config) => (
               <>
@@ -567,6 +635,8 @@ export function SettingsPage() {
             </div>
 
             {renderPlaybackSettings()}
+
+            {renderSubsonicApiKey()}
 
             {renderThemeSettings()}
 

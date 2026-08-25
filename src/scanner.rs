@@ -829,6 +829,7 @@ mod tests {
             user_id: Set("user".into()),
             track_ids: Set(serde_json::to_string(&[&track_id]).unwrap()),
             current_id: Set(Some(track_id.clone())),
+            current_index: Set(Some(0)),
             position: Set(500),
             changed_at: Set(now.clone()),
             changed_by: Set("test".into()),

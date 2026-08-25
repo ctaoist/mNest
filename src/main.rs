@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&settings.database).await?;
     db::migrate(&pool).await?;
     db::bootstrap_admin(&pool, &settings.admin, &settings.auth.jwt_secret).await?;
+    db::protect_subsonic_api_keys(&pool, &settings.auth.jwt_secret).await?;
     db::protect_download_source_secrets(&pool, &settings.auth.jwt_secret).await?;
     let providers = Arc::new(ProviderRegistry::new(settings.clone()));
     let state = AppState::new(settings.clone(), pool, providers);

@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   request: vi.fn(),
   post: vi.fn(),
+  del: vi.fn(),
   subsonic: vi.fn(),
   notify: vi.fn(),
   bitrate: 0,
@@ -40,6 +41,7 @@ vi.mock('../src/context/toast', () => ({
 vi.mock('../src/lib/api', () => ({
   get: mocks.get,
   post: mocks.post,
+  del: mocks.del,
   request: mocks.request,
   subscribeJobs: vi.fn(() => () => undefined),
   subsonic: mocks.subsonic,
@@ -60,6 +62,7 @@ describe('SettingsPage permissions', () => {
     mocks.saveBitrate.mockImplementation(async (value: number) => { mocks.bitrate = value })
     mocks.get.mockImplementation((path: string) => {
       if (path === '/api/lastfm/status/') return Promise.resolve(lastfm)
+      if (path === '/api/user/subsonic-api-key/') return Promise.resolve({ api_key: '0123456789abcdef0123456789abcdef', enabled: true })
       if (path === '/api/download_sources/') return Promise.resolve([])
       if (path === '/api/internet_radio_stations/') return Promise.resolve([])
       if (path === '/api/config/status/') return Promise.resolve({
@@ -90,6 +93,7 @@ describe('SettingsPage permissions', () => {
 
     await waitFor(() => expect(screen.getByText('Last.fm')).toBeTruthy())
     expect(screen.getByText('界面主题')).toBeTruthy()
+    expect(screen.getByText('OpenSubsonic API Key')).toBeTruthy()
     expect(screen.getByLabelText('网页端播放码率')).toHaveValue('0')
     expect(screen.queryByText('曲库目录')).toBeNull()
     expect(screen.queryByPlaceholderText('Last.fm API Key')).toBeNull()
@@ -105,6 +109,29 @@ describe('SettingsPage permissions', () => {
 
     await waitFor(() => expect(mocks.saveBitrate).toHaveBeenCalledWith(128))
     expect(mocks.notify).toHaveBeenCalledWith('网页播放码率已保存，将从下一次播放开始生效', 'success')
+  })
+
+  it('rotates the personal OpenSubsonic API key', async () => {
+    mocks.post.mockResolvedValue({ api_key: 'fedcba9876543210fedcba9876543210', enabled: true })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(() => <SettingsPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '轮换' })).toBeTruthy())
+
+    await fireEvent.click(screen.getByRole('button', { name: '轮换' }))
+
+    await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/api/user/subsonic-api-key/', {}))
+    expect(screen.getByText('fedcba9876543210fedcba9876543210')).toBeTruthy()
+  })
+
+  it('masks the personal OpenSubsonic API key until explicitly revealed', async () => {
+    render(() => <SettingsPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '显示 OpenSubsonic API Key' })).toBeTruthy())
+
+    expect(screen.queryByText('0123456789abcdef0123456789abcdef')).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: '显示 OpenSubsonic API Key' }))
+
+    expect(screen.getByText('0123456789abcdef0123456789abcdef')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '隐藏 OpenSubsonic API Key' })).toBeTruthy()
   })
 
   it('shows administrative and personal settings to an administrator', async () => {

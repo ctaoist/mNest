@@ -17,6 +17,11 @@ export interface UserPreferences {
   web_playback_bitrate: WebPlaybackBitrate
 }
 
+export interface SubsonicApiKey {
+  api_key: string
+  enabled: boolean
+}
+
 export interface Track {
   id: string
   title: string

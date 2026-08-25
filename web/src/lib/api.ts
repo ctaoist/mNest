@@ -57,6 +57,10 @@ export function get<T>(path: string): Promise<T> {
   return management<T>(path)
 }
 
+export function del<T>(path: string): Promise<T> {
+  return management<T>(path, { method: 'DELETE' })
+}
+
 export function subscribeJobs(
   pageSize: number,
   onJobs: (jobs: JobRecord[]) => void,

@@ -38,7 +38,7 @@ use crate::{
     auth::{
         AdminUser, AuthUser, authenticate_password_with_subsonic, authenticate_subsonic,
         cookie_value, decode_token, decrypt_server_secret, encrypt_server_secret, issue_tokens,
-        user_by_id, web_user_from_headers,
+        protect_subsonic_api_key, reveal_subsonic_api_key, user_by_id, web_user_from_headers,
     },
     entities::{app_setting, download_source, internet_radio_station, job, music_folder, track},
     internet_radio,
@@ -78,6 +78,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/user/preferences/",
             get(user_preferences).post(save_user_preferences),
+        )
+        .route(
+            "/api/user/subsonic-api-key/",
+            get(subsonic_api_key)
+                .post(rotate_subsonic_api_key)
+                .delete(revoke_subsonic_api_key),
         )
         .route("/api/lastfm/config/", post(save_lastfm_config))
         .route("/api/lastfm/status/", get(lastfm_status))
@@ -285,6 +291,74 @@ fn session_response(
 async fn user_info(AuthUser(user): AuthUser) -> Json<ApiResponse<Value>> {
     Json(ApiResponse::success(
         json!({"username": user.username, "role": user.role, "email": user.email}),
+    ))
+}
+
+async fn subsonic_api_key(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<
+    (
+        [(header::HeaderName, &'static str); 1],
+        Json<ApiResponse<Value>>,
+    ),
+    ApiError,
+> {
+    let api_key = reveal_subsonic_api_key(
+        &user.subsonic_token,
+        &state.settings.auth.jwt_secret,
+        &user.id,
+    )?;
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(ApiResponse::success(json!({
+            "api_key": api_key,
+            "enabled": !api_key.is_empty(),
+        }))),
+    ))
+}
+
+async fn rotate_subsonic_api_key(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<
+    (
+        [(header::HeaderName, &'static str); 1],
+        Json<ApiResponse<Value>>,
+    ),
+    ApiError,
+> {
+    let api_key = Uuid::new_v4().simple().to_string();
+    let protected = protect_subsonic_api_key(&api_key, &state.settings.auth.jwt_secret, &user.id)?;
+    let mut active = user.into_active_model();
+    active.subsonic_token = Set(protected);
+    active.update(&state.db).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(ApiResponse::success(
+            json!({"api_key": api_key, "enabled": true}),
+        )),
+    ))
+}
+
+async fn revoke_subsonic_api_key(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<
+    (
+        [(header::HeaderName, &'static str); 1],
+        Json<ApiResponse<Value>>,
+    ),
+    ApiError,
+> {
+    let mut active = user.into_active_model();
+    active.subsonic_token = Set(String::new());
+    active.update(&state.db).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(ApiResponse::success(
+            json!({"api_key": "", "enabled": false}),
+        )),
     ))
 }
 
@@ -3411,6 +3485,64 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn users_can_view_rotate_and_revoke_their_subsonic_api_key() {
+        let state = test_state().await;
+        let user = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let original = reveal_subsonic_api_key(
+            &user.subsonic_token,
+            &state.settings.auth.jwt_secret,
+            &user.id,
+        )
+        .unwrap();
+        let viewed = subsonic_api_key(State(state.clone()), AuthUser(user.clone()))
+            .await
+            .unwrap();
+        assert_eq!(viewed.1.0.data["api_key"], original);
+        assert_eq!(viewed.0[0].1, "private, no-store");
+
+        let rotated = rotate_subsonic_api_key(State(state.clone()), AuthUser(user.clone()))
+            .await
+            .unwrap();
+        let api_key = rotated.1.0.data["api_key"].as_str().unwrap().to_owned();
+        assert_ne!(api_key, original);
+        assert_eq!(api_key.len(), 32);
+        assert!(
+            authenticate_subsonic(
+                &state.db,
+                &HashMap::from([("apiKey".into(), api_key.clone())]),
+                &state.settings.auth.jwt_secret,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        let current = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.subsonic_token.starts_with("k1:"));
+        assert!(!current.subsonic_token.contains(&api_key));
+        let revoked = revoke_subsonic_api_key(State(state.clone()), AuthUser(current))
+            .await
+            .unwrap();
+        assert_eq!(revoked.1.0.data["enabled"], false);
+        assert!(
+            authenticate_subsonic(
+                &state.db,
+                &HashMap::from([("apiKey".into(), api_key)]),
+                &state.settings.auth.jwt_secret,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[tokio::test]
