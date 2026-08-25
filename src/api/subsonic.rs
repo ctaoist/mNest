@@ -586,7 +586,7 @@ async fn open_subsonic_extensions(state: &AppState) -> Value {
         json!({"name":"apiKeyAuthentication","versions":[1]}),
         json!({"name":"formPost","versions":[1]}),
         json!({"name":"playbackReport","versions":[1]}),
-        json!({"name":"songLyrics","versions":[1]}),
+        json!({"name":"songLyrics","versions":[1,2]}),
         json!({"name":"topSongsByArtistId","versions":[1]}),
         json!({"name":"transcodeOffset","versions":[1]}),
         json!({"name":"indexBasedQueue","versions":[1]}),
@@ -655,7 +655,9 @@ async fn json_endpoint(
         "updatePlaylist" => update_playlist(state, user, access, p).await,
         "deletePlaylist" => delete_playlist(state, user, required(p, "id")?).await,
         "getLyrics" => get_lyrics_legacy(state, access, p).await,
-        "getLyricsBySongId" => get_lyrics_by_song(state, access, required(p, "id")?).await,
+        "getLyricsBySongId" => {
+            get_lyrics_by_song(state, access, required(p, "id")?, bool_param(p, "enhanced")).await
+        }
         "star" => favorite(state, user, access, p, true).await,
         "unstar" => favorite(state, user, access, p, false).await,
         "setRating" => {
@@ -2404,18 +2406,19 @@ async fn get_lyrics_by_song(
     state: &AppState,
     access: &SubsonicAccess,
     id: &str,
+    enhanced: bool,
 ) -> Result<Value, ApiFailure> {
     let track = accessible_track(state, access, id).await?;
     if track.lyrics.trim().is_empty() {
         return Ok(json!({"lyricsList":{"structuredLyrics":[]}}));
     }
-    let timed_lines = parse_lrc(&track.lyrics)
-        .into_iter()
-        .map(|(start, value)| json!({"start":start,"value":value}))
-        .collect::<Vec<_>>();
-    let synced = !timed_lines.is_empty();
-    let lines = if synced {
-        timed_lines
+    let parsed_lines = parse_lrc(&track.lyrics);
+    let synced = !parsed_lines.is_empty();
+    let lines: Vec<Value> = if synced {
+        parsed_lines
+            .iter()
+            .map(|line| json!({"start":line.start,"value":line.value}))
+            .collect()
     } else {
         track
             .lyrics
@@ -2429,18 +2432,48 @@ async fn get_lyrics_by_song(
         .map(|artist| artist.name)
         .collect::<Vec<_>>()
         .join("; ");
-    Ok(
-        json!({"lyricsList":{"structuredLyrics":[{"displayArtist":display_artist,"displayTitle":track.title,"lang":"und","synced":synced,"line":lines}]}}),
-    )
+    let mut lyrics = json!({
+        "displayArtist": display_artist,
+        "displayTitle": track.title,
+        "lang": "und",
+        "synced": synced,
+        "line": lines,
+    });
+    if enhanced {
+        lyrics["kind"] = json!("main");
+        if synced {
+            let cue_lines = enhanced_lrc_cue_lines(&parsed_lines, track.duration);
+            if !cue_lines.is_empty() {
+                lyrics["cueLine"] = Value::Array(cue_lines);
+            }
+        }
+    }
+    Ok(json!({"lyricsList":{"structuredLyrics":[lyrics]}}))
 }
 
-fn parse_lrc(lyrics: &str) -> Vec<(i64, String)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LrcLine {
+    start: i64,
+    value: String,
+    cues: Vec<LrcCue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LrcCue {
+    start: i64,
+    end: Option<i64>,
+    value: String,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+fn parse_lrc(lyrics: &str) -> Vec<LrcLine> {
     let mut lines = lyrics.lines().flat_map(parse_lrc_line).collect::<Vec<_>>();
-    lines.sort_by_key(|(start, _)| *start);
+    lines.sort_by_key(|line| line.start);
     lines
 }
 
-fn parse_lrc_line(line: &str) -> Vec<(i64, String)> {
+fn parse_lrc_line(line: &str) -> Vec<LrcLine> {
     let mut remaining = line;
     let mut starts = Vec::new();
     while let Some(value) = remaining.strip_prefix('[') {
@@ -2453,10 +2486,173 @@ fn parse_lrc_line(line: &str) -> Vec<(i64, String)> {
         starts.push(start);
         remaining = &value[end + 1..];
     }
+    let Some(first_start) = starts.first().copied() else {
+        return Vec::new();
+    };
+    let (value, cues) = parse_enhanced_lrc_text(remaining);
     starts
         .into_iter()
-        .map(|start| (start, remaining.to_owned()))
+        .map(|start| {
+            let delta = start.checked_sub(first_start);
+            let shifted_cues = delta
+                .map(|delta| {
+                    cues.iter()
+                        .filter_map(|cue| {
+                            Some(LrcCue {
+                                start: cue.start.checked_add(delta)?,
+                                end: cue.end.and_then(|end| end.checked_add(delta)),
+                                value: cue.value.clone(),
+                                byte_start: cue.byte_start,
+                                byte_end: cue.byte_end,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            LrcLine {
+                start,
+                value: value.clone(),
+                cues: shifted_cues,
+            }
+        })
         .collect()
+}
+
+fn parse_enhanced_lrc_text(input: &str) -> (String, Vec<LrcCue>) {
+    let mut value = String::with_capacity(input.len());
+    let mut cues = Vec::new();
+    let mut cursor = 0;
+    let mut cue_start = None;
+    while let Some((marker_start, marker_end, timestamp)) = next_lrc_marker(input, cursor) {
+        append_lrc_segment(
+            &mut value,
+            &mut cues,
+            &input[cursor..marker_start],
+            cue_start.take(),
+            Some(timestamp),
+        );
+        cue_start = Some(timestamp);
+        cursor = marker_end;
+    }
+    append_lrc_segment(&mut value, &mut cues, &input[cursor..], cue_start, None);
+    (value, cues)
+}
+
+fn next_lrc_marker(input: &str, from: usize) -> Option<(usize, usize, i64)> {
+    let mut cursor = from;
+    while let Some(relative_start) = input.get(cursor..)?.find('<') {
+        let marker_start = cursor + relative_start;
+        let value_start = marker_start + 1;
+        let relative_end = input.get(value_start..)?.find('>')?;
+        let marker_end = value_start + relative_end;
+        if let Some(timestamp) = parse_lrc_timestamp(&input[value_start..marker_end]) {
+            return Some((marker_start, marker_end + 1, timestamp));
+        }
+        cursor = marker_end + 1;
+    }
+    None
+}
+
+fn append_lrc_segment(
+    line: &mut String,
+    cues: &mut Vec<LrcCue>,
+    segment: &str,
+    start: Option<i64>,
+    end: Option<i64>,
+) {
+    let byte_start = line.len();
+    line.push_str(segment);
+    if let Some(start) = start
+        && !segment.is_empty()
+    {
+        cues.push(LrcCue {
+            start,
+            end,
+            value: segment.to_owned(),
+            byte_start,
+            byte_end: line.len() - 1,
+        });
+    }
+}
+
+fn enhanced_lrc_cue_lines(lines: &[LrcLine], duration_seconds: f64) -> Vec<Value> {
+    let duration_ms = duration_millis(duration_seconds);
+    let mut result = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.cues.is_empty()
+            || line
+                .cues
+                .windows(2)
+                .any(|pair| pair[0].start > pair[1].start)
+        {
+            continue;
+        }
+        let next_line_start = lines
+            .iter()
+            .skip(index + 1)
+            .map(|line| line.start)
+            .find(|start| *start > line.start);
+        let boundary = next_line_start.or(duration_ms.filter(|end| *end > line.start));
+        let final_cue = line.cues.last().expect("non-empty cues");
+        let cue_line_end = final_cue
+            .end
+            .filter(|end| *end >= final_cue.start)
+            .map(|end| boundary.map_or(end, |boundary| end.min(boundary)))
+            .or(boundary)
+            .filter(|end| *end >= final_cue.start);
+        let mut ends = Vec::with_capacity(line.cues.len());
+        for (cue_index, cue) in line.cues.iter().enumerate() {
+            let next_cue_start = line.cues.get(cue_index + 1).map(|next| next.start);
+            let mut end = cue.end.or(next_cue_start).or(cue_line_end);
+            if let Some(value) = &mut end {
+                *value = (*value).max(cue.start);
+                if let Some(next) = next_cue_start {
+                    *value = (*value).min(next.max(cue.start));
+                }
+                if let Some(line_end) = cue_line_end {
+                    *value = (*value).min(line_end.max(cue.start));
+                }
+            }
+            ends.push(end);
+        }
+        let include_ends = ends.iter().all(Option::is_some);
+        let cues = line
+            .cues
+            .iter()
+            .zip(ends)
+            .map(|(cue, end)| {
+                let mut value = json!({
+                    "start": cue.start,
+                    "value": cue.value,
+                    "byteStart": cue.byte_start,
+                    "byteEnd": cue.byte_end,
+                });
+                if include_ends {
+                    value["end"] = json!(end.expect("all cue ends are present"));
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut cue_line = json!({
+            "index": index,
+            "start": line.cues[0].start,
+            "value": line.value,
+            "cue": cues,
+        });
+        if let Some(end) = cue_line_end {
+            cue_line["end"] = json!(end);
+        }
+        result.push(cue_line);
+    }
+    result
+}
+
+fn duration_millis(seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let milliseconds = (seconds * 1_000.0).round();
+    (milliseconds <= i64::MAX as f64).then_some(milliseconds as i64)
 }
 
 fn parse_lrc_timestamp(value: &str) -> Option<i64> {
@@ -5632,10 +5828,11 @@ mod tests {
 
     #[test]
     fn parses_synced_lrc_timestamps_in_milliseconds() {
-        assert_eq!(
-            parse_lrc_line("[01:02.50]Line"),
-            vec![(62_500, "Line".to_owned())]
-        );
+        let lines = parse_lrc_line("[01:02.50]Line");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].start, 62_500);
+        assert_eq!(lines[0].value, "Line");
+        assert!(lines[0].cues.is_empty());
         assert!(parse_lrc_line("[ar:Artist]").is_empty());
     }
 
@@ -5647,7 +5844,10 @@ mod tests {
              [00:01,5]作曲 : 银临",
         );
         assert_eq!(
-            lines,
+            lines
+                .into_iter()
+                .map(|line| (line.start, line.value))
+                .collect::<Vec<_>>(),
             vec![
                 (1_500, "作曲 : 银临".to_owned()),
                 (16_470, "万家穿针乞巧心系檀郎".to_owned()),
@@ -5655,6 +5855,93 @@ mod tests {
                 (116_290, "万家穿针乞巧心系檀郎".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_enhanced_lrc_with_utf8_byte_offsets_and_complete_ends() {
+        let lines = parse_lrc(
+            "[00:01.000]<00:01.000>眼<00:01.500>睛<00:02.000>\n\
+             [00:02.000]<00:02.000>done<00:03.000>",
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].value, "眼睛");
+        assert_eq!(lines[0].cues.len(), 2);
+        assert_eq!(lines[0].cues[0].byte_start, 0);
+        assert_eq!(lines[0].cues[0].byte_end, 2);
+        assert_eq!(lines[0].cues[1].byte_start, 3);
+        assert_eq!(lines[0].cues[1].byte_end, 5);
+
+        let cue_lines = enhanced_lrc_cue_lines(&lines, 180.0);
+        assert_eq!(cue_lines[0]["start"], 1_000);
+        assert_eq!(cue_lines[0]["end"], 2_000);
+        assert_eq!(cue_lines[0]["value"], "眼睛");
+        assert_eq!(cue_lines[0]["cue"][0]["start"], 1_000);
+        assert_eq!(cue_lines[0]["cue"][0]["end"], 1_500);
+        assert_eq!(cue_lines[0]["cue"][0]["byteStart"], 0);
+        assert_eq!(cue_lines[0]["cue"][0]["byteEnd"], 2);
+        assert_eq!(cue_lines[0]["cue"][1]["end"], 2_000);
+    }
+
+    #[test]
+    fn enhanced_lrc_omits_all_cue_ends_when_the_final_boundary_is_unknown() {
+        let lines = parse_lrc("[00:01.000]<00:01.000>A<00:02.000>B");
+        let cue_lines = enhanced_lrc_cue_lines(&lines, 0.0);
+        assert_eq!(cue_lines.len(), 1);
+        assert!(cue_lines[0].get("end").is_none());
+        assert!(cue_lines[0]["cue"][0].get("end").is_none());
+        assert!(cue_lines[0]["cue"][1].get("end").is_none());
+    }
+
+    #[test]
+    fn enhanced_lrc_drops_invalid_non_monotonic_cues_without_losing_text() {
+        let lines = parse_lrc("[00:01.000]<00:02.000>later<00:01.500>earlier");
+        assert_eq!(lines[0].value, "laterearlier");
+        assert!(enhanced_lrc_cue_lines(&lines, 180.0).is_empty());
+
+        let invalid_marker = parse_lrc("[00:01.000]<not-a-time>Text");
+        assert_eq!(invalid_marker[0].value, "<not-a-time>Text");
+        assert!(invalid_marker[0].cues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn song_lyrics_v2_is_opt_in_and_keeps_the_v1_fallback() {
+        let state = test_state().await;
+        insert_test_music_folder(&state).await;
+        let mut track = test_track();
+        track.lyrics = "[00:01.000]<00:01.000>眼<00:01.500>睛<00:02.000>".into();
+        track.into_active_model().insert(&state.db).await.unwrap();
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let api_key = crate::auth::reveal_subsonic_api_key(
+            &user.subsonic_token,
+            &state.settings.auth.jwt_secret,
+            &user.id,
+        )
+        .unwrap();
+
+        let base =
+            format!("/rest/getLyricsBySongId?apiKey={api_key}&v=1.16.1&c=test&f=json&id=track-1");
+        let v1 = request_json(router().with_state(state.clone()), &base).await;
+        let v1 = &v1["subsonic-response"]["lyricsList"]["structuredLyrics"][0];
+        assert!(v1.get("kind").is_none());
+        assert!(v1.get("cueLine").is_none());
+        assert_eq!(v1["line"][0]["value"], "眼睛");
+
+        let v2 = request_json(router().with_state(state), &format!("{base}&enhanced=true")).await;
+        let v2 = &v2["subsonic-response"]["lyricsList"]["structuredLyrics"][0];
+        assert_eq!(v2["kind"], "main");
+        assert_eq!(v2["cueLine"][0]["index"], 0);
+        assert_eq!(v2["cueLine"][0]["cue"][1]["value"], "睛");
+        assert!(v2.get("agents").is_none());
+
+        let xml = value_to_xml("structuredLyrics", v2);
+        assert!(xml.find("<line ").unwrap() < xml.find("<cueLine ").unwrap());
+        assert!(xml.contains("kind=\"main\""));
+        assert!(xml.contains("value=\"眼睛\""));
+        assert!(xml.contains(">眼</cue>"));
     }
 
     #[test]
@@ -6261,6 +6548,13 @@ mod tests {
         assert!(names.contains(&"playbackReport"));
         assert!(names.contains(&"topSongsByArtistId"));
         assert!(!names.contains(&"mnestRadioRecognition"));
+        let song_lyrics = response["openSubsonicExtensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|extension| extension["name"] == "songLyrics")
+            .unwrap();
+        assert_eq!(song_lyrics["versions"], json!([1, 2]));
 
         let now = chrono::Utc::now().to_rfc3339();
         download_source_entity::ActiveModel {

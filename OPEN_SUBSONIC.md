@@ -76,7 +76,7 @@
 | `indexBasedQueue` | 1 | 是 | ✅ | `currentIndex` 独立持久化，重复歌曲及其准确当前位置可以往返。 |
 | `playbackReport` | 1 | 是 | ✅ | `reportPlayback`、位置估算、一次性 Scrobble、`ignoreScrobble` 和带时间线字段的 `getNowPlaying` 已实现。 |
 | `songLyrics` | 1 | 是 | ✅ | `getLyricsBySongId` 返回内嵌歌词，并将 LRC 时间标签转换为结构化行。 |
-| `songLyrics` | 2 | 否 | ❌ | 不处理 `enhanced=true`，没有 `kind`、`agents`、`cueLine` 和字/音节级时间信息。 |
+| `songLyrics` | 2 | 是 | ✅ | `enhanced=true` 返回 `kind=main`，并将 Enhanced LRC 内联时间标记转换为 `cueLine`/`cue`、毫秒起止时间及 UTF-8 `byteStart`/`byteEnd`。简单单层歌词按规范省略可选的 `agents`；当前歌词存储不包含可可靠恢复的翻译、注音或多歌手分轨，因此不会伪造这些层。 |
 | `sonicSimilarity` | 1 | 否 | ❌ | `findSonicPath`、`getSonicSimilarTracks` 均未实现。 |
 | `template` | 1、2 | 否 | — | 官方文档中的扩展示例模板，不是 mNest 功能目标。 |
 | `topSongsByArtistId` | 1 | 是 | ✅ | `getTopSongs` 同时支持基础 `artist` 参数和优先级更高的艺术家 `id`。 |
@@ -128,7 +128,7 @@
 | `getInternetRadioStations` | ✅ | 返回网络电台；可按 mNest 配置生成代理流地址。 |
 | `getLicense` | 🟡 | 返回固定的“有效至 2099 年”兼容响应，并非真实授权状态。 |
 | `getLyrics` | ✅ | 按艺术家/标题从内嵌标签歌词中查找并返回旧版歌词。 |
-| `getLyricsBySongId` | ✅ | 实现 `songLyrics` v1；支持普通文本和 LRC 行级同步歌词。 |
+| `getLyricsBySongId` | ✅ | 实现 `songLyrics` v1/v2；默认保持普通文本和 LRC 行级响应，`enhanced=true` 时为 Enhanced LRC 增加逐字/音节时间和 UTF-8 字节偏移。 |
 | `getMusicDirectory` | ✅ | 可浏览音乐文件夹、艺术家、专辑和歌曲层级。 |
 | `getMusicFolders` | ✅ | 返回当前用户有权访问的全部启用音乐文件夹及稳定的整型 API ID。 |
 | `getNewestPodcasts` | ❌ | Podcast 域未启用。 |
@@ -187,7 +187,6 @@
 - Jukebox：`jukeboxControl`。
 - 声学相似度：`findSonicPath`、`getSonicSimilarTracks`。
 - 新转码协商：`getTranscodeDecision`、`getTranscodeStream`。
-- `songLyrics` v2 的增强歌词结构。
 
 ## 本轮兼容性修复
 
@@ -197,5 +196,6 @@
 4. 个人设置提供 API Key 查看、复制、轮换和吊销。
 5. 分享接受专辑 ID，`star` / `unstar` 正确识别目录式 ID。
 6. Artist/Album Info 返回本地元数据；`reportPlayback`、Now Playing 和一次性 Scrobble 已接通，并广告 `playbackReport`。
+7. `songLyrics` v2 支持 Enhanced LRC 的逐字/音节时间轴，并在 `enhanced=true` 时返回规范的 `kind`、`cueLine` 和 UTF-8 字节偏移。
 
 剩余视频、Podcast、聊天、Jukebox、声学相似度和新转码协商属于独立产品范围，只有在产品需要时再实现并广告对应扩展。
