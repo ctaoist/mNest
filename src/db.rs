@@ -205,8 +205,8 @@ mod tests {
     use super::*;
     use crate::config::{AdminSettings, DatabaseSettings};
     use crate::entities::{
-        app_setting, download_source, play_queue, playback_state, schema_migration, scrobble,
-        user_subsonic_access, user_track_stat,
+        app_setting, download_source, internet_radio_station, play_queue, playback_state,
+        schema_migration, scrobble, user_subsonic_access, user_track_stat,
     };
 
     #[tokio::test]
@@ -340,6 +340,43 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn adds_radio_cover_urls_to_an_already_applied_baseline() {
+        let db = connect(&DatabaseSettings {
+            driver: "sqlite".into(),
+            url: "sqlite::memory:".into(),
+            max_connections: 1,
+        })
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        db.execute_unprepared("ALTER TABLE internet_radio_stations DROP COLUMN cover_url")
+            .await
+            .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        internet_radio_station::ActiveModel {
+            id: Set("radio-1".into()),
+            name: Set("Radio".into()),
+            stream_url: Set("https://radio.example/live".into()),
+            home_page_url: Set(String::new()),
+            cover_url: Set("https://radio.example/cover.png".into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            internet_radio_station::Entity::find_by_id("radio-1")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .cover_url,
+            "https://radio.example/cover.png"
         );
     }
 

@@ -2,7 +2,6 @@ use std::{future::Future, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use chrono::Utc;
-use futures::StreamExt;
 use redis::AsyncCommands;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr,
@@ -418,55 +417,37 @@ async fn remote_import_one(
                 .map_err(|error| anyhow::anyhow!(error.without_url()))
         })
         .await?;
-        let response_content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let total = response.content_length().unwrap_or_default();
-        anyhow::ensure!(
-            total == 0 || total <= MAX_IMPORT_BYTES,
-            "远程音频超过 2GiB 限制"
-        );
-        let mut stream = response.bytes_stream();
-        let mut file = tokio::fs::File::create(&partial).await?;
-        let mut downloaded = 0u64;
-        loop {
-            let chunk =
-                cancel_on_shutdown(shutdown, async { Ok(stream.next().await.transpose()?) })
-                    .await?;
-            let Some(chunk) = chunk else {
-                break;
-            };
-            downloaded = downloaded
-                .checked_add(chunk.len() as u64)
-                .context("远程音频大小溢出")?;
-            anyhow::ensure!(downloaded <= MAX_IMPORT_BYTES, "远程音频超过 2GiB 限制");
-            file.write_all(&chunk).await?;
-            let progress = if total > 0 {
-                (downloaded as f64 / total as f64).min(1.0) * 0.82
-            } else {
-                0.35
-            };
-            set_progress(
-                state,
-                job_id,
-                progress,
-                &format!("正在下载 {}", payload.title),
-            )
-            .await?;
-        }
-        file.flush().await?;
-        file.sync_all().await?;
-        drop(file);
-        anyhow::ensure!(downloaded > 0, "下载源返回了空文件");
+        let progress_state = state.clone();
+        let progress_job_id = job_id.to_owned();
+        let progress_title = payload.title.clone();
+        let downloaded = network::download_response_to_file(
+            response,
+            &partial,
+            MAX_IMPORT_BYTES,
+            Some(shutdown.clone()),
+            move |download| {
+                let state = progress_state.clone();
+                let job_id = progress_job_id.clone();
+                let title = progress_title.clone();
+                async move {
+                    let progress = if download.total > 0 {
+                        (download.downloaded as f64 / download.total as f64).min(1.0) * 0.82
+                    } else {
+                        0.35
+                    };
+                    set_progress(&state, &job_id, progress, &format!("正在下载 {title}")).await
+                }
+            },
+        )
+        .await
+        .context("远程音频下载失败")?;
         let expected_extension = desired_destination
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
         let inspect_path = partial.clone();
-        let inspect_content_type = response_content_type.clone();
+        let inspect_content_type = downloaded.content_type.clone();
         let actual_extension = tokio::task::spawn_blocking(move || {
             remote_download::downloaded_audio_extension(
                 &inspect_path,

@@ -24,6 +24,7 @@ pub async fn run(db: &DatabaseConnection) -> anyhow::Result<()> {
     } else {
         remove_non_baseline_versions(db).await?;
     }
+    ensure_compatibility_columns(db).await?;
     if !has_column(db, "tracks", "needs_scrape").await? {
         anyhow::bail!(
             "database baseline is outdated: recreate the database to add tracks.needs_scrape"
@@ -270,7 +271,8 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         .col(text_primary_key("id"))
         .col(required_text("name"))
         .col(required_text("stream_url"))
-        .col(text_default("home_page_url", ""));
+        .col(text_default("home_page_url", ""))
+        .col(text_default("cover_url", ""));
     execute(db, stations).await?;
 
     let mut scrobbles = create_table("scrobbles");
@@ -408,6 +410,12 @@ async fn ensure_compatibility_columns<C: ConnectionTrait>(db: &C) -> anyhow::Res
     if !has_column(db, "play_queues", "current_index").await? {
         db.execute_unprepared("ALTER TABLE play_queues ADD COLUMN current_index BIGINT")
             .await?;
+    }
+    if !has_column(db, "internet_radio_stations", "cover_url").await? {
+        db.execute_unprepared(
+            "ALTER TABLE internet_radio_stations ADD COLUMN cover_url TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
     }
     Ok(())
 }

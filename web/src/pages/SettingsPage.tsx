@@ -33,6 +33,7 @@ import {
   X,
 } from 'lucide-solid'
 import { GitHubMark } from '../components/GitHubMark'
+import { CoverArt } from '../components/CoverArt'
 import { useAuth } from '../context/auth'
 import { ThemeName, useTheme } from '../context/theme'
 import { useToast } from '../context/toast'
@@ -90,6 +91,7 @@ type RadioDraft = {
   name: string
   streamUrl: string
   homePageUrl: string
+  coverUrl: string
   proxy: boolean
 }
 
@@ -117,7 +119,7 @@ export function SettingsPage() {
   const [sourceDraft, setSourceDraft] = createSignal<DownloadSourceDraft>({ kind: 'netease', name: sourceNames.netease, base_url: '', username: '', password: '', enabled: true })
   const [neteaseLogin, setNeteaseLogin] = createSignal<{ source_id: string; key: string; qr_image: string; message: string } | null>(null)
   const [radioDialog, setRadioDialog] = createSignal(false)
-  const [radioDraft, setRadioDraft] = createSignal<RadioDraft>({ name: '', streamUrl: '', homePageUrl: '', proxy: false })
+  const [radioDraft, setRadioDraft] = createSignal<RadioDraft>({ name: '', streamUrl: '', homePageUrl: '', coverUrl: '', proxy: false })
   const [lastFmApiKey, setLastFmApiKey] = createSignal('')
   const [lastFmSharedSecret, setLastFmSharedSecret] = createSignal('')
   const [busy, setBusy] = createSignal('')
@@ -385,8 +387,9 @@ export function SettingsPage() {
       name: station.name,
       streamUrl: station.streamUrl,
       homePageUrl: station.homePageUrl || '',
+      coverUrl: station.coverUrl || '',
       proxy: !!station.proxy,
-    } : { name: '', streamUrl: '', homePageUrl: '', proxy: false })
+    } : { name: '', streamUrl: '', homePageUrl: '', coverUrl: '', proxy: false })
     setRadioDialog(true)
   }
 
@@ -402,6 +405,11 @@ export function SettingsPage() {
       toast.notify('电台流地址必须使用 HTTP、HTTPS、RTSP、MMS、MMSH 或 MMST', 'error')
       return
     }
+    const coverUrl = draft.coverUrl.trim()
+    if (coverUrl && !safeHttpUrl(coverUrl)) {
+      toast.notify('电台封面链接必须使用 HTTP 或 HTTPS', 'error')
+      return
+    }
     setBusy('radio-save')
     try {
       await subsonic(draft.id ? 'updateInternetRadioStation' : 'createInternetRadioStation', {
@@ -409,6 +417,7 @@ export function SettingsPage() {
         name: draft.name.trim(),
         streamUrl,
         homepageUrl: draft.homePageUrl.trim(),
+        coverUrl,
         proxy: draft.proxy,
       })
       toast.notify(draft.id ? '网络电台已更新' : '网络电台已添加', 'success')
@@ -642,7 +651,7 @@ export function SettingsPage() {
 
             <section class="panel radio-settings">
               <div class="section-heading"><div><span class="eyebrow">INTERNET RADIO</span><h2>网络电台</h2></div><div class="section-actions"><span class="count-label">{radioStations().length} 个</span><button class="primary-button small" onClick={() => openRadioDialog()}><Plus size={15} />添加电台</button></div></div>
-              <div class="radio-setting-grid"><For each={radioStations()} fallback={<div class="empty-state small">尚未添加网络电台</div>}>{(station) => <article class="radio-setting-card"><span class="radio-setting-icon"><RadioTower /></span><div><div class="radio-setting-title"><strong>{station.name}</strong><span class={`radio-route-badge ${station.proxy ? 'is-proxied' : ''}`}>{station.proxy ? '服务端代理' : '客户端直连'}</span></div><div class="radio-original-url"><span>原始地址</span><code title={station.streamUrl}>{station.streamUrl}</code></div><small>{station.homePageUrl || '未设置电台主页'}</small></div><div class="radio-setting-tools"><Show when={safeHttpUrl(station.homePageUrl)}>{(homepage) => <a class="icon-button" href={homepage()} target="_blank" rel="noreferrer" aria-label={`打开 ${station.name} 主页`}><ExternalLink /></a>}</Show><button class="icon-button" onClick={() => openRadioDialog(station)} aria-label={`编辑 ${station.name}`}><Edit3 /></button><button class="icon-button danger" disabled={busy() === `radio-delete:${station.id}`} onClick={() => void removeRadio(station)} aria-label={`删除 ${station.name}`}>{busy() === `radio-delete:${station.id}` ? <LoaderCircle class="spin" /> : <Trash2 />}</button></div></article>}</For></div>
+              <div class="radio-setting-grid"><For each={radioStations()} fallback={<div class="empty-state small">尚未添加网络电台</div>}>{(station) => <article class="radio-setting-card"><CoverArt id={station.coverArt} alt={station.name} class="radio-setting-icon" kind="radio" /><div><div class="radio-setting-title"><strong>{station.name}</strong><span class={`radio-route-badge ${station.proxy ? 'is-proxied' : ''}`}>{station.proxy ? '服务端代理' : '客户端直连'}</span></div><div class="radio-original-url"><span>原始地址</span><code title={station.streamUrl}>{station.streamUrl}</code></div><small>{station.coverUrl ? '封面已由服务器缓存' : station.homePageUrl || '未设置电台主页'}</small></div><div class="radio-setting-tools"><Show when={safeHttpUrl(station.homePageUrl)}>{(homepage) => <a class="icon-button" href={homepage()} target="_blank" rel="noreferrer" aria-label={`打开 ${station.name} 主页`}><ExternalLink /></a>}</Show><button class="icon-button" onClick={() => openRadioDialog(station)} aria-label={`编辑 ${station.name}`}><Edit3 /></button><button class="icon-button danger" disabled={busy() === `radio-delete:${station.id}`} onClick={() => void removeRadio(station)} aria-label={`删除 ${station.name}`}>{busy() === `radio-delete:${station.id}` ? <LoaderCircle class="spin" /> : <Trash2 />}</button></div></article>}</For></div>
             </section>
 
             {renderLastFmSettings(true)}
@@ -672,7 +681,7 @@ export function SettingsPage() {
       </Show>
 
       <Show when={radioDialog()}>
-        <div class="dialog-layer"><div class="sheet-backdrop" onClick={() => setRadioDialog(false)} /><section class="dialog"><header><div><span class="eyebrow">INTERNET RADIO</span><h2>{radioDraft().id ? '编辑网络电台' : '添加网络电台'}</h2></div><button class="icon-button" onClick={() => setRadioDialog(false)}><X /></button></header><form onSubmit={saveRadio}><label class="field wide"><span>电台名称</span><input value={radioDraft().name} maxlength={256} onInput={(event) => setRadioDraft((value) => ({ ...value, name: event.currentTarget.value }))} required placeholder="例如：BBC Radio 6 Music" /></label><label class="field wide"><span>音频流地址</span><input type="text" inputmode="url" aria-label="音频流地址" value={radioDraft().streamUrl} maxlength={4096} onInput={(event) => setRadioDraft((value) => ({ ...value, streamUrl: event.currentTarget.value }))} required placeholder="https://、rtsp:// 或 mms://" /><small>支持 HTTP、HTTPS、RTSP、MMS、MMSH 和 MMST；非 HTTP 流由服务端转为 MP3。</small></label><label class="field wide"><span>电台主页（可选）</span><input type="url" value={radioDraft().homePageUrl} maxlength={4096} onInput={(event) => setRadioDraft((value) => ({ ...value, homePageUrl: event.currentTarget.value }))} placeholder="https://radio.example.com" /></label><label class={`radio-proxy-toggle ${radioDraft().proxy ? 'is-active' : ''}`}><input type="checkbox" checked={radioDraft().proxy} onChange={(event) => setRadioDraft((value) => ({ ...value, proxy: event.currentTarget.checked }))} aria-label="OpenSubsonic 服务端代理" /><span class="radio-proxy-check"><Check size={13} /></span><span><strong>OpenSubsonic 服务端代理</strong><small>第三方客户端获取 mNest 签名代理地址，由服务器连接并转发电台流。</small></span></label><p class="form-tip">关闭时 OpenSubsonic 返回原始流地址，由客户端直连；mNest 网页播放器始终使用服务端代理。RTSP、MMS 等协议建议开启代理。反向代理部署请正确配置 <code>server.public_url</code>。</p><div class="dialog-actions"><button type="button" class="secondary-button" onClick={() => setRadioDialog(false)}>取消</button><button class="primary-button" disabled={!radioDraft().name.trim() || !radioDraft().streamUrl.trim() || busy() === 'radio-save'}>{busy() === 'radio-save' ? <LoaderCircle class="spin" /> : <RadioTower size={16} />}保存电台</button></div></form></section></div>
+        <div class="dialog-layer"><div class="sheet-backdrop" onClick={() => setRadioDialog(false)} /><section class="dialog"><header><div><span class="eyebrow">INTERNET RADIO</span><h2>{radioDraft().id ? '编辑网络电台' : '添加网络电台'}</h2></div><button class="icon-button" onClick={() => setRadioDialog(false)}><X /></button></header><form onSubmit={saveRadio}><label class="field wide"><span>电台名称</span><input value={radioDraft().name} maxlength={256} onInput={(event) => setRadioDraft((value) => ({ ...value, name: event.currentTarget.value }))} required placeholder="例如：BBC Radio 6 Music" /></label><label class="field wide"><span>音频流地址</span><input type="text" inputmode="url" aria-label="音频流地址" value={radioDraft().streamUrl} maxlength={4096} onInput={(event) => setRadioDraft((value) => ({ ...value, streamUrl: event.currentTarget.value }))} required placeholder="https://、rtsp:// 或 mms://" /><small>支持 HTTP、HTTPS、RTSP、MMS、MMSH 和 MMST；非 HTTP 流由服务端转为 MP3。</small></label><label class="field wide"><span>电台主页（可选）</span><input type="url" value={radioDraft().homePageUrl} maxlength={4096} onInput={(event) => setRadioDraft((value) => ({ ...value, homePageUrl: event.currentTarget.value }))} placeholder="https://radio.example.com" /></label><label class="field wide"><span>封面链接（可选）</span><input type="url" aria-label="封面链接" value={radioDraft().coverUrl} maxlength={4096} onInput={(event) => setRadioDraft((value) => ({ ...value, coverUrl: event.currentTarget.value }))} placeholder="https://radio.example.com/logo.jpg" /><small>服务端下载并校验图片；启用封面缓存后会保存到本地缓存目录。</small></label><label class={`radio-proxy-toggle ${radioDraft().proxy ? 'is-active' : ''}`}><input type="checkbox" checked={radioDraft().proxy} onChange={(event) => setRadioDraft((value) => ({ ...value, proxy: event.currentTarget.checked }))} aria-label="OpenSubsonic 服务端代理" /><span class="radio-proxy-check"><Check size={13} /></span><span><strong>OpenSubsonic 服务端代理</strong><small>第三方客户端获取 mNest 签名代理地址，由服务器连接并转发电台流。</small></span></label><p class="form-tip">关闭时 OpenSubsonic 返回原始流地址，由客户端直连；mNest 网页播放器始终使用服务端代理。RTSP、MMS 等协议建议开启代理。反向代理部署请正确配置 <code>server.public_url</code>。</p><div class="dialog-actions"><button type="button" class="secondary-button" onClick={() => setRadioDialog(false)}>取消</button><button class="primary-button" disabled={!radioDraft().name.trim() || !radioDraft().streamUrl.trim() || busy() === 'radio-save'}>{busy() === 'radio-save' ? <LoaderCircle class="spin" /> : <RadioTower size={16} />}保存电台</button></div></form></section></div>
       </Show>
 
       <Show when={neteaseLogin()}>{(login) => <div class="dialog-layer"><div class="sheet-backdrop" onClick={closeNeteaseLogin} /><section class="dialog netease-login-dialog"><header><div><span class="eyebrow">NETEASE LOGIN</span><h2>网易云扫码登录</h2></div><button class="icon-button" onClick={closeNeteaseLogin}><X /></button></header><img src={login().qr_image} alt="网易云登录二维码" /><p>{login().message}</p></section></div>}</Show>

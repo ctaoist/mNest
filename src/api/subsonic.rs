@@ -849,6 +849,42 @@ async fn binary_endpoint(
         }
         "getCoverArt" => {
             let id = required_anyhow(p, "id")?;
+            if let Some(station_id) = id.strip_prefix("radio-") {
+                let station = radio_entity::Entity::find_by_id(station_id)
+                    .one(&state.db)
+                    .await?
+                    .context("radio station not found")?;
+                anyhow::ensure!(!station.cover_url.is_empty(), "radio cover not found");
+                let artwork = state
+                    .radio_covers
+                    .get(&station.id, &station.cover_url)
+                    .await?;
+                let etag = radio_cover_etag(&artwork.data);
+                if if_none_match.is_some_and(|value| if_none_match_matches(value, &etag)) {
+                    let mut response = StatusCode::NOT_MODIFIED.into_response();
+                    response
+                        .headers_mut()
+                        .insert(header::ETAG, HeaderValue::from_str(&etag)?);
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("private, no-cache"),
+                    );
+                    return Ok(response);
+                }
+                return Ok((
+                    [
+                        (header::CONTENT_TYPE, artwork.mime_type),
+                        (header::CACHE_CONTROL, "private, no-cache".to_owned()),
+                        (
+                            header::HeaderName::from_static("x-content-type-options"),
+                            "nosniff".to_owned(),
+                        ),
+                        (header::ETAG, etag),
+                    ],
+                    artwork.data,
+                )
+                    .into_response());
+            }
             let image_id = id.strip_prefix("img-").context("invalid cover art id")?;
             let requested_size = p
                 .get("size")
@@ -940,6 +976,10 @@ fn cover_art_etag(source_id: &str, modified: i64, requested_size: Option<u32>) -
     let digest =
         Md5::digest(format!("cover-v1:{source_id}:{modified}:{requested_size}").as_bytes());
     format!("W/\"{}\"", hex::encode(digest))
+}
+
+fn radio_cover_etag(data: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Md5::digest(data)))
 }
 
 fn cover_art_cache_id(image_id: &str, source_id: &str) -> String {
@@ -3300,7 +3340,12 @@ async fn radio_stations(
             } else {
                 v.stream_url.clone()
             };
-            json!({"id":v.id,"name":v.name,"streamUrl":stream_url,"homePageUrl":v.home_page_url})
+            let cover_art = (!v.cover_url.is_empty()).then(|| format!("radio-{}", v.id));
+            let mut station = json!({"id":v.id,"name":v.name,"streamUrl":stream_url,"homePageUrl":v.home_page_url});
+            if let Some(cover_art) = cover_art {
+                station["coverArt"] = json!(cover_art);
+            }
+            station
         }).collect::<Vec<_>>()}}),
     )
 }
@@ -3310,7 +3355,7 @@ async fn create_radio(
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     require_admin(user)?;
-    let (name, stream_url, home_page_url) = validated_radio_fields(p)?;
+    let (name, stream_url, home_page_url, cover_url) = validated_radio_fields(p)?;
     let id = Uuid::new_v4().to_string();
     let transaction = state.db.begin().await?;
     radio_entity::ActiveModel {
@@ -3318,6 +3363,7 @@ async fn create_radio(
         name: Set(name),
         stream_url: Set(stream_url),
         home_page_url: Set(home_page_url),
+        cover_url: Set(cover_url),
     }
     .insert(&transaction)
     .await?;
@@ -3331,7 +3377,7 @@ async fn update_radio(
     p: &HashMap<String, String>,
 ) -> Result<Value, ApiFailure> {
     require_admin(user)?;
-    let (name, stream_url, home_page_url) = validated_radio_fields(p)?;
+    let (name, stream_url, home_page_url, cover_url) = validated_radio_fields(p)?;
     let transaction = state.db.begin().await?;
     let radio = radio_entity::Entity::find_by_id(required(p, "id")?)
         .one(&transaction)
@@ -3343,11 +3389,15 @@ async fn update_radio(
     active.name = Set(name);
     active.stream_url = Set(stream_url);
     active.home_page_url = Set(home_page_url);
+    active.cover_url = Set(cover_url);
     active.update(&transaction).await?;
     if p.contains_key("proxy") {
         internet_radio::set_proxy_enabled(&transaction, &radio_id, bool_param(p, "proxy")).await?;
     }
     transaction.commit().await?;
+    if let Err(error) = state.radio_covers.clear_station(&radio_id).await {
+        tracing::warn!(%radio_id, %error, "failed to clear updated radio cover cache");
+    }
     if stream_url_changed {
         state.radio_streams.cancel(&radio_id).await;
     }
@@ -3356,7 +3406,7 @@ async fn update_radio(
 
 fn validated_radio_fields(
     p: &HashMap<String, String>,
-) -> Result<(String, String, String), ApiFailure> {
+) -> Result<(String, String, String, String), ApiFailure> {
     let name = required(p, "name")?.trim();
     if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
         return Err(ApiFailure::new(10, "Invalid internet radio name"));
@@ -3366,7 +3416,11 @@ fn validated_radio_fields(
         Some(value) if !value.is_empty() => validate_radio_url(value, "homepageUrl")?,
         _ => String::new(),
     };
-    Ok((name.to_owned(), stream_url, home_page_url))
+    let cover_url = match p.get("coverUrl").map(|value| value.trim()) {
+        Some(value) if !value.is_empty() => validate_radio_url(value, "coverUrl")?,
+        _ => String::new(),
+    };
+    Ok((name.to_owned(), stream_url, home_page_url, cover_url))
 }
 
 fn validate_radio_url(value: &str, parameter: &str) -> Result<String, ApiFailure> {
@@ -3379,6 +3433,12 @@ fn validate_radio_url(value: &str, parameter: &str) -> Result<String, ApiFailure
     }
     let url = Url::parse(value)
         .map_err(|_| ApiFailure::new(10, format!("Invalid internet radio {parameter}")))?;
+    if parameter == "coverUrl" && (!url.username().is_empty() || url.password().is_some()) {
+        return Err(ApiFailure::new(
+            10,
+            "Internet radio coverUrl must not contain credentials",
+        ));
+    }
     let valid_url = if parameter == "streamUrl" {
         internet_radio::is_supported_stream_url(&url)
     } else {
@@ -5035,6 +5095,10 @@ mod tests {
             ("name".into(), "  Radio One  ".into()),
             ("streamUrl".into(), " https://radio.example/live ".into()),
             ("homepageUrl".into(), "https://radio.example/".into()),
+            (
+                "coverUrl".into(),
+                " https://radio.example/cover.png ".into(),
+            ),
         ]);
         assert_eq!(
             validated_radio_fields(&valid).unwrap(),
@@ -5042,6 +5106,7 @@ mod tests {
                 "Radio One".into(),
                 "https://radio.example/live".into(),
                 "https://radio.example/".into(),
+                "https://radio.example/cover.png".into(),
             )
         );
 
@@ -5077,6 +5142,19 @@ mod tests {
             ]),
             HashMap::from([
                 ("name".into(), "Radio".into()),
+                ("streamUrl".into(), "https://radio.example/live".into()),
+                ("coverUrl".into(), "file:///tmp/cover.png".into()),
+            ]),
+            HashMap::from([
+                ("name".into(), "Radio".into()),
+                ("streamUrl".into(), "https://radio.example/live".into()),
+                (
+                    "coverUrl".into(),
+                    "https://user:secret@radio.example/cover.png".into(),
+                ),
+            ]),
+            HashMap::from([
+                ("name".into(), "Radio".into()),
                 (
                     "streamUrl".into(),
                     "https://music.example/api/internet_radio_stream.mp3?id=radio-1&token=test"
@@ -5099,6 +5177,7 @@ mod tests {
             ("name".into(), "Radio One".into()),
             ("streamUrl".into(), "https://radio.example/live".into()),
             ("homepageUrl".into(), "https://radio.example/".into()),
+            ("coverUrl".into(), "https://radio.example/cover.png".into()),
             ("proxy".into(), "true".into()),
         ]);
         create_radio(&state, &admin, &create).await.unwrap();
@@ -5123,6 +5202,7 @@ mod tests {
             .find(|station| station["name"] == "Radio One")
             .unwrap();
         assert_eq!(proxied_station["homePageUrl"], "https://radio.example/");
+        assert_eq!(proxied_station["coverArt"], format!("radio-{}", created.id));
         let proxy_url = proxied_station["streamUrl"].as_str().unwrap();
         assert!(proxy_url.starts_with("https://music.example/api/internet_radio_stream.mp3?id="));
         assert!(proxy_url.contains("&token="));
@@ -5155,6 +5235,10 @@ mod tests {
             ("name".into(), "Radio Two".into()),
             ("streamUrl".into(), "http://radio.example/aac".into()),
             ("homepageUrl".into(), String::new()),
+            (
+                "coverUrl".into(),
+                "https://radio.example/new-cover.jpg".into(),
+            ),
         ]);
         update_radio(&state, &admin, &update).await.unwrap();
         let updated = radio_entity::Entity::find_by_id(&created.id)
@@ -5165,6 +5249,7 @@ mod tests {
         assert_eq!(updated.name, "Radio Two");
         assert_eq!(updated.stream_url, "http://radio.example/aac");
         assert!(updated.home_page_url.is_empty());
+        assert_eq!(updated.cover_url, "https://radio.example/new-cover.jpg");
         assert!(
             internet_radio::proxy_enabled(&state.db, &created.id)
                 .await
@@ -5191,6 +5276,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_radio_covers_from_the_disk_cache_with_etags() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.cover_cache.enabled = true;
+        settings.cover_cache.path = directory.path().join("covers");
+        let state = test_state_with_settings(settings).await;
+        let cover_url = "https://radio.invalid/cover.png";
+        let cover = b"\x89PNG\r\n\x1a\ncached-radio-cover";
+        radio_entity::ActiveModel {
+            id: Set("station-cover".into()),
+            name: Set("Covered Radio".into()),
+            stream_url: Set("https://radio.example/live".into()),
+            home_page_url: Set(String::new()),
+            cover_url: Set(cover_url.into()),
+        }
+        .insert(&state.db)
+        .await
+        .unwrap();
+        state
+            .radio_covers
+            .seed("station-cover", cover_url, cover)
+            .await
+            .unwrap();
+        let user = user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        let params = HashMap::from([("id".into(), "radio-station-cover".into())]);
+
+        let response = binary_endpoint(&state, &user, &access, "getCoverArt", &params, None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        let etag = response.headers()[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            cover
+        );
+
+        let response = binary_endpoint(&state, &user, &access, "getCoverArt", &params, Some(&etag))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
     async fn open_subsonic_radio_listing_uses_the_request_host_for_proxy_urls() {
         let state = test_state().await;
         let admin = user_by_name(&state.db, &state.settings.admin.username)
@@ -5209,6 +5348,7 @@ mod tests {
             name: Set("Proxied radio".into()),
             stream_url: Set("https://radio.example/live".into()),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await

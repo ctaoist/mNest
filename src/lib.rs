@@ -19,6 +19,7 @@ pub mod migrations;
 pub mod models;
 pub mod network;
 pub mod providers;
+pub mod radio_cover;
 pub mod remote_download;
 pub mod scanner;
 pub mod state;

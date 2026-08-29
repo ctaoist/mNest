@@ -398,6 +398,7 @@ pub mod internet_radio_station {
         pub name: String,
         pub stream_url: String,
         pub home_page_url: String,
+        pub cover_url: String,
     }
 
     empty_relation!();

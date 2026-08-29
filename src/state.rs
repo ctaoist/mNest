@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::Settings, internet_radio::SharedStreamHub, providers::ProviderRegistry,
-    tags::TagService,
+    radio_cover::RadioCoverCache, tags::TagService,
 };
 
 #[derive(Clone)]
@@ -37,6 +37,7 @@ pub struct AppState {
     pub tags: Arc<TagService>,
     pub events: EventHub,
     pub radio_streams: SharedStreamHub,
+    pub radio_covers: RadioCoverCache,
     pub shutdown: CancellationToken,
 }
 
@@ -52,6 +53,7 @@ impl AppState {
         ));
         let events = EventHub::new();
         let radio_streams = SharedStreamHub::default();
+        let radio_covers = RadioCoverCache::new(settings.cover_cache.clone());
         let shutdown = CancellationToken::new();
         Self {
             settings,
@@ -60,6 +62,7 @@ impl AppState {
             tags,
             events,
             radio_streams,
+            radio_covers,
             shutdown,
         }
     }

@@ -156,7 +156,7 @@ export function PlayerBar() {
         {(track) => (
           <div class="player-bar">
             <button class="player-track" onClick={openQueue}>
-              <CoverArt id={track().coverArt} alt={track().album} kind="track" />
+              <CoverArt id={track().coverArt} alt={track().album} kind={track().id.startsWith('radio:') ? 'radio' : 'track'} />
               <span><strong>{track().title}</strong><small class={player.error() ? 'player-track-error' : ''}>{player.error() || trackArtistLabel(track())}</small></span>
             </button>
             <div class="player-center">

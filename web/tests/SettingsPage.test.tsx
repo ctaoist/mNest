@@ -185,7 +185,7 @@ describe('SettingsPage permissions', () => {
     }))
   })
 
-  it('saves an RTSP radio with the OpenSubsonic proxy option', async () => {
+  it('saves an RTSP radio with its cover and OpenSubsonic proxy option', async () => {
     mocks.role = 'admin'
     render(() => <SettingsPage />)
     await waitFor(() => expect(screen.getByRole('button', { name: '添加电台' })).toBeTruthy())
@@ -193,6 +193,7 @@ describe('SettingsPage permissions', () => {
     await fireEvent.click(screen.getByRole('button', { name: '添加电台' }))
     await fireEvent.input(screen.getByLabelText('电台名称'), { target: { value: '代理电台' } })
     await fireEvent.input(screen.getByLabelText('音频流地址'), { target: { value: 'rtsp://radio.example/live' } })
+    await fireEvent.input(screen.getByLabelText('封面链接'), { target: { value: 'https://radio.example/cover.png' } })
     await fireEvent.click(screen.getByLabelText('OpenSubsonic 服务端代理'))
     await fireEvent.click(screen.getByRole('button', { name: '保存电台' }))
 
@@ -201,6 +202,7 @@ describe('SettingsPage permissions', () => {
       name: '代理电台',
       streamUrl: 'rtsp://radio.example/live',
       homepageUrl: '',
+      coverUrl: 'https://radio.example/cover.png',
       proxy: true,
     }))
   })

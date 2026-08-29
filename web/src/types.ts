@@ -75,6 +75,8 @@ export interface RadioStation {
   name: string
   streamUrl: string
   homePageUrl?: string
+  coverUrl?: string
+  coverArt?: string
   proxy?: boolean
 }
 

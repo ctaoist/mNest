@@ -1315,13 +1315,20 @@ async fn internet_radio_stations(
         .into_iter()
         .map(|station| {
             let proxy = proxied.contains(&station.id);
-            json!({
+            let cover_art =
+                (!station.cover_url.is_empty()).then(|| format!("radio-{}", station.id));
+            let mut value = json!({
                 "id": station.id,
                 "name": station.name,
                 "streamUrl": station.stream_url,
                 "homePageUrl": station.home_page_url,
+                "coverUrl": station.cover_url,
                 "proxy": proxy,
-            })
+            });
+            if let Some(cover_art) = cover_art {
+                value["coverArt"] = json!(cover_art);
+            }
+            value
         })
         .collect::<Vec<_>>();
     Ok((
@@ -1349,6 +1356,9 @@ async fn delete_internet_radio_station(
     internet_radio::set_proxy_enabled(&transaction, station_id, false).await?;
     transaction.commit().await?;
     state.radio_streams.cancel(station_id).await;
+    if let Err(error) = state.radio_covers.clear_station(station_id).await {
+        tracing::warn!(%station_id, %error, "failed to clear deleted radio cover cache");
+    }
     Ok(Json(ApiResponse::success(json!([]))))
 }
 
@@ -3557,6 +3567,7 @@ mod tests {
             name: Set("Deleted radio".into()),
             stream_url: Set("https://radio.example/live".into()),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await
@@ -3809,6 +3820,7 @@ mod tests {
             name: Set("Radio".into()),
             stream_url: Set(format!("http://{address}/live")),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await
@@ -3897,6 +3909,7 @@ mod tests {
             name: Set("Disabled proxy".into()),
             stream_url: Set("https://radio.example/live".into()),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await
@@ -3949,6 +3962,7 @@ mod tests {
                     .into(),
             ),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await
@@ -4121,6 +4135,7 @@ exec sleep 30
             name: Set("RTSP radio".into()),
             stream_url: Set("rtsp://radio.example/live".into()),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await
@@ -4209,6 +4224,7 @@ exec sleep 30
             name: Set("HLS fallback".into()),
             stream_url: Set(format!("http://{address}/live")),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await
@@ -4351,6 +4367,7 @@ exec sleep 30
             name: Set("HLS Radio".into()),
             stream_url: Set(format!("http://{address}/live")),
             home_page_url: Set(String::new()),
+            cover_url: Set(String::new()),
         }
         .insert(&state.db)
         .await

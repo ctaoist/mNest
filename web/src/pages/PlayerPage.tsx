@@ -636,6 +636,7 @@ function RadioGrid(props: { stations: RadioStation[] }) {
     title: station.name,
     artists: [{ id: `radio-artist:${station.id}`, name: '网络电台' }],
     album: '实时广播',
+    coverArt: station.coverArt,
     duration: 0,
     streamUrl,
   })
@@ -649,7 +650,7 @@ function RadioGrid(props: { stations: RadioStation[] }) {
           const proxyUrl = () => `/api/internet_radio_stream.mp3?${new URLSearchParams({ id: station.id }).toString()}`
           return (
             <article class={`radio-card ${active() ? 'is-active' : ''}`}>
-              <span class="radio-mark"><RadioTower /></span>
+              <CoverArt id={station.coverArt} alt={station.name} class="radio-mark" kind="radio" />
               <div><strong>{station.name}</strong><span>{active() ? '正在播放实时流' : streamUrl() ? '互联网广播' : '流地址无效'}</span><small title={station.streamUrl}>{station.streamUrl}</small></div>
               <Show when={homePageUrl()}>{(homepage) => <a href={homepage()} target="_blank" rel="noreferrer" aria-label="打开电台主页"><ExternalLink /></a>}</Show>
               <button class="radio-play" disabled={!streamUrl()} onClick={() => active() ? player.toggle() : player.playStream(trackFor(station, proxyUrl()))} aria-label={`播放 ${station.name}`}>
