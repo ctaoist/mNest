@@ -27,9 +27,11 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive", "env"] }
 futures = "0.3"
+ffmpeg-sys-next = { version = "9.0", default-features = false, features = ["avformat", "swresample"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 jsonwebtoken = "9.3"
+libc = "0.2"
 libloading = "0.8"
 lofty = "0.24"
 md-5 = "0.10"
@@ -69,6 +71,9 @@ sea-orm = { version = "1.1.20", default-features = false, features = ["macros", 
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 wat = "1"
+
+[build-dependencies]
+pkg-config = "0.3"
 
 [profile.release]
 opt-level = "z"

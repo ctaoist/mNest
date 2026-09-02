@@ -31,7 +31,7 @@ pub fn is_supported_stream_url(url: &reqwest::Url) -> bool {
         )
 }
 
-pub fn normalized_ffmpeg_stream_url(url: &reqwest::Url) -> Option<reqwest::Url> {
+pub fn normalized_media_stream_url(url: &reqwest::Url) -> Option<reqwest::Url> {
     if !is_supported_stream_url(url) {
         return None;
     }
@@ -360,33 +360,31 @@ mod tests {
         ] {
             let url = reqwest::Url::parse(value).unwrap();
             assert!(is_supported_stream_url(&url));
-            assert_eq!(normalized_ffmpeg_stream_url(&url).unwrap(), url);
+            assert_eq!(normalized_media_stream_url(&url).unwrap(), url);
         }
 
         let mms_default = reqwest::Url::parse("mms://radio.example/live").unwrap();
         assert_eq!(
-            normalized_ffmpeg_stream_url(&mms_default).unwrap().as_str(),
+            normalized_media_stream_url(&mms_default).unwrap().as_str(),
             "mmst://radio.example/live"
         );
         let mms_over_http = reqwest::Url::parse("mms://radio.example:80/live").unwrap();
         assert_eq!(
-            normalized_ffmpeg_stream_url(&mms_over_http)
+            normalized_media_stream_url(&mms_over_http)
                 .unwrap()
                 .as_str(),
             "mmsh://radio.example:80/live"
         );
         let mms_over_tcp = reqwest::Url::parse("mms://radio.example:1755/live").unwrap();
         assert_eq!(
-            normalized_ffmpeg_stream_url(&mms_over_tcp)
-                .unwrap()
-                .as_str(),
+            normalized_media_stream_url(&mms_over_tcp).unwrap().as_str(),
             "mmst://radio.example:1755/live"
         );
 
         for value in ["file:///tmp/radio", "javascript:alert(1)"] {
             let url = reqwest::Url::parse(value).unwrap();
             assert!(!is_supported_stream_url(&url));
-            assert!(normalized_ffmpeg_stream_url(&url).is_none());
+            assert!(normalized_media_stream_url(&url).is_none());
         }
     }
 

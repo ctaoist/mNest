@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{self, SeekFrom},
     path::{Path as FsPath, PathBuf},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -25,10 +26,7 @@ use sea_orm::{
     sea_query::{Expr, OnConflict, Order},
 };
 use serde_json::{Map, Value, json};
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    process::{Child, ChildStdout, Command},
-};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use uuid::Uuid;
 
@@ -54,6 +52,7 @@ use crate::{
     internet_radio,
     jobs::{self, ScanPayload},
     lastfm,
+    media::{AudioFormat, MediaStream, TranscodeRequest},
     models::{Album, Artist, MusicFolder, Track, User},
     transcode_cache, user_preferences,
 };
@@ -823,7 +822,7 @@ async fn binary_endpoint(
             };
             let time_offset = p
                 .get("timeOffset")
-                .filter(|value| value.parse::<f64>().is_ok_and(|value| value > 0.0));
+                .filter(|value| transcode_offset(value).is_some());
             if method == "download"
                 || (raw && user_max_bitrate.is_none())
                 || (requested_format.is_none() && max_bitrate.is_none() && time_offset.is_none())
@@ -4121,12 +4120,12 @@ async fn transcode(
     offset: Option<&str>,
     range_header: Option<&str>,
 ) -> anyhow::Result<Response> {
-    let (muxer, mime_extension) = match format.to_ascii_lowercase().as_str() {
-        "mp3" => ("mp3", "mp3"),
-        "opus" => ("opus", "opus"),
-        "aac" => ("adts", "aac"),
-        "flac" => ("flac", "flac"),
-        "ogg" => ("ogg", "ogg"),
+    let (audio_format, mime_extension) = match format.to_ascii_lowercase().as_str() {
+        "mp3" => (AudioFormat::Mp3, "mp3"),
+        "opus" => (AudioFormat::Opus, "opus"),
+        "aac" => (AudioFormat::Aac, "aac"),
+        "flac" => (AudioFormat::Flac, "flac"),
+        "ogg" => (AudioFormat::OggVorbis, "ogg"),
         _ => anyhow::bail!("unsupported transcode format"),
     };
     let cache_path = transcode_cache_path(state, track, mime_extension, max_bitrate, offset).await;
@@ -4141,22 +4140,10 @@ async fn transcode(
             }
         }
     }
-    let mut command = Command::new(&state.settings.tools.ffmpeg);
-    command.kill_on_drop(true);
-    command.arg("-v").arg("error");
-    if let Some(offset) = offset {
-        command.args(["-ss", offset]);
-    }
-    command.args(["-i", &track.path, "-vn"]);
-    if let Some(rate) = max_bitrate {
-        command.args(["-b:a", &format!("{}k", rate.clamp(16, 320))]);
-    }
-    command
-        .args(["-f", muxer, "pipe:1"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take().context("ffmpeg stdout unavailable")?;
+    let mut request = TranscodeRequest::file(PathBuf::from(&track.path), audio_format);
+    request.bitrate_kbps = max_bitrate.map(|rate| rate.clamp(16, 320));
+    request.offset = offset.and_then(transcode_offset);
+    let stdout = state.media.transcode(request)?;
     let cache = match cache_path {
         Some(path) => match PendingTranscodeCache::create(path).await {
             Ok(cache) => Some(cache),
@@ -4168,11 +4155,7 @@ async fn transcode(
         None => None,
     };
     let stream = futures::stream::try_unfold(
-        TranscodeOutputState {
-            stdout: ReaderStream::new(stdout),
-            child,
-            cache,
-        },
+        TranscodeOutputState { stdout, cache },
         |mut state| async move {
             match state.stdout.next().await {
                 Some(Ok(chunk)) => {
@@ -4184,24 +4167,14 @@ async fn transcode(
                     }
                     Ok(Some((chunk, state)))
                 }
-                Some(Err(error)) => {
-                    let _ = state.child.kill().await;
-                    Err(error)
-                }
+                Some(Err(error)) => Err(error),
                 None => {
-                    let status = state.child.wait().await?;
-                    if status.success() {
-                        if let Some(cache) = state.cache.as_mut()
-                            && let Err(error) = cache.commit().await
-                        {
-                            tracing::warn!(%error, "failed to finalize transcode cache");
-                        }
-                        Ok(None)
-                    } else {
-                        Err(std::io::Error::other(format!(
-                            "ffmpeg exited with status {status}"
-                        )))
+                    if let Some(cache) = state.cache.as_mut()
+                        && let Err(error) = cache.commit().await
+                    {
+                        tracing::warn!(%error, "failed to finalize transcode cache");
                     }
+                    Ok(None)
                 }
             }
         },
@@ -4219,9 +4192,15 @@ async fn transcode(
     Ok(response)
 }
 
+fn transcode_offset(value: &str) -> Option<Duration> {
+    let seconds = value.parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds > 0.0)
+        .then(|| Duration::try_from_secs_f64(seconds).ok())
+        .flatten()
+}
+
 struct TranscodeOutputState {
-    stdout: ReaderStream<ChildStdout>,
-    child: Child,
+    stdout: MediaStream,
     cache: Option<PendingTranscodeCache>,
 }
 
@@ -5016,12 +4995,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_an_existing_transcode_result_without_starting_ffmpeg() {
+    async fn serves_an_existing_transcode_result_without_starting_the_media_engine() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("song.flac");
         tokio::fs::write(&source, b"source audio").await.unwrap();
-        let mut server_settings = crate::config::Settings::default();
-        server_settings.tools.ffmpeg = directory.path().join("missing-ffmpeg");
+        let server_settings = crate::config::Settings::default();
         let state = test_state_with_settings(server_settings).await;
         let cache_settings = transcode_cache::TranscodeCacheSettings {
             enabled: true,
@@ -5439,6 +5417,14 @@ mod tests {
         assert_eq!(parse_range("bytes=10-19", 100), Some((10, 19)));
         assert_eq!(parse_range("bytes=90-", 100), Some((90, 99)));
         assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+    }
+
+    #[test]
+    fn validates_transcode_offsets_before_starting_media_work() {
+        assert_eq!(transcode_offset("1.25"), Some(Duration::from_millis(1_250)));
+        for invalid in ["0", "-1", "NaN", "inf", "1e999", "not-a-number"] {
+            assert_eq!(transcode_offset(invalid), None, "accepted {invalid}");
+        }
     }
 
     #[test]

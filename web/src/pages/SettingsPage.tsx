@@ -619,7 +619,7 @@ export function SettingsPage() {
               <StatusCard icon={Database} label="DATABASE" value={config().database.toUpperCase()} detail={`${config().library_roots.length} 个曲库目录`} />
               <StatusCard icon={Gauge} label="JOB QUEUE" value={config().queue.toUpperCase()} detail={activeJob() ? '有任务正在执行' : '当前队列空闲'} accent={!!activeJob()} />
               <StatusCard icon={ServerCog} label="PROVIDERS" value={String(config().providers.length).padStart(2, '0')} detail={config().providers.join(' · ') || '未启用'} />
-              <StatusCard icon={Wrench} label="LOCAL TOOLS" value={`${[config().tools.ffmpeg, config().tools.fpcalc].filter(Boolean).length}/2`} detail="FFmpeg 与 Chromaprint" warning={!config().tools.ffmpeg || !config().tools.fpcalc} />
+              <StatusCard icon={Wrench} label="LOCAL TOOLS" value={`${[config().tools.media_library.ready, config().tools.fpcalc].filter(Boolean).length}/2`} detail="libav 与 Chromaprint" warning={!config().tools.media_library.ready || !config().tools.fpcalc} />
             </section>
 
             <div class="settings-grid">
@@ -636,7 +636,7 @@ export function SettingsPage() {
 
               <section class="panel tool-settings">
                 <div class="section-heading compact"><div><span class="eyebrow">RUNTIME TOOLS</span><h2>本机工具</h2></div></div>
-                <ToolRow name="FFmpeg / FFprobe" description="音频流与转码" ready={config().tools.ffmpeg} />
+                <ToolRow name={`libav ${config().tools.media_library.version}`} description="音频流与转码" ready={config().tools.media_library.ready} />
                 <ToolRow name="Chromaprint / fpcalc" description="AcoustID 音频指纹" ready={config().tools.fpcalc} />
                 <ToolRow name="TagLib" description="特殊格式标签回退" ready={true} optional={!config().tools.taglib_configured} />
                 <div class="config-note"><CircleAlert size={18} /><p>工具路径、Provider、队列与封面缓存由服务器 <code>config.yaml</code> 管理。封面缓存{config().cover_cache.enabled ? <>已启用：<code>{config().cover_cache.path}</code></> : '未启用'}。</p></div>

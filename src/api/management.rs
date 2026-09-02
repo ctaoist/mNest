@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     io,
     path::{Component, Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,12 +26,8 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{
-    io::AsyncWriteExt,
-    process::{Child, Command},
-    sync::Semaphore,
-};
-use tokio_util::{io::ReaderStream, sync::CancellationToken};
+use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppState,
@@ -44,6 +40,7 @@ use crate::{
     internet_radio,
     jobs::{self, AutoTagPayload, ScanPayload},
     lastfm,
+    media::{MediaEngine, MediaStream, RadioInput, TranscodeRequest},
     models::{ApiResponse, MusicFolder},
     network,
     remote_download::{self, RemoteConnection, RemoteImportRequest, RemoteSearchRequest},
@@ -1232,7 +1229,7 @@ async fn netease_audio_match_media(
         let source = load_netease_download_source(&state).await?;
         let connection = remote_connection(&source);
         let fingerprint = remote_download::netease_audio_fingerprint_from_media(
-            &state.settings.tools.ffmpeg,
+            state.media.as_ref(),
             &connection,
             &body,
         )
@@ -1387,7 +1384,7 @@ async fn internet_radio_stream(
     }
     let url = reqwest::Url::parse(station.stream_url.trim())
         .map_err(|_| ApiError::bad_request("网络电台流地址无效"))?;
-    let ffmpeg_url = internet_radio::normalized_ffmpeg_stream_url(&url).ok_or_else(|| {
+    let media_url = internet_radio::normalized_media_stream_url(&url).ok_or_else(|| {
         ApiError::bad_request("网络电台流地址必须使用 HTTP、HTTPS、RTSP、MMS、MMSH 或 MMST")
     })?;
     if internet_radio::is_proxy_stream_url(&url) {
@@ -1396,9 +1393,9 @@ async fn internet_radio_stream(
         ));
     }
     if !matches!(url.scheme(), "http" | "https") {
-        let input = RadioTranscodeInput::from_url(&ffmpeg_url)
+        let input = RadioTranscodeInput::from_url(&media_url)
             .ok_or_else(|| ApiError::bad_request("网络电台流协议不受支持"))?;
-        return transcode_radio(&state, &station.id, &ffmpeg_url, input, None).await;
+        return transcode_radio(&state, &station.id, &media_url, input, None).await;
     }
     let client = reqwest::Client::builder()
         .connect_timeout(RADIO_UPSTREAM_PROBE_TIMEOUT)
@@ -1419,7 +1416,7 @@ async fn internet_radio_stream(
             Ok(Ok(upstream)) => {
                 tracing::warn!(
                     status = upstream.status().as_u16(),
-                    "internet radio probe was rejected; trying FFmpeg HLS input"
+                    "internet radio probe was rejected; trying libav HLS input"
                 );
                 drop(upstream);
                 return transcode_hls_radio(&state, &station.id, &url, None).await;
@@ -1427,12 +1424,12 @@ async fn internet_radio_stream(
             Ok(Err(error)) => {
                 tracing::warn!(
                     error = %error.without_url(),
-                    "internet radio probe failed; trying FFmpeg HLS input"
+                    "internet radio probe failed; trying libav HLS input"
                 );
                 return transcode_hls_radio(&state, &station.id, &url, None).await;
             }
             Err(_) => {
-                tracing::warn!("internet radio probe timed out; trying FFmpeg HLS input");
+                tracing::warn!("internet radio probe timed out; trying libav HLS input");
                 return transcode_hls_radio(&state, &station.id, &url, None).await;
             }
         };
@@ -1524,8 +1521,7 @@ impl RadioTranscodeInput {
 }
 
 struct RadioProcess {
-    stdout: ReaderStream<tokio::process::ChildStdout>,
-    child: Child,
+    stdout: MediaStream,
     started_at: Instant,
     output_bytes: u64,
 }
@@ -1598,104 +1594,24 @@ fn parse_unix_timestamp(value: &str, radix: u32) -> Option<u64> {
     })
 }
 
-fn radio_ffmpeg_arguments(source_url: &str, input: RadioTranscodeInput) -> Vec<String> {
-    let mut arguments = vec!["-nostdin".into(), "-v".into(), "error".into()];
-    match input {
-        RadioTranscodeInput::Hls => arguments.extend(
-            [
-                "-reconnect",
-                "1",
-                "-reconnect_streamed",
-                "1",
-                "-reconnect_delay_max",
-                "5",
-                "-rw_timeout",
-                "30000000",
-                "-user_agent",
-                "mNest/internet-radio",
-                "-re",
-                "-f",
-                "hls",
-                "-live_start_index",
-                "-1",
-                "-i",
-                source_url,
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        ),
-        RadioTranscodeInput::Rtsp => arguments.extend(
-            [
-                "-rw_timeout",
-                "30000000",
-                "-rtsp_transport",
-                "tcp",
-                "-i",
-                source_url,
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        ),
-        RadioTranscodeInput::Mmsh => arguments.extend(
-            [
-                "-rw_timeout",
-                "30000000",
-                "-user_agent",
-                "mNest/internet-radio",
-                "-i",
-                source_url,
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        ),
-        RadioTranscodeInput::Mmst => arguments.extend(
-            ["-rw_timeout", "30000000", "-i", source_url]
-                .into_iter()
-                .map(str::to_owned),
-        ),
-    }
-    arguments.extend(
-        [
-            "-map",
-            "0:a:0",
-            "-vn",
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-            "-f",
-            "mp3",
-            "-id3v2_version",
-            "0",
-            "-write_xing",
-            "0",
-            "pipe:1",
-        ]
-        .into_iter()
-        .map(str::to_owned),
-    );
-    arguments
+fn radio_transcode_request(source_url: &str, input: RadioTranscodeInput) -> TranscodeRequest {
+    let protocol = match input {
+        RadioTranscodeInput::Hls => RadioInput::Hls,
+        RadioTranscodeInput::Rtsp => RadioInput::Rtsp,
+        RadioTranscodeInput::Mmsh => RadioInput::Mmsh,
+        RadioTranscodeInput::Mmst => RadioInput::Mmst,
+    };
+    TranscodeRequest::radio(source_url.to_owned(), protocol)
 }
 
 fn spawn_radio_process(
-    ffmpeg: &Path,
+    media: &dyn MediaEngine,
     source_url: &str,
     input: RadioTranscodeInput,
 ) -> io::Result<RadioProcess> {
-    let mut command = Command::new(ffmpeg);
-    command.kill_on_drop(true);
-    command
-        .args(radio_ffmpeg_arguments(source_url, input))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("ffmpeg stdout unavailable"))?;
+    let stdout = media.transcode(radio_transcode_request(source_url, input))?;
     Ok(RadioProcess {
-        stdout: ReaderStream::new(stdout),
-        child,
+        stdout,
         started_at: Instant::now(),
         output_bytes: 0,
     })
@@ -1739,13 +1655,13 @@ async fn wait_for_radio_transcode_restart(
 }
 
 async fn prepare_radio_replacement(
-    ffmpeg: PathBuf,
+    media: Arc<dyn MediaEngine>,
     source_url: String,
     input: RadioTranscodeInput,
     shutdown: CancellationToken,
     cancellation: CancellationToken,
 ) -> io::Result<RadioReplacement> {
-    let mut process = spawn_radio_process(&ffmpeg, &source_url, input)?;
+    let mut process = spawn_radio_process(media.as_ref(), &source_url, input)?;
     let first_chunk = tokio::select! {
         _ = shutdown.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "server is shutting down")),
         _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "internet radio stream was cancelled")),
@@ -1753,8 +1669,8 @@ async fn prepare_radio_replacement(
             match result {
                 Ok(Some(Ok(chunk))) => Ok(chunk),
                 Ok(Some(Err(error))) => Err(error),
-                Ok(None) => Err(io::Error::other("replacement ffmpeg produced no audio")),
-                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "replacement ffmpeg first audio timed out")),
+                Ok(None) => Err(io::Error::other("replacement media pipeline produced no audio")),
+                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "replacement media pipeline first audio timed out")),
             }
         }
     };
@@ -1768,11 +1684,7 @@ async fn prepare_radio_replacement(
                 process,
             })
         }
-        Err(error) => {
-            let _ = process.child.kill().await;
-            let _ = process.child.wait().await;
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1802,7 +1714,7 @@ async fn stop_hls_radio_replacement(
 }
 
 async fn run_shared_radio_producer(
-    ffmpeg: PathBuf,
+    media: Arc<dyn MediaEngine>,
     source_url: String,
     input: RadioTranscodeInput,
     refresh_interval: Option<Duration>,
@@ -1815,7 +1727,7 @@ async fn run_shared_radio_producer(
         if shutdown.is_cancelled() || cancellation.is_cancelled() {
             return Ok(());
         }
-        let mut process = match spawn_radio_process(&ffmpeg, &source_url, input) {
+        let mut process = match spawn_radio_process(media.as_ref(), &source_url, input) {
             Ok(process) => process,
             Err(error) => {
                 let delay = radio_transcode_restart_delay(
@@ -1844,34 +1756,26 @@ async fn run_shared_radio_producer(
             match event {
                 RadioProducerEvent::Shutdown | RadioProducerEvent::Cancelled => {
                     stop_hls_radio_replacement(&mut replacement).await;
-                    let _ = process.child.kill().await;
-                    let _ = process.child.wait().await;
                     return Ok(());
                 }
                 RadioProducerEvent::Refresh => {
                     refresh = None;
-                    let ffmpeg = ffmpeg.clone();
+                    let media = media.clone();
                     let source_url = source_url.clone();
                     let shutdown = shutdown.clone();
                     let cancellation = cancellation.clone();
                     replacement = Some(tokio::spawn(async move {
-                        prepare_radio_replacement(ffmpeg, source_url, input, shutdown, cancellation)
+                        prepare_radio_replacement(media, source_url, input, shutdown, cancellation)
                             .await
                     }));
                 }
                 RadioProducerEvent::Replacement(result) => {
                     replacement = None;
                     match *result {
-                        Ok(mut next) => {
+                        Ok(next) => {
                             if !producer.send_audio(next.first_chunk) {
-                                let _ = next.process.child.kill().await;
-                                let _ = next.process.child.wait().await;
-                                let _ = process.child.kill().await;
-                                let _ = process.child.wait().await;
                                 return Ok(());
                             }
-                            let _ = process.child.kill().await;
-                            let _ = process.child.wait().await;
                             process = next.process;
                             restart_attempts = 0;
                             refresh = refresh_interval
@@ -1897,8 +1801,6 @@ async fn run_shared_radio_producer(
                     process.output_bytes = process.output_bytes.saturating_add(chunk.len() as u64);
                     if !producer.send_audio(chunk) {
                         stop_hls_radio_replacement(&mut replacement).await;
-                        let _ = process.child.kill().await;
-                        let _ = process.child.wait().await;
                         return Ok(());
                     }
                 }
@@ -1906,8 +1808,6 @@ async fn run_shared_radio_producer(
                     stop_hls_radio_replacement(&mut replacement).await;
                     let runtime = process.started_at.elapsed();
                     let output_bytes = process.output_bytes;
-                    let _ = process.child.kill().await;
-                    let _ = process.child.wait().await;
                     let delay = radio_transcode_restart_delay(
                         &mut restart_attempts,
                         runtime,
@@ -1923,12 +1823,9 @@ async fn run_shared_radio_producer(
                     stop_hls_radio_replacement(&mut replacement).await;
                     let runtime = process.started_at.elapsed();
                     let output_bytes = process.output_bytes;
-                    let status = process.child.wait().await?;
-                    let error = io::Error::other(if status.success() {
-                        "ffmpeg ended an internet radio stream unexpectedly".to_owned()
-                    } else {
-                        format!("ffmpeg exited with status {status}")
-                    });
+                    let error = io::Error::other(
+                        "media library ended an internet radio stream unexpectedly",
+                    );
                     let delay = radio_transcode_restart_delay(
                         &mut restart_attempts,
                         runtime,
@@ -1978,12 +1875,12 @@ async fn transcode_radio(
         .subscribe(station_id, source_url.as_str())
         .await;
     if let Some(producer) = producer {
-        let ffmpeg = state.settings.tools.ffmpeg.clone();
+        let media = state.media.clone();
         let source_url = source_url.as_str().to_owned();
         let shutdown = state.shutdown.clone();
         tokio::spawn(async move {
             let error = run_shared_radio_producer(
-                ffmpeg,
+                media,
                 source_url,
                 input,
                 refresh_interval,
@@ -2464,7 +2361,12 @@ async fn config_status(
             "concurrency": state.settings.cover_cache.concurrency,
         },
         "lastfm": lastfm,
-        "tools": {"ffmpeg":state.settings.tools.ffmpeg.exists(),"fpcalc":state.settings.tools.fpcalc.exists(),"taglib_configured":state.settings.tools.taglib.is_some()}
+        "tools": {
+            "media_library":{"ready":true,"version":state.media.version()},
+            "ffmpeg":true,
+            "fpcalc":state.settings.tools.fpcalc.exists(),
+            "taglib_configured":state.settings.tools.taglib.is_some()
+        }
     }))))
 }
 
@@ -3148,7 +3050,13 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -3157,6 +3065,78 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    struct MediaScript {
+        delay: Duration,
+        chunks: Vec<Bytes>,
+        keep_open: bool,
+    }
+
+    impl MediaScript {
+        fn open(chunk: &'static [u8]) -> Self {
+            Self {
+                delay: Duration::ZERO,
+                chunks: vec![Bytes::from_static(chunk)],
+                keep_open: true,
+            }
+        }
+
+        fn ending_after(delay: Duration, chunk: &'static [u8]) -> Self {
+            Self {
+                delay,
+                chunks: vec![Bytes::from_static(chunk)],
+                keep_open: false,
+            }
+        }
+    }
+
+    struct ScriptedMediaEngine {
+        scripts: Mutex<VecDeque<MediaScript>>,
+        requests: Mutex<Vec<TranscodeRequest>>,
+        invocations: AtomicUsize,
+    }
+
+    impl ScriptedMediaEngine {
+        fn new(scripts: impl IntoIterator<Item = MediaScript>) -> Arc<Self> {
+            Arc::new(Self {
+                scripts: Mutex::new(scripts.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+                invocations: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl MediaEngine for ScriptedMediaEngine {
+        fn transcode(&self, request: TranscodeRequest) -> io::Result<MediaStream> {
+            self.requests.lock().unwrap().push(request);
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let script = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| io::Error::other("no scripted media response remains"))?;
+            let (sender, stream) = MediaStream::channel(8);
+            tokio::spawn(async move {
+                if !script.delay.is_zero() {
+                    tokio::time::sleep(script.delay).await;
+                }
+                for chunk in script.chunks {
+                    if sender.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+                if script.keep_open {
+                    sender.closed().await;
+                }
+            });
+            Ok(stream)
+        }
+
+        fn version(&self) -> String {
+            "test-libav".to_owned()
+        }
+    }
 
     async fn test_state() -> AppState {
         test_state_with_settings(crate::config::Settings::default()).await
@@ -3283,41 +3263,22 @@ mod tests {
     }
 
     #[test]
-    fn configures_ffmpeg_for_each_radio_input_protocol() {
-        let hls =
-            radio_ffmpeg_arguments("https://radio.example/live.m3u8", RadioTranscodeInput::Hls);
-        let hls_input = hls.iter().position(|value| value == "-i").unwrap();
-        assert!(
-            hls[..hls_input]
-                .windows(2)
-                .any(|values| values == ["-f", "hls"])
-        );
-        assert!(hls[..hls_input].iter().any(|value| value == "-re"));
-
-        let rtsp = radio_ffmpeg_arguments("rtsp://radio.example/live", RadioTranscodeInput::Rtsp);
-        let rtsp_input = rtsp.iter().position(|value| value == "-i").unwrap();
-        assert!(
-            rtsp[..rtsp_input]
-                .windows(2)
-                .any(|values| values == ["-rtsp_transport", "tcp"])
-        );
-        assert!(!rtsp[..rtsp_input].iter().any(|value| value == "-re"));
-        assert!(!rtsp.windows(2).any(|values| values == ["-f", "hls"]));
-
-        let mmsh = radio_ffmpeg_arguments("mmsh://radio.example/live", RadioTranscodeInput::Mmsh);
-        assert!(
-            mmsh.iter()
-                .any(|value| value == "mmsh://radio.example/live")
-        );
-        assert!(mmsh.iter().any(|value| value == "mNest/internet-radio"));
-
-        let mmst =
-            radio_ffmpeg_arguments("mmst://radio.example:1755/live", RadioTranscodeInput::Mmst);
-        assert!(
-            mmst.iter()
-                .any(|value| value == "mmst://radio.example:1755/live")
-        );
-        assert!(!mmst.iter().any(|value| value == "-user_agent"));
+    fn configures_media_requests_for_each_radio_input_protocol() {
+        for (input, expected) in [
+            (RadioTranscodeInput::Hls, RadioInput::Hls),
+            (RadioTranscodeInput::Rtsp, RadioInput::Rtsp),
+            (RadioTranscodeInput::Mmsh, RadioInput::Mmsh),
+            (RadioTranscodeInput::Mmst, RadioInput::Mmst),
+        ] {
+            let request = radio_transcode_request("scheme://radio.example/live", input);
+            assert!(matches!(
+                request.input,
+                crate::media::MediaInput::Radio { protocol, .. } if protocol == expected
+            ));
+            assert_eq!(request.format, crate::media::AudioFormat::Mp3);
+            assert_eq!(request.bitrate_kbps, Some(128));
+            assert_eq!(request.realtime, input == RadioTranscodeInput::Hls);
+        }
     }
 
     #[test]
@@ -3985,28 +3946,10 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("不能使用 mNest 代理地址"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn shares_one_hls_transcoder_between_concurrent_listeners() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let fake_ffmpeg = temp.path().join("ffmpeg");
-        let invocations = temp.path().join("invocations");
-        std::fs::write(
-            &fake_ffmpeg,
-            format!(
-                "#!/bin/sh\nprintf x >> '{}'\nsleep 1\nprintf 'SHARED'\nexec sleep 30\n",
-                invocations.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&fake_ffmpeg).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&fake_ffmpeg, permissions).unwrap();
-        let mut settings = crate::config::Settings::default();
-        settings.tools.ffmpeg = fake_ffmpeg;
-        let state = test_state_with_settings(settings).await;
+        let media = ScriptedMediaEngine::new([MediaScript::open(b"SHARED")]);
+        let state = test_state().await.with_media_engine(media.clone());
         let source_url = reqwest::Url::parse("https://radio.example/live.m3u8").unwrap();
 
         let (first, second) = tokio::join!(
@@ -4020,7 +3963,7 @@ mod tests {
 
         assert_eq!(first_chunk, b"SHARED".as_slice());
         assert_eq!(second_chunk, b"SHARED".as_slice());
-        assert_eq!(std::fs::read(&invocations).unwrap(), b"x");
+        assert_eq!(media.invocations.load(Ordering::SeqCst), 1);
         assert_eq!(state.radio_streams.active_streams().await, 1);
 
         drop(first);
@@ -4038,43 +3981,11 @@ mod tests {
         .expect("shared transcoder was not cleaned up");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn warms_up_a_replacement_before_refreshing_an_expiring_hls_stream() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let fake_ffmpeg = temp.path().join("ffmpeg");
-        let invocations = temp.path().join("invocations");
-        std::fs::write(
-            &fake_ffmpeg,
-            format!(
-                r#"#!/bin/sh
-count=0
-if [ -f '{}' ]; then
-  read count < '{}'
-fi
-count=$((count + 1))
-printf '%s' "$count" > '{}'
-if [ "$count" -eq 1 ]; then
-  printf 'FIRST'
-else
-  printf 'SECOND'
-fi
-exec sleep 30
-"#,
-                invocations.display(),
-                invocations.display(),
-                invocations.display(),
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&fake_ffmpeg).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&fake_ffmpeg, permissions).unwrap();
-        let mut settings = crate::config::Settings::default();
-        settings.tools.ffmpeg = fake_ffmpeg;
-        let state = test_state_with_settings(settings).await;
+        let media =
+            ScriptedMediaEngine::new([MediaScript::open(b"FIRST"), MediaScript::open(b"SECOND")]);
+        let state = test_state().await.with_media_engine(media.clone());
         let source_url = reqwest::Url::parse("https://radio.example/live").unwrap();
 
         let response = transcode_hls_radio(
@@ -4093,32 +4004,14 @@ exec sleep 30
             .expect("replacement transcoder output missing")
             .unwrap();
         assert_eq!(refreshed, b"SECOND".as_slice());
-        assert_eq!(std::fs::read_to_string(&invocations).unwrap(), "2");
+        assert_eq!(media.invocations.load(Ordering::SeqCst), 2);
         drop(body);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn transcodes_rtsp_radio_without_an_http_probe() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let fake_ffmpeg = temp.path().join("ffmpeg");
-        let arguments = temp.path().join("arguments");
-        std::fs::write(
-            &fake_ffmpeg,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'RTSP-RADIO'\nexec sleep 30\n",
-                arguments.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&fake_ffmpeg).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&fake_ffmpeg, permissions).unwrap();
-        let mut settings = crate::config::Settings::default();
-        settings.tools.ffmpeg = fake_ffmpeg;
-        let state = test_state_with_settings(settings).await;
+        let media = ScriptedMediaEngine::new([MediaScript::open(b"RTSP-RADIO")]);
+        let state = test_state().await.with_media_engine(media.clone());
         let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
             .await
             .unwrap()
@@ -4160,22 +4053,16 @@ exec sleep 30
         );
         drop(body);
 
-        let arguments = std::fs::read_to_string(arguments).unwrap();
-        let arguments = arguments.lines().collect::<Vec<_>>();
-        assert!(
-            arguments
-                .windows(2)
-                .any(|values| values == ["-rtsp_transport", "tcp"])
-        );
-        assert!(arguments.contains(&"rtsp://radio.example/live"));
-        assert!(!arguments.windows(2).any(|values| values == ["-f", "hls"]));
+        let requests = media.requests.lock().unwrap();
+        assert!(matches!(
+            &requests[0].input,
+            crate::media::MediaInput::Radio { url, protocol: RadioInput::Rtsp }
+                if url == "rtsp://radio.example/live"
+        ));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn falls_back_to_forced_hls_when_the_http_probe_is_rejected() {
-        use std::os::unix::fs::PermissionsExt;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = tokio::spawn(async move {
@@ -4191,23 +4078,8 @@ exec sleep 30
                 .unwrap();
         });
 
-        let temp = tempfile::tempdir().unwrap();
-        let fake_ffmpeg = temp.path().join("ffmpeg");
-        let arguments = temp.path().join("arguments");
-        std::fs::write(
-            &fake_ffmpeg,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'HLS-FALLBACK'\nexec sleep 30\n",
-                arguments.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&fake_ffmpeg).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&fake_ffmpeg, permissions).unwrap();
-        let mut settings = crate::config::Settings::default();
-        settings.tools.ffmpeg = fake_ffmpeg;
-        let state = test_state_with_settings(settings).await;
+        let media = ScriptedMediaEngine::new([MediaScript::open(b"HLS-FALLBACK")]);
+        let state = test_state().await.with_media_engine(media.clone());
         let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
             .await
             .unwrap()
@@ -4251,31 +4123,20 @@ exec sleep 30
         assert_eq!(first, b"HLS-FALLBACK".as_slice());
         drop(body);
 
-        let arguments = std::fs::read_to_string(arguments).unwrap();
-        let arguments = arguments.lines().collect::<Vec<_>>();
-        assert!(arguments.windows(2).any(|values| values == ["-f", "hls"]));
-        let read_at_realtime_rate = arguments
-            .iter()
-            .position(|value| *value == "-re")
-            .expect("ffmpeg should pace the HLS input at its native rate");
-        let input = arguments
-            .iter()
-            .position(|value| *value == "-i")
-            .expect("ffmpeg input argument should be present");
-        assert!(read_at_realtime_rate < input);
-        assert!(
-            arguments
-                .iter()
-                .any(|value| *value == format!("http://{address}/live"))
-        );
+        {
+            let requests = media.requests.lock().unwrap();
+            assert!(matches!(
+                &requests[0].input,
+                crate::media::MediaInput::Radio { url, protocol: RadioInput::Hls }
+                    if url == &format!("http://{address}/live")
+            ));
+            assert!(requests[0].realtime);
+        }
         upstream.await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn restarts_redirected_hls_from_the_original_source_url() {
-        use std::os::unix::fs::PermissionsExt;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = tokio::spawn(async move {
@@ -4315,42 +4176,11 @@ exec sleep 30
             }
         });
 
-        let temp = tempfile::tempdir().unwrap();
-        let fake_ffmpeg = temp.path().join("ffmpeg");
-        let invocations = temp.path().join("invocations");
-        let arguments = temp.path().join("arguments");
-        std::fs::write(
-            &fake_ffmpeg,
-            format!(
-                r#"#!/bin/sh
-printf '%s\n' "$@" > '{}'
-count=0
-if [ -f '{}' ]; then
-  read count < '{}'
-fi
-count=$((count + 1))
-printf '%s' "$count" > '{}'
-if [ "$count" -eq 1 ]; then
-  sleep 1
-  printf 'HLS-FIRST'
-  exit 1
-fi
-printf 'HLS-SECOND'
-exec sleep 30
-"#,
-                arguments.display(),
-                invocations.display(),
-                invocations.display(),
-                invocations.display(),
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&fake_ffmpeg).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&fake_ffmpeg, permissions).unwrap();
-        let mut settings = crate::config::Settings::default();
-        settings.tools.ffmpeg = fake_ffmpeg;
-        let state = test_state_with_settings(settings).await;
+        let media = ScriptedMediaEngine::new([
+            MediaScript::ending_after(Duration::from_secs(1), b"HLS-FIRST"),
+            MediaScript::open(b"HLS-SECOND"),
+        ]);
+        let state = test_state().await.with_media_engine(media.clone());
         let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
             .await
             .unwrap()
@@ -4406,31 +4236,17 @@ exec sleep 30
         assert_eq!(second, b"HLS-SECOND".as_slice());
         drop(body);
 
-        assert_eq!(std::fs::read_to_string(&invocations).unwrap(), "2");
-        let arguments = std::fs::read_to_string(arguments).unwrap();
-        assert!(
-            arguments
-                .lines()
-                .any(|value| value == format!("http://{address}/live"))
-        );
-        let arguments = arguments.lines().collect::<Vec<_>>();
-        assert!(arguments.windows(2).any(|values| values == ["-f", "hls"]));
-        let read_at_realtime_rate = arguments
-            .iter()
-            .position(|value| *value == "-re")
-            .expect("ffmpeg should pace the HLS input at its native rate");
-        let input = arguments
-            .iter()
-            .position(|value| *value == "-i")
-            .expect("ffmpeg input argument should be present");
-        assert!(read_at_realtime_rate < input);
-        assert!(arguments.contains(&"-reconnect"));
-        assert!(!arguments.contains(&"-reconnect_at_eof"));
-        assert!(
-            !arguments
-                .iter()
-                .any(|value| value.contains("token=initial"))
-        );
+        assert_eq!(media.invocations.load(Ordering::SeqCst), 2);
+        {
+            let requests = media.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|request| matches!(
+                &request.input,
+                crate::media::MediaInput::Radio { url, protocol: RadioInput::Hls }
+                    if url == &format!("http://{address}/live") && !url.contains("token=initial")
+            )));
+            assert!(requests.iter().all(|request| request.realtime));
+        }
         upstream.await.unwrap();
     }
 

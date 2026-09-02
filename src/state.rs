@@ -5,8 +5,12 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::Settings, internet_radio::SharedStreamHub, providers::ProviderRegistry,
-    radio_cover::RadioCoverCache, tags::TagService,
+    config::Settings,
+    internet_radio::SharedStreamHub,
+    media::{LibavMediaEngine, MediaEngine},
+    providers::ProviderRegistry,
+    radio_cover::RadioCoverCache,
+    tags::TagService,
 };
 
 #[derive(Clone)]
@@ -38,6 +42,7 @@ pub struct AppState {
     pub events: EventHub,
     pub radio_streams: SharedStreamHub,
     pub radio_covers: RadioCoverCache,
+    pub media: Arc<dyn MediaEngine>,
     pub shutdown: CancellationToken,
 }
 
@@ -54,6 +59,7 @@ impl AppState {
         let events = EventHub::new();
         let radio_streams = SharedStreamHub::default();
         let radio_covers = RadioCoverCache::new(settings.cover_cache.clone());
+        let media = Arc::new(LibavMediaEngine);
         let shutdown = CancellationToken::new();
         Self {
             settings,
@@ -63,7 +69,14 @@ impl AppState {
             events,
             radio_streams,
             radio_covers,
+            media,
             shutdown,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_media_engine(mut self, media: Arc<dyn MediaEngine>) -> Self {
+        self.media = media;
+        self
     }
 }

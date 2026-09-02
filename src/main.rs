@@ -36,6 +36,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let settings = Arc::new(Settings::load(&cli.config)?);
+    if settings.tools.ffmpeg.is_some() || settings.tools.ffprobe.is_some() {
+        warn!(
+            "tools.ffmpeg and tools.ffprobe are deprecated and ignored; mNest now uses bundled libav libraries"
+        );
+    }
     settings.validate()?;
     settings.prepare_runtime()?;
 

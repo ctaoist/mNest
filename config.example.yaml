@@ -27,8 +27,6 @@ auth:
   refresh_token_days: 30
 
 tools:
-  ffmpeg: /usr/bin/ffmpeg
-  ffprobe: /usr/bin/ffprobe
   fpcalc: /usr/bin/fpcalc
   taglib: /usr/lib/x86_64-linux-gnu/libtag_c.so.0
 

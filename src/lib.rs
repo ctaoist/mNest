@@ -15,6 +15,7 @@ pub mod entities;
 pub mod internet_radio;
 pub mod jobs;
 pub mod lastfm;
+pub mod media;
 pub mod migrations;
 pub mod models;
 pub mod network;

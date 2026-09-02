@@ -78,45 +78,41 @@ jobs:
       matrix:
         include:
           - platform: linux-amd64
+            docker_platform: linux/amd64
             runner: ubuntu-24.04
           - platform: linux-arm64
+            docker_platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Build embedded frontend
+      - name: Build release bundle
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: release-bundle
+          platforms: ${{ matrix.docker_platform }}
+          outputs: type=local,dest=bundle
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.version }}
+          cache-from: type=gha,scope=mnest-release-${{ matrix.platform }}
+          cache-to: type=gha,scope=mnest-release-${{ matrix.platform }},mode=max
+
+      - name: Verify bundled media libraries
         run: |
-          npm --prefix web ci --no-audit --no-fund
-          npm --prefix web run build
-
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95.0
-
-      - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.platform }}
-
-      - name: Build mNest
-        env:
-          MNEST_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
-        run: cargo build --locked --release
+          test -x bundle/mNest
+          test -f bundle/lib/libavcodec.so.59
+          bundle/mNest --version
+          ldd bundle/mNest
+          if find bundle -type f \( -name 'ffmpeg' -o -name 'ffprobe' \) | grep -q .; then
+            echo "::error::release bundle unexpectedly contains FFmpeg programs"
+            exit 1
+          fi
 
       - name: Package release archive
         env:
@@ -127,8 +123,9 @@ jobs:
           set -euo pipefail
           archive="mNest-${VERSION}-${PLATFORM}"
           mkdir -p "dist/${archive}"
-          install -m 0755 target/release/mNest "dist/${archive}/mNest"
-          cp config.example.yaml LICENSE README.md "dist/${archive}/"
+          install -m 0755 bundle/mNest "dist/${archive}/mNest"
+          cp -a bundle/lib bundle/licenses "dist/${archive}/"
+          cp bundle/config.example.yaml bundle/LICENSE bundle/README.md "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
           cd dist
           sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
@@ -238,11 +235,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: runtime
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ needs.prepare.outputs.docker_image }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             APP_VERSION=${{ needs.prepare.outputs.version }}
-            ALPINE_MIRROR=${{ vars.ALPINE_MIRROR || 'https://dl-cdn.alpinelinux.org/alpine' }}
           cache-from: |
             ${{ steps.registry-cache.outputs.source }}
             type=gha,scope=mnest-${{ matrix.arch }}

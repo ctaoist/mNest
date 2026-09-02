@@ -73,7 +73,12 @@ describe('SettingsPage permissions', () => {
         download_filename_format: 'artist-title',
         cover_cache: { enabled: true, path: '/data/cache/covers', concurrency: 4 },
         lastfm,
-        tools: { ffmpeg: true, fpcalc: true, taglib_configured: false },
+        tools: {
+          media_library: { ready: true, version: '5.1.7' },
+          ffmpeg: true,
+          fpcalc: true,
+          taglib_configured: false,
+        },
       })
       throw new Error(`unexpected GET ${path}`)
     })

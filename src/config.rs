@@ -249,16 +249,18 @@ impl Default for AdminSettings {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ToolSettings {
-    pub ffmpeg: PathBuf,
-    pub ffprobe: PathBuf,
+    #[serde(skip_serializing)]
+    pub ffmpeg: Option<PathBuf>,
+    #[serde(skip_serializing)]
+    pub ffprobe: Option<PathBuf>,
     pub fpcalc: PathBuf,
     pub taglib: Option<PathBuf>,
 }
 impl Default for ToolSettings {
     fn default() -> Self {
         Self {
-            ffmpeg: "/usr/bin/ffmpeg".into(),
-            ffprobe: "/usr/bin/ffprobe".into(),
+            ffmpeg: None,
+            ffprobe: None,
             fpcalc: "/usr/bin/fpcalc".into(),
             taglib: None,
         }
@@ -369,6 +371,27 @@ auth: { jwt_secret: "12345678901234567890123456789012" }
             settings.queue.redis_url.as_deref(),
             Some("redis://redis:6379/0")
         );
+    }
+
+    #[test]
+    fn accepts_but_does_not_serialize_deprecated_ffmpeg_paths() {
+        let settings: Settings = serde_yaml::from_str(
+            "tools:\n  ffmpeg: /legacy/ffmpeg\n  ffprobe: /legacy/ffprobe\n  fpcalc: /bin/fpcalc\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.tools.ffmpeg.as_deref(),
+            Some(Path::new("/legacy/ffmpeg"))
+        );
+        assert_eq!(
+            settings.tools.ffprobe.as_deref(),
+            Some(Path::new("/legacy/ffprobe"))
+        );
+
+        let serialized = serde_yaml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("ffmpeg:"));
+        assert!(!serialized.contains("ffprobe:"));
+        assert!(serialized.contains("fpcalc:"));
     }
 
     #[test]

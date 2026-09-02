@@ -196,6 +196,10 @@ export interface ConfigStatus {
   }
   lastfm: LastFmStatus
   tools: {
+    media_library: {
+      ready: boolean
+      version: string
+    }
     ffmpeg: boolean
     fpcalc: boolean
     taglib_configured: boolean

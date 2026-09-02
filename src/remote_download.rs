@@ -8,20 +8,24 @@ use std::{
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures::StreamExt;
 use lofty::{file::FileType, probe::Probe};
 use md5::{Digest, Md5};
 use reqwest::{Client, RequestBuilder, Response, Url, header};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{process::Command, sync::Mutex};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use wasmi::{
     Caller, Config as WasmiConfig, Engine as WasmiEngine, Extern, ExternType, Func, Linker,
     Module as WasmiModule, Ref as WasmiRef, Store, Val,
 };
 
-use crate::artist_credit;
+use crate::{
+    artist_credit,
+    media::{AudioFormat, MediaEngine, TranscodeRequest},
+};
 
 pub const DOWNLOAD_FILENAME_FORMAT_KEY: &str = "download_filename_format";
 pub const DEFAULT_DOWNLOAD_FILENAME_FORMAT: &str = "artist-title";
@@ -413,7 +417,7 @@ async fn fetch_netease_audio_match_runtime_file(
 }
 
 pub async fn netease_audio_fingerprint_from_media(
-    ffmpeg: &Path,
+    media: &dyn MediaEngine,
     connection: &RemoteConnection,
     media_sample: &[u8],
 ) -> anyhow::Result<String> {
@@ -426,7 +430,7 @@ pub async fn netease_audio_fingerprint_from_media(
     tokio::fs::write(&media_path, media_sample)
         .await
         .context("无法保存听歌识曲媒体样本")?;
-    let pcm_f32le = decode_netease_audio_sample(ffmpeg, &media_path).await?;
+    let pcm_f32le = decode_netease_audio_sample(media, &media_path).await?;
     let wasm = cached_netease_audio_match_wasm(connection).await?;
     tokio::time::timeout(
         NETEASE_AUDIO_MATCH_WASM_TIMEOUT,
@@ -437,51 +441,40 @@ pub async fn netease_audio_fingerprint_from_media(
     .context("听歌识曲指纹任务异常")?
 }
 
-async fn decode_netease_audio_sample(ffmpeg: &Path, media_path: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut command = Command::new(ffmpeg);
-    command
-        .kill_on_drop(true)
-        .args(netease_audio_decode_arguments(media_path));
-    let output = tokio::time::timeout(NETEASE_AUDIO_MATCH_DECODE_TIMEOUT, command.output())
-        .await
-        .context("听歌识曲媒体解码超时")?
+async fn decode_netease_audio_sample(
+    media: &dyn MediaEngine,
+    media_path: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    let mut output = media
+        .transcode(netease_audio_decode_request(media_path))
         .context("无法启动听歌识曲解码器")?;
-    anyhow::ensure!(output.status.success(), "听歌识曲媒体解码失败");
+    let bytes = tokio::time::timeout(NETEASE_AUDIO_MATCH_DECODE_TIMEOUT, async move {
+        let mut bytes = Vec::with_capacity(NETEASE_AUDIO_MATCH_SAMPLE_BYTES);
+        while let Some(chunk) = output.next().await {
+            let chunk = chunk.context("听歌识曲媒体解码失败")?;
+            bytes.extend_from_slice(&chunk);
+            anyhow::ensure!(
+                bytes.len() <= NETEASE_AUDIO_MATCH_SAMPLE_BYTES,
+                "听歌识曲解码器返回了过多数据"
+            );
+        }
+        Ok::<_, anyhow::Error>(bytes)
+    })
+    .await
+    .context("听歌识曲媒体解码超时")??;
     anyhow::ensure!(
-        output.stdout.len() >= NETEASE_AUDIO_MATCH_SAMPLE_BYTES,
+        bytes.len() >= NETEASE_AUDIO_MATCH_SAMPLE_BYTES,
         "听歌识曲媒体样本不足3秒"
     );
-    Ok(output.stdout[..NETEASE_AUDIO_MATCH_SAMPLE_BYTES].to_vec())
+    Ok(bytes)
 }
 
-fn netease_audio_decode_arguments(media_path: &Path) -> Vec<String> {
-    vec![
-        "-nostdin".into(),
-        "-v".into(),
-        "error".into(),
-        "-protocol_whitelist".into(),
-        "file,pipe".into(),
-        "-probesize".into(),
-        NETEASE_AUDIO_MATCH_MEDIA_MAX_BYTES.to_string(),
-        "-analyzeduration".into(),
-        "5000000".into(),
-        "-i".into(),
-        media_path.to_string_lossy().into_owned(),
-        "-t".into(),
-        "3".into(),
-        "-map".into(),
-        "0:a:0".into(),
-        "-vn".into(),
-        "-ac".into(),
-        "1".into(),
-        "-ar".into(),
-        "8000".into(),
-        "-c:a".into(),
-        "pcm_f32le".into(),
-        "-f".into(),
-        "f32le".into(),
-        "pipe:1".into(),
-    ]
+fn netease_audio_decode_request(media_path: &Path) -> TranscodeRequest {
+    let mut request = TranscodeRequest::file(media_path.to_path_buf(), AudioFormat::PcmF32Le);
+    request.sample_rate = Some(8_000);
+    request.channels = Some(1);
+    request.max_samples = Some(24_000);
+    request
 }
 
 async fn cached_netease_audio_match_wasm(
@@ -1500,28 +1493,17 @@ mod tests {
     }
 
     #[test]
-    fn media_decode_disables_network_protocols() {
-        let arguments = netease_audio_decode_arguments(Path::new("radio.media"));
-        assert!(
-            arguments
-                .windows(2)
-                .any(|values| values == ["-protocol_whitelist", "file,pipe"])
-        );
-        assert!(!arguments.iter().any(|value| value.contains("http")));
-        assert!(arguments.windows(2).any(|values| values == ["-t", "3"]));
-        assert!(arguments.windows(2).any(|values| values == ["-ar", "8000"]));
+    fn media_decode_uses_a_bounded_local_pcm_request() {
+        let request = netease_audio_decode_request(Path::new("radio.media"));
+        assert!(matches!(request.input, crate::media::MediaInput::File(_)));
+        assert_eq!(request.format, AudioFormat::PcmF32Le);
+        assert_eq!(request.sample_rate, Some(8_000));
+        assert_eq!(request.channels, Some(1));
+        assert_eq!(request.max_samples, Some(24_000));
     }
 
     #[tokio::test]
-    async fn decodes_a_float_wave_media_sample_when_ffmpeg_is_available() {
-        if Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .await
-            .is_err()
-        {
-            return;
-        }
+    async fn decodes_a_float_wave_media_sample_with_libav() {
         let sample_rate = 8_000_u32;
         let sample_count = sample_rate as usize * 4;
         let data_bytes = sample_count * size_of::<f32>();
@@ -1543,9 +1525,8 @@ mod tests {
         let path = directory.path().join("sample.wav");
         tokio::fs::write(&path, wave).await.unwrap();
 
-        let decoded = decode_netease_audio_sample(Path::new("ffmpeg"), &path)
-            .await
-            .unwrap();
+        let media = crate::media::LibavMediaEngine;
+        let decoded = decode_netease_audio_sample(&media, &path).await.unwrap();
 
         assert_eq!(decoded.len(), NETEASE_AUDIO_MATCH_SAMPLE_BYTES);
     }

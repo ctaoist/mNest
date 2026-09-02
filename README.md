@@ -37,16 +37,15 @@ Web 管理界面已经嵌入可执行文件，正常运行时不需要单独部�
 
 ### 1. 准备运行环境
 
-mNest 可执行文件包含 Web 界面，但以下功能仍依赖外部工具：
+mNest 可执行文件包含 Web 界面，官方发行压缩包同时携带音频转码所需的 libav 共享库。以下功能仍依赖外部工具：
 
-- `ffmpeg`、`ffprobe`：播放转码、音频信息检测
 - `fpcalc`：AcoustID 音频指纹识别
 - TagLib：可选，用于部分格式处理
 
 Debian/Ubuntu 可以安装：
 
 ```bash
-sudo apt install ffmpeg libchromaprint-tools libtagc0
+sudo apt install libchromaprint-tools libtagc0
 ```
 
 ### 2. 创建配置
@@ -67,7 +66,7 @@ database:
   max_connections: 10
 ```
 
-同时确认 `tools` 中的 `ffmpeg`、`ffprobe` 和 `fpcalc` 路径与服务器一致。
+同时确认 `tools` 中的 `fpcalc` 路径与服务器一致。旧配置中的 `ffmpeg`、`ffprobe` 字段会被忽略并输出弃用提示。
 
 需要避免每次请求都从音频文件重新提取封面时，可以启用磁盘缓存：
 
@@ -80,7 +79,7 @@ cover_cache:
 
 缓存目录必须使用绝对路径，`concurrency` 用于限制同时提取、下载并写入缓存的封面数量，可设置为 `1` 到 `64`。Docker 部署中的 `/data` 已持久化；歌曲封面缓存键由数据库中的歌曲 ID 和文件修改时间组成，修改曲库挂载路径不会使缓存失效，文件修改时间变化后会自动重新提取。网络电台可在系统设置中配置 HTTP(S) 封面链接，服务端会校验并缓存图片，缓存最多保留 7 天后刷新，刷新失败时继续使用旧缓存。缓存命中时只读取本地缓存，不访问曲库文件或远程封面地址。设置为 `enabled: false` 时不会读写封面缓存。
 
-播放转码结果缓存跟随曲库配置，由管理员在新增或编辑曲库目录时分别设置开关和缓存目录。配置以曲库 ID 保存在数据库的 `app_settings` 表中，不需要修改 `config.yaml`。缓存使用“缓存目录 / 曲库 ID / 歌手-专辑-歌名-码率.输出格式”的明文文件名；源文件修改时间晚于缓存时会重新转码并覆盖同一文件。转码中的临时文件写入 `/tmp/mnest-transcodes`，音频会在转码过程中持续发送给客户端，只有 FFmpeg 正常结束后才发布为正式缓存。
+播放转码结果缓存跟随曲库配置，由管理员在新增或编辑曲库目录时分别设置开关和缓存目录。配置以曲库 ID 保存在数据库的 `app_settings` 表中，不需要修改 `config.yaml`。缓存使用“缓存目录 / 曲库 ID / 歌手-专辑-歌名-码率.输出格式”的明文文件名；源文件修改时间晚于缓存时会重新转码并覆盖同一文件。转码中的临时文件写入 `/tmp/mnest-transcodes`，音频会在转码过程中持续发送给客户端，只有 libav 管线正常结束后才发布为正式缓存。
 
 如果通过域名或反向代理访问，请将 `server.public_url` 改为用户实际访问的外部地址，例如 `https://music.example.com`。
 
@@ -177,7 +176,7 @@ docker compose pull
 docker compose up -d
 ```
 
-`latest` 指向最新稳定版本；指定完整版本号可以避免更新时自动跨版本。镜像中已经包含 Web 前端、FFmpeg、FFprobe 和 fpcalc。
+`latest` 指向最新稳定版本；指定完整版本号可以避免更新时自动跨版本。镜像中已经包含 Web 前端、libav 共享库和 fpcalc，不包含或调用 `ffmpeg`、`ffprobe` 程序。
 
 ### 从源码构建镜像
 
@@ -288,7 +287,7 @@ mNest 支持密码认证、盐值令牌、`enc:` 密码和用户 API Token。更
 
 ### 无法转码或识别指纹
 
-检查配置中 `ffmpeg`、`ffprobe`、`fpcalc` 的路径，并在服务器终端直接运行这些命令确认可用。
+官方发行包请保留 `mNest` 同级的 `lib/` 目录，并使用 `ldd ./mNest` 检查共享库是否都能解析。指纹识别失败时再检查配置中的 `fpcalc` 路径并直接运行该命令。
 
 ### OpenSubsonic 客户端登录失败
 
@@ -300,7 +299,14 @@ mNest 支持密码认证、盐值令牌、`enc:` 密码和用户 API Token。更
 
 ## 从源码构建
 
-普通使用者可以直接使用已编译的可执行文件。需要自行构建时，先安装 Rust、Node.js、系统 OpenSSL 开发包和 `pkg-config`：
+普通使用者可以直接使用官方发行包。需要自行构建时，先安装 Rust、Node.js、Clang、系统 OpenSSL、pkg-config 和 libav 开发包；Debian/Ubuntu 可执行：
+
+```bash
+sudo apt install clang libclang-dev libssl-dev pkg-config \
+  libavformat-dev libavcodec-dev libavutil-dev libswresample-dev
+```
+
+随后构建：
 
 ```bash
 npm --prefix web ci
@@ -320,12 +326,7 @@ cargo build --release --no-default-features --features sqlite
 cargo build --release --no-default-features --features postgres
 ```
 
-GNU/Linux 使用 native-tls 和系统 OpenSSL。musl 目标自动改用 rustls，可构建静态可执行文件：
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
+GNU/Linux 使用 native-tls 和动态链接的 libav。官方发行目标为 glibc amd64/arm64；musl 构建需要自行提供同一目标的 FFmpeg 库及其依赖，目前不提供纯静态单文件构建保证。
 
 ## 许可证
 
