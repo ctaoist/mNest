@@ -195,6 +195,7 @@ fn validate_request(request: &TranscodeRequest) -> io::Result<()> {
 const MAX_SAMPLE_RATE: c_int = 768_000;
 const MAX_CHANNELS: c_int = 64;
 const AV_NOPTS_VALUE: i64 = i64::MIN;
+const REALTIME_INITIAL_BURST: Duration = Duration::from_millis(500);
 
 struct OutputSink {
     sender: mpsc::Sender<io::Result<Bytes>>,
@@ -1121,8 +1122,7 @@ impl<'a> AudioPipeline<'a> {
         let Some(origin) = self.realtime_origin else {
             return;
         };
-        let target =
-            origin + Duration::from_secs_f64(samples.max(0) as f64 / f64::from(sample_rate.max(1)));
+        let target = origin + realtime_presentation_delay(samples, sample_rate);
         while let Some(remaining) = target.checked_duration_since(Instant::now()) {
             if remaining.is_zero() || self.cancellation.is_cancelled() {
                 break;
@@ -1130,6 +1130,11 @@ impl<'a> AudioPipeline<'a> {
             std::thread::sleep(remaining.min(Duration::from_millis(25)));
         }
     }
+}
+
+fn realtime_presentation_delay(samples: i64, sample_rate: c_int) -> Duration {
+    Duration::from_secs_f64(samples.max(0) as f64 / f64::from(sample_rate.max(1)))
+        .saturating_sub(REALTIME_INITIAL_BURST)
 }
 
 fn validate_audio_properties(sample_rate: c_int, channels: c_int) -> anyhow::Result<()> {
@@ -1362,6 +1367,16 @@ fn check(code: c_int, operation: &str) -> anyhow::Result<c_int> {
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
+
+    #[test]
+    fn realtime_pacing_allows_a_bounded_initial_burst() {
+        assert_eq!(realtime_presentation_delay(0, 44_100), Duration::ZERO);
+        assert_eq!(realtime_presentation_delay(22_050, 44_100), Duration::ZERO);
+        assert_eq!(
+            realtime_presentation_delay(44_100, 44_100),
+            Duration::from_millis(500)
+        );
+    }
 
     use futures::StreamExt;
     use tokio::io::AsyncReadExt;
