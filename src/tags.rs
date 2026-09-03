@@ -1,7 +1,8 @@
 use std::{
     collections::HashSet,
     ffi::{CStr, CString, c_char, c_uint, c_void},
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
 };
@@ -28,7 +29,10 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mpc", "opus", "wma", "wmv", "dsf", "dff", "spx",
 ];
 pub const ARTWORK_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+pub const EMBEDDED_ARTWORK_MARKER: &str = "embedded";
+pub const MISSING_ARTWORK_MARKER: &str = "";
 const MAX_CACHED_ARTWORK_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_FAST_ID3V2_SCAN_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AudioMetadata {
@@ -63,6 +67,11 @@ pub struct AudioMetadata {
 pub struct AudioArtwork {
     pub mime_type: String,
     pub data: Vec<u8>,
+}
+
+pub struct TagWriteResult {
+    pub path: PathBuf,
+    pub has_artwork: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +287,11 @@ impl TagService {
     }
 
     fn read_artwork_lofty(&self, path: &Path) -> anyhow::Result<Option<AudioArtwork>> {
+        // On remote filesystems, Lofty's full MP3 probe can take as long as reading the whole
+        // track. Most cover-art misses can be answered from the small leading ID3v2 tag alone.
+        if matches!(mp3_id3v2_picture_presence(path), Ok(Some(false))) {
+            return Ok(None);
+        }
         let tagged = Probe::open(path)?
             .options(ParseOptions::new().read_properties(false))
             .read()?;
@@ -541,7 +555,7 @@ impl TagService {
         Ok(metadata)
     }
 
-    pub fn write(&self, path: &Path, metadata: &AudioMetadata) -> anyhow::Result<PathBuf> {
+    pub fn write(&self, path: &Path, metadata: &AudioMetadata) -> anyhow::Result<TagWriteResult> {
         if is_taglib_extension(path) && Probe::open(path).and_then(|p| p.read()).is_err() {
             return self.write_taglib_atomic(path, metadata);
         }
@@ -582,6 +596,7 @@ impl TagService {
                     .build(),
             );
         }
+        let has_artwork = !tag.pictures().is_empty();
         tag.save_to_path(temp.path(), WriteOptions::default())?;
         self.read_without_artwork(temp.path())
             .context("written tag verification failed")?;
@@ -590,7 +605,10 @@ impl TagService {
         validate_sidecar_target(path, &target, metadata)?;
         persist_audio_file(temp, path, &target)?;
         write_auxiliary_files(path, &target, metadata, cover_file);
-        Ok(target)
+        Ok(TagWriteResult {
+            path: target,
+            has_artwork,
+        })
     }
 
     fn read_taglib(&self, path: &Path) -> anyhow::Result<AudioMetadata> {
@@ -702,7 +720,7 @@ impl TagService {
         &self,
         path: &Path,
         metadata: &AudioMetadata,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<TagWriteResult> {
         let existing_artwork = if metadata.is_save_album_cover && metadata.album_img.is_empty() {
             self.read_artwork(path)?
         } else {
@@ -723,7 +741,10 @@ impl TagService {
         validate_sidecar_target(path, &target, metadata)?;
         persist_audio_file(temp, path, &target)?;
         write_auxiliary_files(path, &target, metadata, cover_file);
-        Ok(target)
+        Ok(TagWriteResult {
+            path: target,
+            has_artwork: false,
+        })
     }
 
     unsafe fn load_taglib(&self) -> anyhow::Result<libloading::Library> {
@@ -739,6 +760,57 @@ impl TagService {
         }
         bail!("TagLib C library not found; configure tools.taglib")
     }
+}
+
+fn mp3_id3v2_picture_presence(path: &Path) -> io::Result<Option<bool>> {
+    if !matches!(extension(path).as_str(), "mp2" | "mp3") {
+        return Ok(None);
+    }
+
+    let mut file = fs::File::open(path)?;
+    let mut header = [0_u8; 10];
+    if let Err(error) = file.read_exact(&mut header) {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if &header[..3] != b"ID3" || !(2..=4).contains(&header[3]) {
+        return Ok(None);
+    }
+    if header[6..10].iter().any(|byte| byte & 0x80 != 0) {
+        return Ok(None);
+    }
+    // ID3v2.2 may compress the complete tag, including frame identifiers.
+    if header[3] == 2 && header[5] & 0x40 != 0 {
+        return Ok(None);
+    }
+
+    let tag_size = header[6..10]
+        .iter()
+        .fold(0_usize, |size, byte| (size << 7) | usize::from(*byte));
+    if tag_size > MAX_FAST_ID3V2_SCAN_BYTES {
+        return Ok(None);
+    }
+    let mut tag = vec![0_u8; tag_size];
+    if let Err(error) = file.read_exact(&mut tag) {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+
+    let picture_frame = if header[3] == 2 {
+        b"PIC".as_slice()
+    } else {
+        b"APIC".as_slice()
+    };
+    Ok(Some(
+        tag.windows(picture_frame.len())
+            .any(|window| window == picture_frame),
+    ))
 }
 
 #[derive(Debug)]
@@ -1090,6 +1162,53 @@ fn copy_file_noclobber(source: &Path, target: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_id3v2_file(path: &Path, version: u8, flags: u8, tag: &[u8]) {
+        assert!(tag.len() < 128);
+        let mut file = vec![
+            b'I',
+            b'D',
+            b'3',
+            version,
+            0,
+            flags,
+            0,
+            0,
+            0,
+            tag.len() as u8,
+        ];
+        file.extend_from_slice(tag);
+        file.extend_from_slice(b"audio");
+        fs::write(path, file).unwrap();
+    }
+
+    #[test]
+    fn quickly_rejects_mp3_id3v2_tags_without_picture_frames() {
+        let directory = tempfile::tempdir().unwrap();
+        let without_picture = directory.path().join("without-picture.mp3");
+        let with_picture = directory.path().join("with-picture.mp3");
+        let compressed_v22 = directory.path().join("compressed-v22.mp3");
+
+        write_id3v2_file(&without_picture, 4, 0, b"TIT2 title");
+        write_id3v2_file(&with_picture, 4, 0, b"TIT2 title APIC image");
+        write_id3v2_file(&compressed_v22, 2, 0x40, b"TIT2 title");
+
+        assert_eq!(
+            mp3_id3v2_picture_presence(&without_picture).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            mp3_id3v2_picture_presence(&with_picture).unwrap(),
+            Some(true)
+        );
+        assert_eq!(mp3_id3v2_picture_presence(&compressed_v22).unwrap(), None);
+        assert!(
+            TagService::new(ToolSettings::default())
+                .read_artwork(&without_picture)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn sanitizes_only_path_separators() {

@@ -1,13 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use axum::body::Bytes;
 use base64::Engine;
+use futures::{Stream, StreamExt, stream};
 use ring::hmac;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
@@ -22,6 +24,52 @@ const PROXY_SETTING_PREFIX: &str = "internet_radio.proxy.";
 const PROXY_TOKEN_CONTEXT: &[u8] = b"mnest-internet-radio-proxy-v1\0";
 const PROXY_STREAM_PATH: &str = "/api/internet_radio_stream.mp3";
 const SHARED_STREAM_CHANNEL_CAPACITY: usize = 256;
+
+pub async fn prebuffer_stream<S, E>(
+    stream: S,
+    duration: Duration,
+    max_bytes: usize,
+) -> impl Stream<Item = Result<Bytes, E>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let mut stream = Box::pin(stream);
+    let mut buffered = Vec::new();
+    let mut buffered_bytes = 0;
+    let mut pending = None;
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+
+    while buffered_bytes < max_bytes {
+        let item = tokio::select! {
+            _ = &mut deadline => break,
+            item = stream.next() => item,
+        };
+        match item {
+            Some(Ok(mut chunk)) if !chunk.is_empty() => {
+                let available = max_bytes - buffered_bytes;
+                if chunk.len() > available {
+                    buffered.push(Ok(chunk.split_to(available)));
+                    pending = Some(Ok(chunk));
+                    break;
+                }
+                buffered_bytes += chunk.len();
+                buffered.push(Ok(chunk));
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                buffered.push(Err(error));
+                break;
+            }
+            None => break,
+        }
+    }
+
+    stream::iter(buffered)
+        .chain(stream::iter(pending))
+        .chain(stream)
+}
 
 pub fn is_supported_stream_url(url: &reqwest::Url) -> bool {
     url.host_str().is_some()
@@ -56,6 +104,7 @@ pub enum SharedStreamEvent {
 
 struct SharedStreamSession {
     source_url: String,
+    content_type: RwLock<String>,
     sender: broadcast::Sender<SharedStreamEvent>,
     cancellation: CancellationToken,
     subscribers: AtomicUsize,
@@ -101,6 +150,18 @@ impl SharedStreamSubscription {
     pub async fn recv(&mut self) -> Result<SharedStreamEvent, broadcast::error::RecvError> {
         self.receiver.recv().await
     }
+
+    pub fn content_type(&self) -> String {
+        self.session
+            .content_type
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn skip_to_live(&mut self) {
+        self.receiver = self.session.sender.subscribe();
+    }
 }
 
 impl Drop for SharedStreamSubscription {
@@ -127,6 +188,14 @@ impl SharedStreamProducer {
             .sender
             .send(SharedStreamEvent::Audio(chunk))
             .is_ok()
+    }
+
+    pub fn set_content_type(&self, content_type: impl Into<String>) {
+        *self
+            .session
+            .content_type
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = content_type.into();
     }
 
     pub async fn finish(self, error: Option<String>) {
@@ -159,16 +228,20 @@ impl SharedStreamHub {
         station_id: &str,
         source_url: &str,
     ) -> (SharedStreamSubscription, Option<SharedStreamProducer>) {
+        self.subscribe_with_content_type(station_id, source_url, "audio/mpeg")
+            .await
+    }
+
+    pub async fn subscribe_with_content_type(
+        &self,
+        station_id: &str,
+        source_url: &str,
+        content_type: &str,
+    ) -> (SharedStreamSubscription, Option<SharedStreamProducer>) {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(station_id) {
             if session.source_url == source_url && session.try_add_subscriber() {
-                return (
-                    SharedStreamSubscription {
-                        receiver: session.sender.subscribe(),
-                        session: session.clone(),
-                    },
-                    None,
-                );
+                return (shared_stream_subscription(session), None);
             }
             session.cancellation.cancel();
             sessions.remove(station_id);
@@ -177,6 +250,7 @@ impl SharedStreamHub {
         let (sender, receiver) = broadcast::channel(SHARED_STREAM_CHANNEL_CAPACITY);
         let session = Arc::new(SharedStreamSession {
             source_url: source_url.to_owned(),
+            content_type: RwLock::new(content_type.to_owned()),
             sender,
             cancellation: CancellationToken::new(),
             subscribers: AtomicUsize::new(1),
@@ -197,6 +271,13 @@ impl SharedStreamHub {
     #[cfg(test)]
     pub async fn active_streams(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+}
+
+fn shared_stream_subscription(session: &Arc<SharedStreamSession>) -> SharedStreamSubscription {
+    SharedStreamSubscription {
+        receiver: session.sender.subscribe(),
+        session: session.clone(),
     }
 }
 
@@ -416,5 +497,32 @@ mod tests {
         assert!(replacement_producer.cancellation().is_cancelled());
         replacement_producer.finish(None).await;
         assert_eq!(hub.active_streams().await, 0);
+    }
+
+    #[tokio::test]
+    async fn lagged_shared_listeners_jump_to_the_current_live_position() {
+        let hub = SharedStreamHub::default();
+        let (mut subscription, producer) =
+            hub.subscribe("radio-1", "https://radio.example/live").await;
+        let producer = producer.unwrap();
+        producer.set_content_type("audio/aac");
+        assert_eq!(subscription.content_type(), "audio/aac");
+
+        for index in 0..=SHARED_STREAM_CHANNEL_CAPACITY {
+            assert!(producer.send_audio(Bytes::from(index.to_string())));
+        }
+        assert!(matches!(
+            subscription.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        subscription.skip_to_live();
+        assert!(producer.send_audio(Bytes::from_static(b"LIVE")));
+        assert!(matches!(
+            subscription.recv().await,
+            Ok(SharedStreamEvent::Audio(chunk)) if chunk == b"LIVE".as_slice()
+        ));
+
+        drop(subscription);
+        producer.finish(None).await;
     }
 }

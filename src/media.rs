@@ -195,7 +195,7 @@ fn validate_request(request: &TranscodeRequest) -> io::Result<()> {
 const MAX_SAMPLE_RATE: c_int = 768_000;
 const MAX_CHANNELS: c_int = 64;
 const AV_NOPTS_VALUE: i64 = i64::MIN;
-const REALTIME_INITIAL_BURST: Duration = Duration::from_millis(500);
+const REALTIME_INITIAL_BURST: Duration = Duration::from_secs(2);
 
 struct OutputSink {
     sender: mpsc::Sender<io::Result<Bytes>>,
@@ -1371,10 +1371,10 @@ mod tests {
     #[test]
     fn realtime_pacing_allows_a_bounded_initial_burst() {
         assert_eq!(realtime_presentation_delay(0, 44_100), Duration::ZERO);
-        assert_eq!(realtime_presentation_delay(22_050, 44_100), Duration::ZERO);
+        assert_eq!(realtime_presentation_delay(88_200, 44_100), Duration::ZERO);
         assert_eq!(
-            realtime_presentation_delay(44_100, 44_100),
-            Duration::from_millis(500)
+            realtime_presentation_delay(132_300, 44_100),
+            Duration::from_secs(1)
         );
     }
 

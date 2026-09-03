@@ -3,6 +3,7 @@ use std::{
     convert::Infallible,
     io,
     path::{Component, Path, PathBuf},
+    pin::Pin,
     sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -40,7 +41,7 @@ use crate::{
     internet_radio,
     jobs::{self, AutoTagPayload, ScanPayload},
     lastfm,
-    media::{MediaEngine, MediaStream, RadioInput, TranscodeRequest},
+    media::{MediaEngine, RadioInput, TranscodeRequest},
     models::{ApiResponse, MusicFolder},
     network,
     remote_download::{self, RemoteConnection, RemoteImportRequest, RemoteSearchRequest},
@@ -520,6 +521,7 @@ async fn update_id3(
 ) -> Result<Json<ApiResponse<Value>>, ApiError> {
     let mut results = Vec::new();
     let mut updated_paths = Vec::new();
+    let mut artwork_statuses = Vec::new();
     for mut metadata in request.music_id3_info {
         materialize_remote_image(&mut metadata).await?;
         let path = allowed_path(&state, &metadata.file_full_path).await?;
@@ -528,9 +530,10 @@ async fn update_id3(
         let result =
             tokio::task::spawn_blocking(move || tags.write(&write_path, &metadata)).await?;
         match result {
-            Ok(updated_path) => {
-                updated_paths.push((path.clone(), updated_path.clone()));
-                results.push(json!({"path":updated_path,"success":true}));
+            Ok(updated) => {
+                artwork_statuses.push((updated.path.clone(), updated.has_artwork));
+                updated_paths.push((path.clone(), updated.path.clone()));
+                results.push(json!({"path":updated.path,"success":true}));
             }
             Err(error) => {
                 results.push(json!({"path":path,"success":false,"message":error.to_string()}))
@@ -538,6 +541,7 @@ async fn update_id3(
         }
     }
     scanner::refresh_path_changes(&state.db, state.tags.clone(), &updated_paths).await?;
+    scanner::remember_artwork_statuses(&state.db, &artwork_statuses).await?;
     scanner::clear_needs_scrape(
         &state.db,
         updated_paths.iter().map(|(_, current)| current.clone()),
@@ -573,6 +577,7 @@ async fn batch_update_id3(
     let paths = expand_selection(&state, &request.file_full_path, &request.select_data).await?;
     let mut results = Vec::new();
     let mut updated_paths = Vec::new();
+    let mut artwork_statuses = Vec::new();
     for path in paths {
         let tags = state.tags.clone();
         let read_path = path.clone();
@@ -583,9 +588,10 @@ async fn batch_update_id3(
         let tags = state.tags.clone();
         let write_path = path.clone();
         match tokio::task::spawn_blocking(move || tags.write(&write_path, &metadata)).await? {
-            Ok(new_path) => {
-                updated_paths.push((path.clone(), new_path.clone()));
-                results.push(json!({"path":new_path,"success":true}));
+            Ok(updated) => {
+                artwork_statuses.push((updated.path.clone(), updated.has_artwork));
+                updated_paths.push((path.clone(), updated.path.clone()));
+                results.push(json!({"path":updated.path,"success":true}));
             }
             Err(error) => {
                 results.push(json!({"path":path,"success":false,"message":error.to_string()}))
@@ -593,6 +599,7 @@ async fn batch_update_id3(
         }
     }
     scanner::refresh_path_changes(&state.db, state.tags.clone(), &updated_paths).await?;
+    scanner::remember_artwork_statuses(&state.db, &artwork_statuses).await?;
     scanner::clear_needs_scrape(
         &state.db,
         updated_paths.iter().map(|(_, current)| current.clone()),
@@ -1397,78 +1404,7 @@ async fn internet_radio_stream(
             .ok_or_else(|| ApiError::bad_request("网络电台流协议不受支持"))?;
         return transcode_radio(&state, &station.id, &media_url, input, None).await;
     }
-    let client = reqwest::Client::builder()
-        .connect_timeout(RADIO_UPSTREAM_PROBE_TIMEOUT)
-        .http1_only()
-        .user_agent("mNest/internet-radio")
-        .build()
-        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
-    let mut upstream_request = client.get(url.clone()).header("Icy-MetaData", "0");
-    if let Some(range) = headers
-        .get(header::RANGE)
-        .and_then(|value| value.to_str().ok())
-    {
-        upstream_request = upstream_request.header(reqwest::header::RANGE, range);
-    }
-    let upstream =
-        match tokio::time::timeout(RADIO_UPSTREAM_PROBE_TIMEOUT, upstream_request.send()).await {
-            Ok(Ok(upstream)) if upstream.status().is_success() => upstream,
-            Ok(Ok(upstream)) => {
-                tracing::warn!(
-                    status = upstream.status().as_u16(),
-                    "internet radio probe was rejected; trying libav HLS input"
-                );
-                drop(upstream);
-                return transcode_hls_radio(&state, &station.id, &url, None).await;
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    error = %error.without_url(),
-                    "internet radio probe failed; trying libav HLS input"
-                );
-                return transcode_hls_radio(&state, &station.id, &url, None).await;
-            }
-            Err(_) => {
-                tracing::warn!("internet radio probe timed out; trying libav HLS input");
-                return transcode_hls_radio(&state, &station.id, &url, None).await;
-            }
-        };
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
-    if is_hls_radio_stream(upstream.url(), content_type) {
-        let refresh_interval = hls_radio_refresh_interval(&url, upstream.url());
-        drop(upstream);
-        return transcode_hls_radio(&state, &station.id, &url, refresh_interval).await;
-    }
-    let status = StatusCode::from_u16(upstream.status().as_u16())
-        .map_err(|_| ApiError::bad_gateway("网络电台返回了无效状态码"))?;
-    let upstream_headers = upstream.headers().clone();
-    let stream = upstream
-        .bytes_stream()
-        .take_until(state.shutdown.clone().cancelled_owned());
-    let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = status;
-    for name in [
-        header::CONTENT_TYPE,
-        header::CONTENT_LENGTH,
-        header::CONTENT_RANGE,
-        header::ACCEPT_RANGES,
-    ] {
-        if let Some(value) = upstream_headers
-            .get(&name)
-            .and_then(|value| value.to_str().ok())
-            && let Ok(value) = HeaderValue::from_str(value)
-        {
-            response.headers_mut().insert(name, value);
-        }
-    }
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    Ok(response)
+    share_http_radio(&state, &station.id, &url).await
 }
 
 fn is_hls_radio_stream(url: &reqwest::Url, content_type: Option<&str>) -> bool {
@@ -1495,6 +1431,9 @@ const RADIO_TRANSCODE_MAX_RESTARTS: u8 = 3;
 const RADIO_TRANSCODE_STABLE_RUNTIME: Duration = Duration::from_secs(10);
 const RADIO_TRANSCODE_STABLE_BYTES: u64 = 128 * 1024;
 const RADIO_TRANSCODE_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(8);
+const RADIO_PREBUFFER_DURATION: Duration = Duration::from_secs(2);
+const DIRECT_RADIO_PREBUFFER_MAX_BYTES: usize = 1024 * 1024;
+const HLS_RADIO_PREBUFFER_BYTES: usize = 32_000;
 const HLS_RADIO_REFRESH_MIN_LEAD: Duration = Duration::from_secs(5);
 const HLS_RADIO_REFRESH_MAX_LEAD: Duration = Duration::from_secs(60);
 const HLS_RADIO_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -1521,7 +1460,7 @@ impl RadioTranscodeInput {
 }
 
 struct RadioProcess {
-    stdout: MediaStream,
+    stdout: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
     started_at: Instant,
     output_bytes: u64,
 }
@@ -1610,11 +1549,130 @@ fn spawn_radio_process(
     input: RadioTranscodeInput,
 ) -> io::Result<RadioProcess> {
     let stdout = media.transcode(radio_transcode_request(source_url, input))?;
+    let stdout: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>> =
+        if input == RadioTranscodeInput::Hls {
+            Box::pin(
+                stream::once(internet_radio::prebuffer_stream(
+                    stdout,
+                    RADIO_PREBUFFER_DURATION,
+                    HLS_RADIO_PREBUFFER_BYTES,
+                ))
+                .flatten(),
+            )
+        } else {
+            Box::pin(stdout)
+        };
     Ok(RadioProcess {
         stdout,
         started_at: Instant::now(),
         output_bytes: 0,
     })
+}
+
+async fn run_shared_direct_radio_producer(
+    upstream: reqwest::Response,
+    shutdown: CancellationToken,
+    producer: &internet_radio::SharedStreamProducer,
+) -> io::Result<()> {
+    let cancellation = producer.cancellation();
+    let stream = upstream
+        .bytes_stream()
+        .take_until(shutdown.cancelled_owned())
+        .take_until(cancellation.cancelled_owned());
+    let stream = stream::once(internet_radio::prebuffer_stream(
+        stream,
+        RADIO_PREBUFFER_DURATION,
+        DIRECT_RADIO_PREBUFFER_MAX_BYTES,
+    ))
+    .flatten();
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| io::Error::other(error.without_url().to_string()))?;
+        if !producer.send_audio(chunk) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+async fn run_shared_http_radio_producer(
+    media: Arc<dyn MediaEngine>,
+    source_url: reqwest::Url,
+    shutdown: CancellationToken,
+    producer: &internet_radio::SharedStreamProducer,
+) -> io::Result<()> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(RADIO_UPSTREAM_PROBE_TIMEOUT)
+        .http1_only()
+        .user_agent("mNest/internet-radio")
+        .build()
+        .map_err(io::Error::other)?;
+    let request = client.get(source_url.clone()).header("Icy-MetaData", "0");
+    let upstream = match tokio::time::timeout(RADIO_UPSTREAM_PROBE_TIMEOUT, request.send()).await {
+        Ok(Ok(upstream)) if upstream.status().is_success() => upstream,
+        Ok(Ok(upstream)) => {
+            tracing::warn!(
+                status = upstream.status().as_u16(),
+                "internet radio probe was rejected; trying libav HLS input"
+            );
+            drop(upstream);
+            return run_shared_radio_producer(
+                media,
+                source_url.as_str().to_owned(),
+                RadioTranscodeInput::Hls,
+                None,
+                shutdown,
+                producer,
+            )
+            .await;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %error.without_url(),
+                "internet radio probe failed; trying libav HLS input"
+            );
+            return run_shared_radio_producer(
+                media,
+                source_url.as_str().to_owned(),
+                RadioTranscodeInput::Hls,
+                None,
+                shutdown,
+                producer,
+            )
+            .await;
+        }
+        Err(_) => {
+            tracing::warn!("internet radio probe timed out; trying libav HLS input");
+            return run_shared_radio_producer(
+                media,
+                source_url.as_str().to_owned(),
+                RadioTranscodeInput::Hls,
+                None,
+                shutdown,
+                producer,
+            )
+            .await;
+        }
+    };
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if is_hls_radio_stream(upstream.url(), content_type) {
+        let refresh_interval = hls_radio_refresh_interval(&source_url, upstream.url());
+        drop(upstream);
+        return run_shared_radio_producer(
+            media,
+            source_url.as_str().to_owned(),
+            RadioTranscodeInput::Hls,
+            refresh_interval,
+            shutdown,
+            producer,
+        )
+        .await;
+    }
+    producer.set_content_type(content_type.unwrap_or("audio/mpeg"));
+    run_shared_direct_radio_producer(upstream, shutdown, producer).await
 }
 
 fn radio_transcode_restart_delay(
@@ -1856,11 +1914,71 @@ async fn receive_shared_radio_chunk(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     skipped_chunks = skipped,
-                    "slow internet radio listener skipped buffered audio"
+                    "slow internet radio listener is rejoining the shared live position"
                 );
+                subscription.skip_to_live();
             }
         }
     }
+}
+
+async fn shared_radio_response(
+    mut subscription: internet_radio::SharedStreamSubscription,
+) -> Result<Response, ApiError> {
+    let first_chunk = match tokio::time::timeout(
+        RADIO_TRANSCODE_FIRST_CHUNK_TIMEOUT,
+        receive_shared_radio_chunk(&mut subscription),
+    )
+    .await
+    {
+        Ok(Ok(Some(chunk))) => chunk,
+        Ok(Ok(None)) => return Err(ApiError::bad_gateway("网络电台没有输出音频")),
+        Ok(Err(error)) => {
+            return Err(ApiError::bad_gateway(format!("网络电台未能启动：{error}")));
+        }
+        Err(_) => return Err(ApiError::bad_gateway("网络电台首帧超时")),
+    };
+    let content_type = HeaderValue::from_str(&subscription.content_type())
+        .unwrap_or_else(|_| HeaderValue::from_static("audio/mpeg"));
+    let stream = futures::stream::try_unfold(subscription, |mut subscription| async move {
+        receive_shared_radio_chunk(&mut subscription)
+            .await
+            .map(|chunk| chunk.map(|chunk| (chunk, subscription)))
+    });
+    let stream = stream::once(async move { Ok::<_, io::Error>(first_chunk) }).chain(stream);
+    let mut response = Response::new(Body::from_stream(stream));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+async fn share_http_radio(
+    state: &AppState,
+    station_id: &str,
+    source_url: &reqwest::Url,
+) -> Result<Response, ApiError> {
+    let (subscription, producer) = state
+        .radio_streams
+        .subscribe_with_content_type(station_id, source_url.as_str(), "audio/mpeg")
+        .await;
+    if let Some(producer) = producer {
+        let media = state.media.clone();
+        let source_url = source_url.clone();
+        let shutdown = state.shutdown.clone();
+        tokio::spawn(async move {
+            let error = run_shared_http_radio_producer(media, source_url, shutdown, &producer)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            producer.finish(error).await;
+        });
+    }
+    shared_radio_response(subscription).await
 }
 
 async fn transcode_radio(
@@ -1870,7 +1988,7 @@ async fn transcode_radio(
     input: RadioTranscodeInput,
     refresh_interval: Option<Duration>,
 ) -> Result<Response, ApiError> {
-    let (mut subscription, producer) = state
+    let (subscription, producer) = state
         .radio_streams
         .subscribe(station_id, source_url.as_str())
         .await;
@@ -1893,40 +2011,10 @@ async fn transcode_radio(
             producer.finish(error).await;
         });
     }
-    let first_chunk = match tokio::time::timeout(
-        RADIO_TRANSCODE_FIRST_CHUNK_TIMEOUT,
-        receive_shared_radio_chunk(&mut subscription),
-    )
-    .await
-    {
-        Ok(Ok(Some(chunk))) => chunk,
-        Ok(Ok(None)) => {
-            return Err(ApiError::bad_gateway("网络电台转码没有输出音频"));
-        }
-        Ok(Err(error)) => {
-            return Err(ApiError::bad_gateway(format!(
-                "网络电台转码未能启动：{error}"
-            )));
-        }
-        Err(_) => return Err(ApiError::bad_gateway("网络电台转码首帧超时")),
-    };
-    let stream = futures::stream::try_unfold(subscription, |mut subscription| async move {
-        receive_shared_radio_chunk(&mut subscription)
-            .await
-            .map(|chunk| chunk.map(|chunk| (chunk, subscription)))
-    });
-    let stream = stream::once(async move { Ok::<_, io::Error>(first_chunk) }).chain(stream);
-    let mut response = Response::new(Body::from_stream(stream));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mpeg"));
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    Ok(response)
+    shared_radio_response(subscription).await
 }
 
+#[cfg(test)]
 async fn transcode_hls_radio(
     state: &AppState,
     station_id: &str,
@@ -3066,6 +3154,49 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn radio_prebuffer_releases_short_streams_without_waiting_for_the_deadline() {
+        let input = stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"short")),
+            Ok(Bytes::from_static(b" stream")),
+        ]);
+        let output = tokio::time::timeout(
+            Duration::from_millis(100),
+            internet_radio::prebuffer_stream(input, Duration::from_secs(60), 1024),
+        )
+        .await
+        .expect("finite radio stream did not leave the prebuffer after EOF")
+        .collect::<Vec<_>>()
+        .await;
+
+        let output = output.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output.concat(), b"short stream");
+    }
+
+    #[tokio::test]
+    async fn radio_prebuffer_releases_at_its_byte_limit_without_losing_data() {
+        let input = stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"def")),
+            Ok(Bytes::from_static(b"ghi")),
+        ]);
+        let output = tokio::time::timeout(
+            Duration::from_millis(100),
+            internet_radio::prebuffer_stream(input, Duration::from_secs(60), 5),
+        )
+        .await
+        .expect("radio stream did not leave the prebuffer at its byte limit")
+        .collect::<Vec<_>>()
+        .await;
+
+        let output = output.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            output.iter().map(Bytes::len).collect::<Vec<_>>(),
+            [3, 2, 1, 3]
+        );
+        assert_eq!(output.concat(), b"abcdefghi");
+    }
+
     struct MediaScript {
         delay: Duration,
         chunks: Vec<Bytes>,
@@ -3077,6 +3208,19 @@ mod tests {
             Self {
                 delay: Duration::ZERO,
                 chunks: vec![Bytes::from_static(chunk)],
+                keep_open: true,
+            }
+        }
+
+        fn buffered(marker: &'static [u8]) -> Self {
+            let mut chunk = Vec::with_capacity(HLS_RADIO_PREBUFFER_BYTES);
+            while chunk.len() < HLS_RADIO_PREBUFFER_BYTES {
+                chunk.extend_from_slice(marker);
+            }
+            chunk.truncate(HLS_RADIO_PREBUFFER_BYTES);
+            Self {
+                delay: Duration::ZERO,
+                chunks: vec![Bytes::from(chunk)],
                 keep_open: true,
             }
         }
@@ -3107,7 +3251,7 @@ mod tests {
     }
 
     impl MediaEngine for ScriptedMediaEngine {
-        fn transcode(&self, request: TranscodeRequest) -> io::Result<MediaStream> {
+        fn transcode(&self, request: TranscodeRequest) -> io::Result<crate::media::MediaStream> {
             self.requests.lock().unwrap().push(request);
             self.invocations.fetch_add(1, Ordering::SeqCst);
             let script = self
@@ -3116,7 +3260,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| io::Error::other("no scripted media response remains"))?;
-            let (sender, stream) = MediaStream::channel(8);
+            let (sender, stream) = crate::media::MediaStream::channel(8);
             tokio::spawn(async move {
                 if !script.delay.is_zero() {
                     tokio::time::sleep(script.delay).await;
@@ -3947,8 +4091,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shares_one_direct_radio_connection_and_fifo_between_listeners() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url =
+            reqwest::Url::parse(&format!("http://{}/live", listener.local_addr().unwrap()))
+                .unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let size = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).contains("GET /live "));
+            let payload = vec![b'R'; DIRECT_RADIO_PREBUFFER_MAX_BYTES];
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/aac\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&payload).await.unwrap();
+            drop(socket);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "shared direct radio opened more than one upstream connection"
+            );
+        });
+        let state = test_state().await;
+
+        let (first, second) = tokio::join!(
+            share_http_radio(&state, "shared-direct", &source_url),
+            share_http_radio(&state, "shared-direct", &source_url),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "audio/aac");
+        assert_eq!(second.headers()[header::CONTENT_TYPE], "audio/aac");
+        let (first, second) =
+            tokio::join!(first.into_body().collect(), second.into_body().collect(),);
+        let first = first.unwrap().to_bytes();
+        let second = second.unwrap().to_bytes();
+        assert_eq!(first.len(), DIRECT_RADIO_PREBUFFER_MAX_BYTES);
+        assert_eq!(second, first);
+        assert!(first.iter().all(|byte| *byte == b'R'));
+        upstream.await.unwrap();
+        assert_eq!(state.radio_streams.active_streams().await, 0);
+    }
+
+    #[tokio::test]
     async fn shares_one_hls_transcoder_between_concurrent_listeners() {
-        let media = ScriptedMediaEngine::new([MediaScript::open(b"SHARED")]);
+        let media = ScriptedMediaEngine::new([MediaScript::buffered(b"SHARED")]);
         let state = test_state().await.with_media_engine(media.clone());
         let source_url = reqwest::Url::parse("https://radio.example/live.m3u8").unwrap();
 
@@ -3961,8 +4158,9 @@ mod tests {
         let first_chunk = first.next().await.unwrap().unwrap();
         let second_chunk = second.next().await.unwrap().unwrap();
 
-        assert_eq!(first_chunk, b"SHARED".as_slice());
-        assert_eq!(second_chunk, b"SHARED".as_slice());
+        assert_eq!(first_chunk.len(), HLS_RADIO_PREBUFFER_BYTES);
+        assert_eq!(second_chunk, first_chunk);
+        assert!(first_chunk.starts_with(b"SHARED"));
         assert_eq!(media.invocations.load(Ordering::SeqCst), 1);
         assert_eq!(state.radio_streams.active_streams().await, 1);
 
@@ -3983,8 +4181,10 @@ mod tests {
 
     #[tokio::test]
     async fn warms_up_a_replacement_before_refreshing_an_expiring_hls_stream() {
-        let media =
-            ScriptedMediaEngine::new([MediaScript::open(b"FIRST"), MediaScript::open(b"SECOND")]);
+        let media = ScriptedMediaEngine::new([
+            MediaScript::buffered(b"FIRST"),
+            MediaScript::buffered(b"SECOND"),
+        ]);
         let state = test_state().await.with_media_engine(media.clone());
         let source_url = reqwest::Url::parse("https://radio.example/live").unwrap();
 
@@ -3997,13 +4197,16 @@ mod tests {
         .await
         .unwrap();
         let mut body = response.into_body().into_data_stream();
-        assert_eq!(body.next().await.unwrap().unwrap(), b"FIRST".as_slice());
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), HLS_RADIO_PREBUFFER_BYTES);
+        assert!(first.starts_with(b"FIRST"));
         let refreshed = tokio::time::timeout(Duration::from_secs(2), body.next())
             .await
             .expect("replacement transcoder output timed out")
             .expect("replacement transcoder output missing")
             .unwrap();
-        assert_eq!(refreshed, b"SECOND".as_slice());
+        assert_eq!(refreshed.len(), HLS_RADIO_PREBUFFER_BYTES);
+        assert!(refreshed.starts_with(b"SECOND"));
         assert_eq!(media.invocations.load(Ordering::SeqCst), 2);
         drop(body);
     }

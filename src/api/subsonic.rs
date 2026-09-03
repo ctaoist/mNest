@@ -54,6 +54,8 @@ use crate::{
     lastfm,
     media::{AudioFormat, MediaStream, TranscodeRequest},
     models::{Album, Artist, MusicFolder, Track, User},
+    scanner,
+    tags::MISSING_ARTWORK_MARKER,
     transcode_cache, user_preferences,
 };
 
@@ -891,12 +893,29 @@ async fn binary_endpoint(
                 .filter(|size| *size > 0);
             let source = if let Some(source) = accessible_tracks(access)
                 .filter(track_entity::Column::AlbumId.eq(image_id))
+                .filter(track_entity::Column::CoverPath.ne(MISSING_ARTWORK_MARKER))
                 .order_by_asc(track_entity::Column::DiscNumber)
                 .order_by_asc(track_entity::Column::TrackNumber)
                 .one(&state.db)
                 .await?
             {
                 source
+            } else if let Some(source) = accessible_tracks(access)
+                .filter(track_entity::Column::AlbumId.eq(image_id))
+                .filter(track_entity::Column::CoverPath.is_null())
+                .order_by_asc(track_entity::Column::DiscNumber)
+                .order_by_asc(track_entity::Column::TrackNumber)
+                .one(&state.db)
+                .await?
+            {
+                source
+            } else if accessible_tracks(access)
+                .filter(track_entity::Column::AlbumId.eq(image_id))
+                .one(&state.db)
+                .await?
+                .is_some()
+            {
+                anyhow::bail!("cover art not found");
             } else {
                 accessible_tracks(access)
                     .filter(track_entity::Column::Id.eq(image_id))
@@ -904,6 +923,9 @@ async fn binary_endpoint(
                     .await?
                     .context("cover art source not found")?
             };
+            if source.cover_path.as_deref() == Some(MISSING_ARTWORK_MARKER) {
+                anyhow::bail!("cover art not found");
+            }
             let etag = cover_art_etag(&source.id, source.mtime, requested_size);
             if if_none_match.is_some_and(|value| if_none_match_matches(value, &etag)) {
                 let mut response = StatusCode::NOT_MODIFIED.into_response();
@@ -918,6 +940,7 @@ async fn binary_endpoint(
             }
             let tags = state.tags.clone();
             let artwork_cache_id = cover_art_cache_id(id, &source.id);
+            let source_path = PathBuf::from(&source.path);
             let artwork = tokio::task::spawn_blocking(move || {
                 tags.read_artwork_cached_with_size(
                     std::path::Path::new(&source.path),
@@ -927,8 +950,14 @@ async fn binary_endpoint(
                     requested_size,
                 )
             })
-            .await??
-            .context("cover art not found")?;
+            .await??;
+            if let Err(error) =
+                scanner::remember_artwork_statuses(&state.db, &[(source_path, artwork.is_some())])
+                    .await
+            {
+                tracing::warn!(%error, "failed to remember embedded cover art status");
+            }
+            let artwork = artwork.context("cover art not found")?;
             Ok((
                 [
                     (header::CONTENT_TYPE, artwork.mime_type),
@@ -1236,7 +1265,7 @@ async fn artist_cover_art_map(
     if artist_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    const SELECT: &str = "SELECT ta.artist_id,t.id AS track_id,t.album_id FROM track_artists ta JOIN tracks t ON t.id=ta.track_id JOIN music_folders mf ON mf.id=t.folder_id AND mf.enabled=1";
+    const SELECT: &str = "SELECT ta.artist_id,t.id AS track_id,t.album_id FROM track_artists ta JOIN tracks t ON t.id=ta.track_id JOIN music_folders mf ON mf.id=t.folder_id AND mf.enabled=1 AND (t.cover_path IS NULL OR t.cover_path <> '')";
     const ORDER: &str = " ORDER BY ta.artist_id,CASE WHEN t.album_id IS NULL THEN 1 ELSE 0 END,ta.position,t.album_id,t.disc_number,t.track_number,t.title,t.id";
     let mut covers = HashMap::new();
     for chunk in artist_ids.chunks(500) {
@@ -1481,9 +1510,17 @@ async fn music_directory(
         if albums.is_empty() {
             return Err(not_found());
         }
-        return Ok(
-            json!({"directory":{"id":artist.id,"name":artist.name,"child":albums.into_iter().map(|a|json!({"id":a.id,"parent":artist.id,"title":a.name,"album":a.name,"artist":a.artist_name,"isDir":true,"coverArt":format!("img-{}",a.id)})).collect::<Vec<_>>()}}),
-        );
+        let children = albums
+            .into_iter()
+            .map(|album| {
+                let mut child = json!({"id":album.id,"parent":artist.id,"title":album.name,"album":album.name,"artist":album.artist_name,"isDir":true});
+                if album.cover_path.as_deref() != Some(MISSING_ARTWORK_MARKER) {
+                    child["coverArt"] = json!(format!("img-{}", album.id));
+                }
+                child
+            })
+            .collect::<Vec<_>>();
+        return Ok(json!({"directory":{"id":artist.id,"name":artist.name,"child":children}}));
     }
     let album = album(state, id).await?;
     let tracks = accessible_tracks(access)
@@ -4402,7 +4439,10 @@ fn artist_child_json(a: &Artist, parent: Option<&str>, cover_art: Option<&str>) 
     value
 }
 fn album_json(a: &Album) -> Value {
-    let mut value = json!({"id":a.id,"name":a.name,"artist":a.artist_name,"artistId":a.artist_id,"displayArtist":a.artist_name,"coverArt":format!("img-{}",a.id),"songCount":a.song_count,"duration":a.duration as i64,"year":a.year,"genre":a.genre,"created":a.created_at});
+    let mut value = json!({"id":a.id,"name":a.name,"artist":a.artist_name,"artistId":a.artist_id,"displayArtist":a.artist_name,"songCount":a.song_count,"duration":a.duration as i64,"year":a.year,"genre":a.genre,"created":a.created_at});
+    if a.cover_path.as_deref() != Some(MISSING_ARTWORK_MARKER) {
+        value["coverArt"] = json!(format!("img-{}", a.id));
+    }
     let artist_names = parse_artist_names(&a.artist_name);
     // The album table stores only one artist ID, so do not attach that ID to a combined name.
     if artist_names.len() == 1 {
@@ -4411,10 +4451,13 @@ fn album_json(a: &Album) -> Value {
     value
 }
 fn album_child_json(album: &Album) -> Value {
-    json!({"id":album.id,"parent":album.artist_id,"isDir":true,"title":album.name,"album":album.name,"artist":album.artist_name,"artistId":album.artist_id,"albumId":album.id,"coverArt":format!("img-{}",album.id),"duration":album.duration as i64,"year":album.year,"genre":album.genre,"created":album.created_at,"type":"music"})
+    let mut value = json!({"id":album.id,"parent":album.artist_id,"isDir":true,"title":album.name,"album":album.name,"artist":album.artist_name,"artistId":album.artist_id,"albumId":album.id,"duration":album.duration as i64,"year":album.year,"genre":album.genre,"created":album.created_at,"type":"music"});
+    if album.cover_path.as_deref() != Some(MISSING_ARTWORK_MARKER) {
+        value["coverArt"] = json!(format!("img-{}", album.id));
+    }
+    value
 }
 fn track_json(t: &Track, starred: Option<String>) -> Value {
-    let cover_art = canonical_track_cover_art(&t.id, t.album_id.as_deref());
     let artists = serde_json::from_str::<Vec<ArtistCredit>>(&t.artists_json).unwrap_or_default();
     let artist = artists
         .iter()
@@ -4422,7 +4465,10 @@ fn track_json(t: &Track, starred: Option<String>) -> Value {
         .collect::<Vec<_>>()
         .join("; ");
     let artist_id = artists.first().map(|artist| artist.id.clone());
-    let mut v = json!({"id":t.id,"isDir":false,"isVideo":false,"title":t.title,"album":t.album_name,"artist":artist,"displayArtist":artist,"artists":artists,"track":t.track_number,"discNumber":t.disc_number,"year":t.year,"genre":t.genre,"coverArt":cover_art,"size":t.size,"contentType":t.mimetype,"suffix":t.suffix,"duration":t.duration as i64,"bitRate":t.bit_rate,"path":t.relative_path,"type":"music","mediaType":"song","playCount":t.play_count,"bookmarkPosition":0,"created":t.created_at,"comment":t.comment});
+    let mut v = json!({"id":t.id,"isDir":false,"isVideo":false,"title":t.title,"album":t.album_name,"artist":artist,"displayArtist":artist,"artists":artists,"track":t.track_number,"discNumber":t.disc_number,"year":t.year,"genre":t.genre,"size":t.size,"contentType":t.mimetype,"suffix":t.suffix,"duration":t.duration as i64,"bitRate":t.bit_rate,"path":t.relative_path,"type":"music","mediaType":"song","playCount":t.play_count,"bookmarkPosition":0,"created":t.created_at,"comment":t.comment});
+    if t.cover_path.as_deref() != Some(MISSING_ARTWORK_MARKER) {
+        v["coverArt"] = json!(canonical_track_cover_art(&t.id, t.album_id.as_deref()));
+    }
     if let Some(album_id) = &t.album_id {
         v["parent"] = json!(album_id);
         v["albumId"] = json!(album_id);
@@ -5507,6 +5553,59 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn cover_art_misses_are_remembered_without_reopening_the_source() {
+        let state = test_state().await;
+        insert_test_catalog(&state).await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("no-cover.mp3");
+        std::fs::write(&path, b"ID3\x04\x00\x00\x00\x00\x00\x0aTIT2 titleaudio").unwrap();
+        let track = track_entity::Entity::find_by_id("track-1")
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = track.into_active_model();
+        active.path = Set(path.to_string_lossy().into_owned());
+        active.relative_path = Set("no-cover.mp3".into());
+        active.suffix = Set("mp3".into());
+        active.mimetype = Set("audio/mpeg".into());
+        active.mtime = Set(123);
+        active.update(&state.db).await.unwrap();
+        let user = user_entity::Entity::find()
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let access = subsonic_access(&state, &user).await.unwrap();
+        let params = HashMap::from([("id".to_owned(), "img-album-1".to_owned())]);
+
+        let error = binary_endpoint(&state, &user, &access, "getCoverArt", &params, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "cover art not found");
+        let track = track_entity::Entity::find_by_id("track-1")
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let album = album_entity::Entity::find_by_id("album-1")
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(track.cover_path.as_deref(), Some(MISSING_ARTWORK_MARKER));
+        assert_eq!(album.cover_path.as_deref(), Some(MISSING_ARTWORK_MARKER));
+        assert!(track_json(&track, None).get("coverArt").is_none());
+        assert!(album_json(&album).get("coverArt").is_none());
+
+        std::fs::remove_file(path).unwrap();
+        let error = binary_endpoint(&state, &user, &access, "getCoverArt", &params, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "cover art not found");
     }
 
     #[tokio::test]

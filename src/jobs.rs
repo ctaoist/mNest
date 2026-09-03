@@ -308,10 +308,14 @@ async fn execute(state: &AppState, job: &Job, shutdown: &CancellationToken) -> a
             let total = payload.paths.len().max(1);
             let mut failures = Vec::new();
             let mut updated_paths = Vec::new();
+            let mut artwork_statuses = Vec::new();
             for (index, path) in payload.paths.iter().enumerate() {
                 ensure_running(shutdown)?;
                 match auto_tag_one(state, path, &payload.sources, &payload.mode, shutdown).await {
-                    Ok(updated_path) => updated_paths.push((path.clone(), updated_path)),
+                    Ok(updated) => {
+                        artwork_statuses.push((updated.path.clone(), updated.has_artwork));
+                        updated_paths.push((path.clone(), updated.path));
+                    }
                     Err(error) => failures.push(format!("{}: {error:#}", path.display())),
                 }
                 set_progress(
@@ -328,6 +332,11 @@ async fn execute(state: &AppState, job: &Job, shutdown: &CancellationToken) -> a
                     .await
                 {
                     Ok(_) => {
+                        if let Err(error) =
+                            scanner::remember_artwork_statuses(&state.db, &artwork_statuses).await
+                        {
+                            failures.push(format!("封面状态更新失败: {error:#}"));
+                        }
                         if let Err(error) = scanner::clear_needs_scrape(
                             &state.db,
                             updated_paths.iter().map(|(_, current)| current.clone()),
@@ -603,7 +612,7 @@ async fn auto_tag_one(
     sources: &[String],
     mode: &str,
     shutdown: &CancellationToken,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<crate::tags::TagWriteResult> {
     let tags = state.tags.clone();
     let read_path = path.to_path_buf();
     let mut current = tokio::task::spawn_blocking(move || tags.read(&read_path)).await??;
@@ -706,9 +715,7 @@ async fn auto_tag_one(
     ensure_running(shutdown)?;
     let tags = state.tags.clone();
     let write_path = path.to_path_buf();
-    let updated_path =
-        tokio::task::spawn_blocking(move || tags.write(&write_path, &current)).await??;
-    Ok(updated_path)
+    tokio::task::spawn_blocking(move || tags.write(&write_path, &current)).await?
 }
 
 fn ensure_running(shutdown: &CancellationToken) -> anyhow::Result<()> {

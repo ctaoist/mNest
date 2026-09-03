@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -20,7 +20,7 @@ use crate::{
         scrobble, share, track, track_artist, user_track_stat,
     },
     models::MusicFolder,
-    tags::{AUDIO_EXTENSIONS, TagService},
+    tags::{AUDIO_EXTENSIONS, EMBEDDED_ARTWORK_MARKER, MISSING_ARTWORK_MARKER, TagService},
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -200,6 +200,97 @@ pub async fn refresh_path_changes(
     refresh_paths(db, tags, &paths).await
 }
 
+pub async fn remember_artwork_statuses(
+    db: &DatabaseConnection,
+    statuses: &[(PathBuf, bool)],
+) -> anyhow::Result<u64> {
+    let transaction = db.begin().await?;
+    let mut updated = 0;
+    let affected_paths = statuses
+        .iter()
+        .map(|(path, _)| path.to_string_lossy().into_owned())
+        .collect::<HashSet<_>>();
+    for (has_artwork, marker) in [
+        (false, MISSING_ARTWORK_MARKER),
+        (true, EMBEDDED_ARTWORK_MARKER),
+    ] {
+        let paths = statuses
+            .iter()
+            .filter(|(_, present)| *present == has_artwork)
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            continue;
+        }
+        updated += track::Entity::update_many()
+            .col_expr(track::Column::CoverPath, Expr::value(marker))
+            .filter(track::Column::Path.is_in(paths))
+            .exec(&transaction)
+            .await?
+            .rows_affected;
+    }
+
+    let affected_album_ids = track::Entity::find()
+        .filter(track::Column::Path.is_in(affected_paths))
+        .all(&transaction)
+        .await?
+        .into_iter()
+        .filter_map(|track| track.album_id)
+        .collect::<HashSet<_>>();
+    if !affected_album_ids.is_empty() {
+        let album_tracks = track::Entity::find()
+            .filter(track::Column::AlbumId.is_in(affected_album_ids))
+            .all(&transaction)
+            .await?;
+        let mut statuses_by_album = HashMap::<String, Vec<Option<String>>>::new();
+        for track in album_tracks {
+            if let Some(album_id) = track.album_id {
+                statuses_by_album
+                    .entry(album_id)
+                    .or_default()
+                    .push(track.cover_path);
+            }
+        }
+        let mut embedded = Vec::new();
+        let mut missing = Vec::new();
+        let mut unknown = Vec::new();
+        for (album_id, statuses) in statuses_by_album {
+            if statuses
+                .iter()
+                .any(|status| status.as_deref().is_some_and(|value| !value.is_empty()))
+            {
+                embedded.push(album_id);
+            } else if statuses
+                .iter()
+                .all(|status| status.as_deref() == Some(MISSING_ARTWORK_MARKER))
+            {
+                missing.push(album_id);
+            } else {
+                unknown.push(album_id);
+            }
+        }
+        for (album_ids, marker) in [
+            (embedded, Some(EMBEDDED_ARTWORK_MARKER)),
+            (missing, Some(MISSING_ARTWORK_MARKER)),
+            (unknown, None),
+        ] {
+            if album_ids.is_empty() {
+                continue;
+            }
+            album::Entity::update_many()
+                .col_expr(
+                    album::Column::CoverPath,
+                    Expr::value(marker.map(str::to_owned)),
+                )
+                .filter(album::Column::Id.is_in(album_ids))
+                .exec(&transaction)
+                .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(updated)
+}
+
 fn ensure_running(shutdown: &CancellationToken) -> anyhow::Result<()> {
     anyhow::ensure!(!shutdown.is_cancelled(), "shutdown requested");
     Ok(())
@@ -367,6 +458,7 @@ async fn update_track(
     existing: track::Model,
     v: &TrackValues<'_>,
 ) -> anyhow::Result<()> {
+    let source_changed = existing.mtime != v.mtime;
     let mut active = existing.into_active_model();
     active.folder_id = Set(v.folder_id.to_owned());
     active.relative_path = Set(v.relative_path.to_owned());
@@ -389,6 +481,9 @@ async fn update_track(
     active.lyrics = Set(v.lyrics.to_owned());
     active.comment = Set(v.comment.to_owned());
     active.needs_scrape = Set(i64::from(v.needs_scrape));
+    if source_changed {
+        active.cover_path = Set(None);
+    }
     active.mtime = Set(v.mtime);
     active.updated_at = Set(v.scan_time.to_owned());
     active.update(db).await?;
@@ -556,7 +651,7 @@ pub(crate) async fn rebuild_aggregates(db: &DatabaseConnection) -> anyhow::Resul
         )
         .await?;
     transaction.execute_unprepared("UPDATE artists SET song_count = (SELECT COUNT(*) FROM track_artists WHERE track_artists.artist_id=artists.id), album_count = (SELECT COUNT(DISTINCT tracks.album_id) FROM track_artists JOIN tracks ON tracks.id=track_artists.track_id WHERE track_artists.artist_id=artists.id AND tracks.album_id IS NOT NULL)").await?;
-    transaction.execute_unprepared("UPDATE albums SET song_count = (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id), duration = COALESCE((SELECT SUM(duration) FROM tracks WHERE tracks.album_id = albums.id), 0), year = COALESCE((SELECT MAX(NULLIF(year, 0)) FROM tracks WHERE tracks.album_id = albums.id), 0), genre = COALESCE((SELECT genre FROM tracks WHERE tracks.album_id = albums.id AND genre <> '' ORDER BY disc_number, track_number, id LIMIT 1), '')").await?;
+    transaction.execute_unprepared("UPDATE albums SET song_count = (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id), duration = COALESCE((SELECT SUM(duration) FROM tracks WHERE tracks.album_id = albums.id), 0), year = COALESCE((SELECT MAX(NULLIF(year, 0)) FROM tracks WHERE tracks.album_id = albums.id), 0), genre = COALESCE((SELECT genre FROM tracks WHERE tracks.album_id = albums.id AND genre <> '' ORDER BY disc_number, track_number, id LIMIT 1), ''), cover_path = CASE WHEN EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = albums.id AND tracks.cover_path IS NOT NULL AND tracks.cover_path <> '') THEN 'embedded' WHEN NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = albums.id AND tracks.cover_path IS NULL) THEN '' ELSE NULL END").await?;
 
     for item_type in ["album", "artist"] {
         let active_ids = if item_type == "album" {
@@ -706,6 +801,47 @@ mod tests {
         assert_eq!(renamed_track.id, indexed_track.id);
         assert_eq!(renamed_track.path, renamed.to_string_lossy());
         assert_eq!(renamed_track.needs_scrape, 0);
+    }
+
+    #[tokio::test]
+    async fn remembers_written_artwork_and_invalidates_it_when_the_source_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tone.wav");
+        write_wav(&path);
+        let db = test_database().await;
+        add_library(&db, "library", directory.path()).await;
+        let tags = Arc::new(TagService::new(ToolSettings::default()));
+        refresh_paths(&db, tags.clone(), std::slice::from_ref(&path))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            remember_artwork_statuses(&db, &[(path.clone(), true)])
+                .await
+                .unwrap(),
+            1
+        );
+        let track = track::Entity::find().one(&db).await.unwrap().unwrap();
+        assert_eq!(track.cover_path.as_deref(), Some(EMBEDDED_ARTWORK_MARKER));
+
+        track::Entity::update_many()
+            .col_expr(track::Column::Mtime, Expr::value(track.mtime - 1))
+            .filter(track::Column::Id.eq(&track.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        refresh_paths(&db, tags, std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        assert_eq!(
+            track::Entity::find_by_id(track.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .cover_path,
+            None
+        );
     }
 
     #[tokio::test]
