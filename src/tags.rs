@@ -1275,10 +1275,22 @@ mod tests {
             ..Default::default()
         };
         assert!(!required_metadata_missing(&complete));
-        assert!(required_metadata_missing(&AudioMetadata {
-            album: String::new(),
-            ..complete
-        }));
+        for incomplete in [
+            AudioMetadata {
+                title: String::new(),
+                ..complete.clone()
+            },
+            AudioMetadata {
+                artist: String::new(),
+                ..complete.clone()
+            },
+            AudioMetadata {
+                album: String::new(),
+                ..complete
+            },
+        ] {
+            assert!(required_metadata_missing(&incomplete));
+        }
     }
 
     #[test]

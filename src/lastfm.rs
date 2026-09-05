@@ -567,6 +567,7 @@ mod tests {
             album_name: "Album".into(),
             album_artist: String::new(),
             genre: String::new(),
+            language: String::new(),
             year: 0,
             track_number: 0,
             disc_number: 0,

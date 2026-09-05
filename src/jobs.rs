@@ -337,14 +337,6 @@ async fn execute(state: &AppState, job: &Job, shutdown: &CancellationToken) -> a
                         {
                             failures.push(format!("封面状态更新失败: {error:#}"));
                         }
-                        if let Err(error) = scanner::clear_needs_scrape(
-                            &state.db,
-                            updated_paths.iter().map(|(_, current)| current.clone()),
-                        )
-                        .await
-                        {
-                            failures.push(format!("需要刮削标记清理失败: {error:#}"));
-                        }
                     }
                     Err(error) => failures.push(format!("曲库索引更新失败: {error:#}")),
                 }

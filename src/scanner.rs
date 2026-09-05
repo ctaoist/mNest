@@ -339,9 +339,7 @@ async fn index_track(
         .filter(track::Column::Path.eq(&full_path))
         .one(db)
         .await?;
-    let needs_scrape = existing.as_ref().map_or(metadata.needs_scrape, |track| {
-        track.needs_scrape != 0 && metadata.needs_scrape
-    });
+    let needs_scrape = metadata.needs_scrape;
     let mimetype = mime_guess::from_path(path)
         .first_or_octet_stream()
         .essence_str()
@@ -358,6 +356,7 @@ async fn index_track(
         album_name: &metadata.album,
         album_artist: &metadata.albumartist,
         genre: &metadata.genre,
+        language: &metadata.language,
         year: metadata.year.parse().unwrap_or(0),
         track_number: metadata.tracknumber.parse().unwrap_or(0),
         disc_number: metadata.discnumber.parse().unwrap_or(0),
@@ -397,6 +396,7 @@ struct TrackValues<'a> {
     album_name: &'a str,
     album_artist: &'a str,
     genre: &'a str,
+    language: &'a str,
     year: i64,
     track_number: i64,
     disc_number: i64,
@@ -430,6 +430,7 @@ async fn insert_track(
         album_name: Set(v.album_name.to_owned()),
         album_artist: Set(v.album_artist.to_owned()),
         genre: Set(v.genre.to_owned()),
+        language: Set(v.language.to_owned()),
         year: Set(v.year),
         track_number: Set(v.track_number),
         disc_number: Set(v.disc_number),
@@ -470,6 +471,7 @@ async fn update_track(
     active.album_name = Set(v.album_name.to_owned());
     active.album_artist = Set(v.album_artist.to_owned());
     active.genre = Set(v.genre.to_owned());
+    active.language = Set(v.language.to_owned());
     active.year = Set(v.year);
     active.track_number = Set(v.track_number);
     active.disc_number = Set(v.disc_number);
@@ -621,28 +623,6 @@ pub(crate) async fn remove_track_records(
     Ok(rows_affected)
 }
 
-pub async fn clear_needs_scrape(
-    db: &DatabaseConnection,
-    paths: impl IntoIterator<Item = PathBuf>,
-) -> anyhow::Result<u64> {
-    let paths = paths
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut updated = 0;
-    for chunk in paths.chunks(500) {
-        updated += track::Entity::update_many()
-            .col_expr(track::Column::NeedsScrape, Expr::value(0))
-            .filter(track::Column::Path.is_in(chunk.to_vec()))
-            .exec(db)
-            .await?
-            .rows_affected;
-    }
-    Ok(updated)
-}
-
 pub(crate) async fn rebuild_aggregates(db: &DatabaseConnection) -> anyhow::Result<()> {
     let transaction = db.begin().await?;
     transaction
@@ -777,17 +757,12 @@ mod tests {
         assert_eq!(indexed_track.path, path.to_string_lossy());
         assert_eq!(indexed_track.needs_scrape, 1);
 
-        assert_eq!(clear_needs_scrape(&db, [path.clone()]).await.unwrap(), 1);
-        assert_eq!(
-            track::Entity::find()
-                .one(&db)
-                .await
-                .unwrap()
-                .unwrap()
-                .needs_scrape,
-            0
-        );
-
+        track::Entity::update_many()
+            .col_expr(track::Column::NeedsScrape, Expr::value(0))
+            .filter(track::Column::Id.eq(&indexed_track.id))
+            .exec(&db)
+            .await
+            .unwrap();
         let renamed = directory.path().join("renamed.wav");
         std::fs::rename(&path, &renamed).unwrap();
         refresh_path_changes(
@@ -800,7 +775,7 @@ mod tests {
         let renamed_track = track::Entity::find().one(&db).await.unwrap().unwrap();
         assert_eq!(renamed_track.id, indexed_track.id);
         assert_eq!(renamed_track.path, renamed.to_string_lossy());
-        assert_eq!(renamed_track.needs_scrape, 0);
+        assert_eq!(renamed_track.needs_scrape, 1);
     }
 
     #[tokio::test]

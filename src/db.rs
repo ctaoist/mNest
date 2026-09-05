@@ -381,6 +381,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adds_track_language_to_an_already_applied_baseline() {
+        let db = connect(&DatabaseSettings {
+            driver: "sqlite".into(),
+            url: "sqlite::memory:".into(),
+            max_connections: 1,
+        })
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        db.execute_unprepared("ALTER TABLE tracks DROP COLUMN language")
+            .await
+            .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        let row = db
+            .query_one(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT COUNT(*) AS column_count FROM pragma_table_info('tracks') WHERE name='language'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "column_count").unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn upgrades_baseline_three_with_open_subsonic_compatibility_state() {
         let db = connect(&DatabaseSettings {
             driver: "sqlite".into(),

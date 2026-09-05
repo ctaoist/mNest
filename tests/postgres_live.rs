@@ -634,6 +634,7 @@ fn track_model(id: &str, folder_id: &str, artist_id: &str, album_id: &str) -> tr
         album_name: album_id.into(),
         album_artist: artist_id.into(),
         genre: String::new(),
+        language: String::new(),
         year: 2026,
         track_number: 1,
         disc_number: 1,

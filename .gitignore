@@ -49,6 +49,7 @@ flamegraph.svg
 lcov.info
 tarpaulin-report.html
 junit.xml
+/.bundle/
 
 # Logs and temporary files
 *.log

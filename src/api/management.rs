@@ -46,7 +46,10 @@ use crate::{
     network,
     remote_download::{self, RemoteConnection, RemoteImportRequest, RemoteSearchRequest},
     scanner,
-    tags::{ARTWORK_CACHE_CONTROL, AUDIO_EXTENSIONS, AudioMetadata, detect_artwork_mime},
+    tags::{
+        ARTWORK_CACHE_CONTROL, AUDIO_EXTENSIONS, AudioMetadata, EMBEDDED_ARTWORK_MARKER,
+        MISSING_ARTWORK_MARKER, detect_artwork_mime,
+    },
     transcode_cache::{self, TranscodeCacheSettings},
     user_preferences,
 };
@@ -419,18 +422,23 @@ async fn file_list(
             .select_only()
             .column(track::Column::Path)
             .column(track::Column::NeedsScrape)
+            .column(track::Column::CoverPath)
             .filter(track::Column::Path.is_in(chunk.to_vec()))
-            .into_tuple::<(String, i64)>()
+            .into_tuple::<(String, i64, Option<String>)>()
             .all(&state.db)
             .await?;
-        scrape_flags.extend(rows);
+        scrape_flags.extend(rows.into_iter().map(|(path, needs_scrape, cover_path)| {
+            (
+                path,
+                needs_scrape != 0 || cover_path.as_deref() != Some(EMBEDDED_ARTWORK_MARKER),
+            )
+        }));
     }
     let mut entries = entries
         .into_iter()
         .map(|(path, mut value)| {
             if let Some(path) = path {
-                value["needs_scrape"] =
-                    json!(scrape_flags.get(&path).is_none_or(|value| *value != 0));
+                value["needs_scrape"] = json!(scrape_flags.get(&path).is_none_or(|value| *value));
             }
             value
         })
@@ -460,16 +468,81 @@ struct MusicId3Request {
     file_name: String,
 }
 
+async fn enabled_track_by_path(
+    state: &AppState,
+    path: &Path,
+) -> Result<Option<track::Model>, ApiError> {
+    let Some(indexed_track) = track::Entity::find()
+        .filter(track::Column::Path.eq(path.to_string_lossy().into_owned()))
+        .one(&state.db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let enabled = music_folder::Entity::find_by_id(&indexed_track.folder_id)
+        .filter(music_folder::Column::Enabled.eq(1))
+        .one(&state.db)
+        .await?
+        .is_some();
+    Ok(enabled.then_some(indexed_track))
+}
+
+fn indexed_audio_metadata(indexed_track: track::Model) -> AudioMetadata {
+    fn optional_number(value: i64) -> String {
+        if value == 0 {
+            String::new()
+        } else {
+            value.to_string()
+        }
+    }
+
+    let filename = Path::new(&indexed_track.path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    AudioMetadata {
+        title: indexed_track.title,
+        artist: indexed_track.artist_name,
+        album: indexed_track.album_name,
+        albumartist: indexed_track.album_artist,
+        genre: indexed_track.genre,
+        language: indexed_track.language,
+        year: optional_number(indexed_track.year),
+        lyrics: indexed_track.lyrics,
+        comment: indexed_track.comment,
+        tracknumber: optional_number(indexed_track.track_number),
+        discnumber: optional_number(indexed_track.disc_number),
+        duration: indexed_track.duration,
+        bit_rate: u32::try_from(indexed_track.bit_rate).unwrap_or_default(),
+        size: u64::try_from(indexed_track.size).unwrap_or_default(),
+        suffix: indexed_track.suffix,
+        filename,
+        file_full_path: indexed_track.path,
+        needs_scrape: indexed_track.needs_scrape != 0,
+        ..Default::default()
+    }
+}
+
 async fn music_id3(
     State(state): State<AppState>,
     _user: AdminUser,
     Json(request): Json<MusicId3Request>,
 ) -> Result<Json<ApiResponse<AudioMetadata>>, ApiError> {
-    let path = allowed_path(
-        &state,
-        &Path::new(&request.file_path).join(&request.file_name),
-    )
-    .await?;
+    let requested_path = Path::new(&request.file_path).join(&request.file_name);
+    if let Some(indexed_track) = enabled_track_by_path(&state, &requested_path).await? {
+        return Ok(Json(ApiResponse::success(indexed_audio_metadata(
+            indexed_track,
+        ))));
+    }
+
+    let path = allowed_path(&state, &requested_path).await?;
+    if let Some(indexed_track) = enabled_track_by_path(&state, &path).await? {
+        return Ok(Json(ApiResponse::success(indexed_audio_metadata(
+            indexed_track,
+        ))));
+    }
+
     let tags = state.tags.clone();
     let metadata = tokio::task::spawn_blocking(move || tags.read_without_artwork(&path)).await??;
     Ok(Json(ApiResponse::success(metadata)))
@@ -480,21 +553,39 @@ async fn music_artwork(
     _user: AdminUser,
     Query(request): Query<MusicId3Request>,
 ) -> Result<Response, ApiError> {
-    let path = allowed_path(
-        &state,
-        &Path::new(&request.file_path).join(&request.file_name),
-    )
-    .await?;
-    let indexed_track = track::Entity::find()
-        .filter(track::Column::Path.eq(path.to_string_lossy().into_owned()))
-        .one(&state.db)
-        .await?;
+    let requested_path = Path::new(&request.file_path).join(&request.file_name);
+    let (path, indexed_track) =
+        if let Some(indexed_track) = enabled_track_by_path(&state, &requested_path).await? {
+            (PathBuf::from(&indexed_track.path), Some(indexed_track))
+        } else {
+            let path = allowed_path(&state, &requested_path).await?;
+            let indexed_track = enabled_track_by_path(&state, &path).await?;
+            (path, indexed_track)
+        };
+    if indexed_track
+        .as_ref()
+        .and_then(|track| track.cover_path.as_deref())
+        == Some(MISSING_ARTWORK_MARKER)
+    {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
     let tags = state.tags.clone();
-    let artwork = tokio::task::spawn_blocking(move || match indexed_track {
-        Some(track) => tags.read_artwork_cached(&path, &track.id, track.mtime),
-        None => tags.read_artwork(&path),
+    let artwork = tokio::task::spawn_blocking({
+        let path = path.clone();
+        let indexed_track = indexed_track.clone();
+        move || match indexed_track {
+            Some(track) => tags.read_artwork_cached(&path, &track.id, track.mtime),
+            None => tags.read_artwork(&path),
+        }
     })
     .await??;
+    if indexed_track.is_some()
+        && let Err(error) =
+            scanner::remember_artwork_statuses(&state.db, &[(path.clone(), artwork.is_some())])
+                .await
+    {
+        tracing::warn!(path = %path.display(), %error, "failed to remember scraper artwork status");
+    }
     let Some(artwork) = artwork else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
@@ -542,11 +633,6 @@ async fn update_id3(
     }
     scanner::refresh_path_changes(&state.db, state.tags.clone(), &updated_paths).await?;
     scanner::remember_artwork_statuses(&state.db, &artwork_statuses).await?;
-    scanner::clear_needs_scrape(
-        &state.db,
-        updated_paths.iter().map(|(_, current)| current.clone()),
-    )
-    .await?;
     let success = results.iter().all(|v| v["success"] == true);
     Ok(Json(if success {
         ApiResponse::success(json!(results))
@@ -600,11 +686,6 @@ async fn batch_update_id3(
     }
     scanner::refresh_path_changes(&state.db, state.tags.clone(), &updated_paths).await?;
     scanner::remember_artwork_statuses(&state.db, &artwork_statuses).await?;
-    scanner::clear_needs_scrape(
-        &state.db,
-        updated_paths.iter().map(|(_, current)| current.clone()),
-    )
-    .await?;
     let success = results.iter().all(|value| value["success"] == true);
     Ok(Json(if success {
         ApiResponse::success(json!(results))
@@ -3148,6 +3229,7 @@ mod tests {
 
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use md5::{Digest, Md5};
     use sea_orm::PaginatorTrait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
@@ -3336,6 +3418,7 @@ mod tests {
             album_name: String::new(),
             album_artist: String::new(),
             genre: String::new(),
+            language: String::new(),
             year: 0,
             track_number: 0,
             disc_number: 0,
@@ -3358,6 +3441,270 @@ mod tests {
         .insert(&state.db)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn music_id3_returns_all_indexed_metadata_without_reading_the_audio_file() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let path = library.path().join("indexed.wav");
+        std::fs::write(&path, minimal_wav()).unwrap();
+        insert_test_track(&state, "library", library.path(), "track-1", &path).await;
+        let track = track::Entity::find_by_id("track-1")
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = track.into_active_model();
+        active.title = Set("Database title".into());
+        active.artist_name = Set("Database artist".into());
+        active.album_name = Set("Database album".into());
+        active.album_artist = Set("Database album artist".into());
+        active.genre = Set("Database genre".into());
+        active.language = Set("zho".into());
+        active.year = Set(2026);
+        active.track_number = Set(3);
+        active.disc_number = Set(2);
+        active.duration = Set(321.5);
+        active.bit_rate = Set(192);
+        active.size = Set(999);
+        active.lyrics = Set("Database lyrics".into());
+        active.comment = Set("Database comment".into());
+        active.needs_scrape = Set(1);
+        active.update(&state.db).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let response = music_id3(
+            State(state),
+            AdminUser(admin),
+            Json(MusicId3Request {
+                file_path: library.path().to_string_lossy().into_owned(),
+                file_name: "indexed.wav".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.data.title, "Database title");
+        assert_eq!(response.0.data.artist, "Database artist");
+        assert_eq!(response.0.data.album, "Database album");
+        assert_eq!(response.0.data.albumartist, "Database album artist");
+        assert_eq!(response.0.data.genre, "Database genre");
+        assert_eq!(response.0.data.language, "zho");
+        assert_eq!(response.0.data.year, "2026");
+        assert_eq!(response.0.data.tracknumber, "3");
+        assert_eq!(response.0.data.discnumber, "2");
+        assert_eq!(response.0.data.duration, 321.5);
+        assert_eq!(response.0.data.bit_rate, 192);
+        assert_eq!(response.0.data.size, 999);
+        assert_eq!(response.0.data.lyrics, "Database lyrics");
+        assert_eq!(response.0.data.comment, "Database comment");
+        assert_eq!(response.0.data.filename, "indexed.wav");
+        assert_eq!(response.0.data.file_full_path, path.to_string_lossy());
+        assert!(response.0.data.needs_scrape);
+    }
+
+    #[tokio::test]
+    async fn file_list_requires_scraping_for_missing_or_unknown_artwork() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let path = library.path().join("indexed.wav");
+        std::fs::write(&path, minimal_wav()).unwrap();
+        insert_test_track(&state, "library", library.path(), "track-1", &path).await;
+
+        let response = file_list(
+            State(state.clone()),
+            AdminUser(admin.clone()),
+            Json(FileListRequest {
+                file_path: library.path().to_string_lossy().into_owned(),
+                sorted_fields: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0.data[0]["children"][0]["needs_scrape"], true);
+
+        track::Entity::update_many()
+            .col_expr(
+                track::Column::CoverPath,
+                sea_orm::sea_query::Expr::value(EMBEDDED_ARTWORK_MARKER),
+            )
+            .filter(track::Column::Id.eq("track-1"))
+            .exec(&state.db)
+            .await
+            .unwrap();
+        let response = file_list(
+            State(state.clone()),
+            AdminUser(admin.clone()),
+            Json(FileListRequest {
+                file_path: library.path().to_string_lossy().into_owned(),
+                sorted_fields: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0.data[0]["children"][0]["needs_scrape"], false);
+
+        track::Entity::update_many()
+            .col_expr(
+                track::Column::NeedsScrape,
+                sea_orm::sea_query::Expr::value(1),
+            )
+            .filter(track::Column::Id.eq("track-1"))
+            .exec(&state.db)
+            .await
+            .unwrap();
+        let response = file_list(
+            State(state.clone()),
+            AdminUser(admin.clone()),
+            Json(FileListRequest {
+                file_path: library.path().to_string_lossy().into_owned(),
+                sorted_fields: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0.data[0]["children"][0]["needs_scrape"], true);
+
+        track::Entity::update_many()
+            .col_expr(
+                track::Column::NeedsScrape,
+                sea_orm::sea_query::Expr::value(0),
+            )
+            .col_expr(
+                track::Column::CoverPath,
+                sea_orm::sea_query::Expr::value(MISSING_ARTWORK_MARKER),
+            )
+            .filter(track::Column::Id.eq("track-1"))
+            .exec(&state.db)
+            .await
+            .unwrap();
+        let response = file_list(
+            State(state),
+            AdminUser(admin),
+            Json(FileListRequest {
+                file_path: library.path().to_string_lossy().into_owned(),
+                sorted_fields: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0.data[0]["children"][0]["needs_scrape"], true);
+    }
+
+    #[tokio::test]
+    async fn music_artwork_remembers_a_missing_cover() {
+        let state = test_state().await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let path = library.path().join("indexed.wav");
+        std::fs::write(&path, minimal_wav()).unwrap();
+        insert_test_track(&state, "library", library.path(), "track-1", &path).await;
+
+        let response = music_artwork(
+            State(state.clone()),
+            AdminUser(admin.clone()),
+            Query(MusicId3Request {
+                file_path: library.path().to_string_lossy().into_owned(),
+                file_name: "indexed.wav".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            track::Entity::find_by_id("track-1")
+                .one(&state.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .cover_path
+                .as_deref(),
+            Some(MISSING_ARTWORK_MARKER)
+        );
+
+        std::fs::write(&path, b"not audio").unwrap();
+        let response = music_artwork(
+            State(state),
+            AdminUser(admin),
+            Query(MusicId3Request {
+                file_path: library.path().to_string_lossy().into_owned(),
+                file_name: "indexed.wav".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn music_artwork_serves_an_indexed_track_from_cache_without_source_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.cover_cache.enabled = true;
+        settings.cover_cache.path = directory.path().join("covers");
+        let state = test_state_with_settings(settings).await;
+        let admin = crate::auth::user_by_name(&state.db, &state.settings.admin.username)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let path = library.path().join("indexed.wav");
+        std::fs::write(&path, minimal_wav()).unwrap();
+        insert_test_track(&state, "library", library.path(), "track-1", &path).await;
+        let indexed_track = track::Entity::find_by_id("track-1")
+            .one(&state.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = indexed_track.into_active_model();
+        active.cover_path = Set(Some(EMBEDDED_ARTWORK_MARKER.into()));
+        active.mtime = Set(42);
+        active.update(&state.db).await.unwrap();
+
+        let track_prefix = hex::encode(Md5::digest(b"track-1"));
+        let version = hex::encode(Md5::digest(b"track-1:42"));
+        std::fs::create_dir_all(&state.settings.cover_cache.path).unwrap();
+        let cached_artwork = b"\xff\xd8\xffcached artwork";
+        std::fs::write(
+            state
+                .settings
+                .cover_cache
+                .path
+                .join(format!("{track_prefix}-{version}.artwork")),
+            cached_artwork,
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let response = music_artwork(
+            State(state),
+            AdminUser(admin),
+            Query(MusicId3Request {
+                file_path: library.path().to_string_lossy().into_owned(),
+                file_name: "indexed.wav".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            cached_artwork.as_slice()
+        );
     }
 
     #[test]

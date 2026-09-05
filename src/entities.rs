@@ -135,6 +135,7 @@ pub mod track {
         pub album_name: String,
         pub album_artist: String,
         pub genre: String,
+        pub language: String,
         pub year: i64,
         pub track_number: i64,
         pub disc_number: i64,

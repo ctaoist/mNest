@@ -149,6 +149,7 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         .col(text_default("album_name", ""))
         .col(text_default("album_artist", ""))
         .col(text_default("genre", ""))
+        .col(text_default("language", ""))
         .col(bigint_default("year", 0))
         .col(bigint_default("track_number", 0))
         .col(bigint_default("disc_number", 0))
@@ -407,6 +408,10 @@ async fn backfill_user_track_stats<C: ConnectionTrait>(db: &C) -> anyhow::Result
 }
 
 async fn ensure_compatibility_columns<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    if !has_column(db, "tracks", "language").await? {
+        db.execute_unprepared("ALTER TABLE tracks ADD COLUMN language TEXT NOT NULL DEFAULT ''")
+            .await?;
+    }
     if !has_column(db, "play_queues", "current_index").await? {
         db.execute_unprepared("ALTER TABLE play_queues ADD COLUMN current_index BIGINT")
             .await?;
