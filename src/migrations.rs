@@ -126,14 +126,7 @@ async fn create_baseline<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
         .col(double_default("duration", 0.0))
         .col(required_text("created_at"));
     execute(db, albums).await?;
-    create_index(
-        db,
-        "uq_albums_name_artist",
-        "albums",
-        &["name", "artist_id"],
-        true,
-    )
-    .await?;
+    create_index(db, "uq_albums_name", "albums", &["name"], true).await?;
 
     let mut tracks = create_table("tracks");
     tracks

@@ -7,7 +7,9 @@ use std::{
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    IntoActiveModel, QueryFilter, QuerySelect, QueryTrait, Set, TransactionTrait, sea_query::Expr,
+    FromQueryResult, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
+    TransactionTrait,
+    sea_query::{Expr, OnConflict},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -502,18 +504,15 @@ async fn get_or_create_album(
 ) -> anyhow::Result<String> {
     if let Some(existing) = album::Entity::find()
         .filter(album::Column::Name.eq(name))
-        .filter(album::Column::ArtistId.eq(artist_id))
+        .order_by_asc(album::Column::CreatedAt)
+        .order_by_asc(album::Column::Id)
         .one(db)
         .await?
     {
-        let id = existing.id.clone();
-        let mut active = existing.into_active_model();
-        active.artist_name = Set(artist_name.to_owned());
-        active.update(db).await?;
-        return Ok(id);
+        return Ok(existing.id);
     }
     let id = Uuid::new_v4().to_string();
-    album::ActiveModel {
+    album::Entity::insert(album::ActiveModel {
         id: Set(id.clone()),
         name: Set(name.to_owned()),
         artist_id: Set(artist_id.to_owned()),
@@ -524,10 +523,19 @@ async fn get_or_create_album(
         song_count: Set(0),
         duration: Set(0.0),
         created_at: Set(Utc::now().to_rfc3339()),
-    }
-    .insert(db)
+    })
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
+    .exec_without_returning(db)
     .await?;
-    Ok(id)
+    // A concurrent refresh may have inserted the same album name first.
+    Ok(album::Entity::find()
+        .filter(album::Column::Name.eq(name))
+        .order_by_asc(album::Column::CreatedAt)
+        .order_by_asc(album::Column::Id)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("album was not created"))?
+        .id)
 }
 
 pub(crate) async fn remove_track_records(
@@ -633,6 +641,50 @@ pub(crate) async fn rebuild_aggregates(db: &DatabaseConnection) -> anyhow::Resul
     transaction.execute_unprepared("UPDATE artists SET song_count = (SELECT COUNT(*) FROM track_artists WHERE track_artists.artist_id=artists.id), album_count = (SELECT COUNT(DISTINCT tracks.album_id) FROM track_artists JOIN tracks ON tracks.id=track_artists.track_id WHERE track_artists.artist_id=artists.id AND tracks.album_id IS NOT NULL)").await?;
     transaction.execute_unprepared("UPDATE albums SET song_count = (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id), duration = COALESCE((SELECT SUM(duration) FROM tracks WHERE tracks.album_id = albums.id), 0), year = COALESCE((SELECT MAX(NULLIF(year, 0)) FROM tracks WHERE tracks.album_id = albums.id), 0), genre = COALESCE((SELECT genre FROM tracks WHERE tracks.album_id = albums.id AND genre <> '' ORDER BY disc_number, track_number, id LIMIT 1), ''), cover_path = CASE WHEN EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = albums.id AND tracks.cover_path IS NOT NULL AND tracks.cover_path <> '') THEN 'embedded' WHEN NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = albums.id AND tracks.cover_path IS NULL) THEN '' ELSE NULL END").await?;
 
+    // Album identity is its name; its display credits include all contributing singers.
+    #[derive(sea_orm::FromQueryResult)]
+    struct AlbumArtist {
+        album_id: String,
+        artist_id: String,
+        artist_name: String,
+    }
+    let credits = AlbumArtist::find_by_statement(sea_orm::Statement::from_string(
+        transaction.get_database_backend(),
+        "SELECT DISTINCT t.album_id, a.id AS artist_id, a.name AS artist_name \
+         FROM tracks t JOIN track_artists ta ON ta.track_id=t.id \
+         JOIN artists a ON a.id=ta.artist_id WHERE t.album_id IS NOT NULL \
+         ORDER BY t.album_id, a.name, a.id",
+    ))
+    .all(&transaction)
+    .await?;
+    let mut album_credits = HashMap::<String, Vec<AlbumArtist>>::new();
+    for credit in credits {
+        album_credits
+            .entry(credit.album_id.clone())
+            .or_default()
+            .push(credit);
+    }
+    for (album_id, credits) in album_credits {
+        album::Entity::update_many()
+            .col_expr(
+                album::Column::ArtistId,
+                Expr::value(credits[0].artist_id.clone()),
+            )
+            .col_expr(
+                album::Column::ArtistName,
+                Expr::value(
+                    credits
+                        .iter()
+                        .map(|credit| credit.artist_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+            )
+            .filter(album::Column::Id.eq(album_id))
+            .exec(&transaction)
+            .await?;
+    }
+
     for item_type in ["album", "artist"] {
         let active_ids = if item_type == "album" {
             track::Entity::find()
@@ -663,6 +715,29 @@ pub(crate) async fn rebuild_aggregates(db: &DatabaseConnection) -> anyhow::Resul
         .column(track::Column::AlbumId)
         .filter(track::Column::AlbumId.is_not_null())
         .into_query();
+    let empty_album_ids = album::Entity::find()
+        .select_only()
+        .column(album::Column::Id)
+        .filter(album::Column::Id.not_in_subquery(active_album_ids.clone()))
+        .into_tuple::<String>()
+        .all(&transaction)
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if !empty_album_ids.is_empty() {
+        for shared in share::Entity::find().all(&transaction).await? {
+            let Ok(mut ids) = serde_json::from_str::<Vec<String>>(&shared.item_ids) else {
+                continue;
+            };
+            let previous_len = ids.len();
+            ids.retain(|id| !empty_album_ids.contains(id));
+            if ids.len() != previous_len {
+                let mut active = shared.into_active_model();
+                active.item_ids = Set(serde_json::to_string(&ids)?);
+                active.update(&transaction).await?;
+            }
+        }
+    }
     album::Entity::delete_many()
         .filter(album::Column::Id.not_in_subquery(active_album_ids))
         .exec(&transaction)
@@ -733,6 +808,279 @@ mod tests {
         .insert(db)
         .await
         .unwrap();
+    }
+
+    async fn index_test_track(
+        db: &DatabaseConnection,
+        folder: &MusicFolder,
+        path: &Path,
+        artist: &str,
+        album: &str,
+    ) {
+        write_wav(path);
+        index_track(
+            db,
+            folder,
+            path,
+            crate::tags::AudioMetadata {
+                title: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                artist: artist.into(),
+                album: album.into(),
+                albumartist: format!("Album artist for {artist}"),
+                duration: 120.0,
+                suffix: "wav".into(),
+                ..Default::default()
+            },
+            "2026-09-05T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn album_names_group_different_singers_and_libraries() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = test_database().await;
+        for id in ["library-a", "library-b"] {
+            let root = directory.path().join(id);
+            std::fs::create_dir(&root).unwrap();
+            add_library(&db, id, &root).await;
+        }
+        let folders = music_folder::Entity::find()
+            .order_by_asc(music_folder::Column::Id)
+            .all(&db)
+            .await
+            .unwrap();
+        for (folder, artist, title) in [
+            (&folders[1], "Singer B", "Song B"),
+            (&folders[0], "Singer A; Singer C", "Song A"),
+        ] {
+            index_test_track(
+                &db,
+                folder,
+                &Path::new(&folder.path).join(format!("{title}.wav")),
+                artist,
+                " Compilation ",
+            )
+            .await;
+        }
+        rebuild_aggregates(&db).await.unwrap();
+
+        let albums = album::Entity::find().all(&db).await.unwrap();
+        assert_eq!(albums.len(), 1);
+        let compilation = &albums[0];
+        assert_eq!(compilation.name, "Compilation");
+        assert_eq!(compilation.song_count, 2);
+        assert_eq!(compilation.duration, 240.0);
+        assert_eq!(compilation.artist_name, "Singer A; Singer B; Singer C");
+        let tracks = track::Entity::find()
+            .order_by_asc(track::Column::Title)
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(tracks[0].artist_name, "Singer A; Singer C");
+        assert_eq!(tracks[1].artist_name, "Singer B");
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.album_id.as_deref() == Some(compilation.id.as_str()))
+        );
+        for artist in artist::Entity::find().all(&db).await.unwrap() {
+            assert_eq!(artist.album_count, 1);
+            assert_eq!(artist.song_count, 1);
+        }
+
+        index_test_track(
+            &db,
+            &folders[0],
+            &Path::new(&folders[0].path).join("Other.wav"),
+            "Singer A",
+            "Other Album",
+        )
+        .await;
+        rebuild_aggregates(&db).await.unwrap();
+        assert_eq!(album::Entity::find().all(&db).await.unwrap().len(), 2);
+        assert_eq!(
+            album::Entity::find_by_id(&compilation.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .song_count,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_album_cleans_up_only_after_its_last_song_moves() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = test_database().await;
+        add_library(&db, "library", directory.path()).await;
+        let tags = Arc::new(TagService::new(ToolSettings::default()));
+        let paths = [
+            directory.path().join("a.wav"),
+            directory.path().join("b.wav"),
+        ];
+        let mut metadata = crate::tags::AudioMetadata {
+            title: "Song".into(),
+            artist: "Singer".into(),
+            album: "Old Album".into(),
+            ..Default::default()
+        };
+        for path in &paths {
+            write_wav(path);
+            tags.write(path, &metadata).unwrap();
+        }
+        refresh_paths(&db, tags.clone(), &paths).await.unwrap();
+        let old_album = album::Entity::find().one(&db).await.unwrap().unwrap();
+        let tracks = track::Entity::find()
+            .order_by_asc(track::Column::Path)
+            .all(&db)
+            .await
+            .unwrap();
+        for (item_type, item_id) in [("album", &old_album.id), ("track", &tracks[0].id)] {
+            favorite::ActiveModel {
+                user_id: Set("user".into()),
+                item_type: Set(item_type.into()),
+                item_id: Set(item_id.clone()),
+                created_at: Set("2026-09-05T00:00:00Z".into()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            rating::ActiveModel {
+                user_id: Set("user".into()),
+                item_type: Set(item_type.into()),
+                item_id: Set(item_id.clone()),
+                rating: Set(5),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        playlist_track::ActiveModel {
+            playlist_id: Set("playlist".into()),
+            position: Set(0),
+            track_id: Set(tracks[0].id.clone()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        share::ActiveModel {
+            id: Set("shared".into()),
+            user_id: Set("user".into()),
+            item_ids: Set(serde_json::to_string(&[&old_album.id, &tracks[0].id]).unwrap()),
+            description: Set(String::new()),
+            expires_at: Set(None),
+            created_at: Set("2026-09-05T00:00:00Z".into()),
+            play_count: Set(0),
+            last_visited_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        metadata.album = "New Album".into();
+        tags.write(&paths[0], &metadata).unwrap();
+        refresh_paths(&db, tags.clone(), &paths[..1]).await.unwrap();
+        assert_eq!(
+            album::Entity::find_by_id(&old_album.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .song_count,
+            1
+        );
+        assert_eq!(favorite::Entity::find().all(&db).await.unwrap().len(), 2);
+        assert_eq!(
+            share::Entity::find_by_id("shared")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .item_ids,
+            serde_json::to_string(&[&old_album.id, &tracks[0].id]).unwrap()
+        );
+
+        tags.write(&paths[1], &metadata).unwrap();
+        refresh_paths(&db, tags.clone(), &paths[1..]).await.unwrap();
+        assert!(
+            album::Entity::find_by_id(&old_album.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let albums = album::Entity::find().all(&db).await.unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].name, "New Album");
+        assert_eq!(albums[0].song_count, 2);
+        assert_eq!(
+            share::Entity::find_by_id("shared")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .item_ids,
+            serde_json::to_string(&[&tracks[0].id]).unwrap()
+        );
+        assert_eq!(
+            favorite::Entity::find()
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .item_id,
+            tracks[0].id
+        );
+        assert_eq!(
+            rating::Entity::find()
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .item_id,
+            tracks[0].id
+        );
+        assert_eq!(
+            playlist_track::Entity::find()
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .track_id,
+            tracks[0].id
+        );
+
+        metadata.album.clear();
+        for path in &paths {
+            tags.write(path, &metadata).unwrap();
+        }
+        refresh_paths(&db, tags, &paths).await.unwrap();
+        assert!(album::Entity::find().all(&db).await.unwrap().is_empty());
+        let refreshed = track::Entity::find()
+            .order_by_asc(track::Column::Path)
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.len(), 2);
+        for (before, after) in tracks.iter().zip(&refreshed) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.created_at, after.created_at);
+            assert!(after.album_id.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_album_creation_reuses_the_same_name() {
+        let db = test_database().await;
+        let (first, second) = tokio::join!(
+            get_or_create_album(&db, "Compilation", "artist-a", "Singer A", "", ""),
+            get_or_create_album(&db, "Compilation", "artist-b", "Singer B", "", ""),
+        );
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(album::Entity::find().all(&db).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
